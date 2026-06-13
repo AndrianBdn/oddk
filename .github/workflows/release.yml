@@ -1,0 +1,67 @@
+name: Release
+
+# Builds linux/amd64 and linux/arm64 binaries and publishes them as a GitHub
+# Release. Triggered by pushing a version tag (vX.Y.Z), or manually via the
+# Actions tab against an existing tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build and package
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -buildvcs=true -o "oddk-linux-$arch" ./cmd/oddk
+            tar -czf "dist/oddk-linux-$arch.tar.gz" "oddk-linux-$arch"
+          done
+          # Sanity: the amd64 binary (runnable on this amd64 runner) must report
+          # the version we are tagging, catching tag/version.go mismatches.
+          built="$(./oddk-linux-amd64 --version 2>&1 || true)"
+          case "$built" in
+            *"$VERSION"*) echo "version ok: $built" ;;
+            *) echo "::error::binary reports '$built' but tag is $TAG"; exit 1 ;;
+          esac
+          rm -f oddk-linux-amd64 oddk-linux-arm64
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "ODDK $TAG" \
+            --notes "ODDK $TAG" \
+            dist/oddk-linux-amd64.tar.gz \
+            dist/oddk-linux-arm64.tar.gz \
+            dist/SHA256SUMS

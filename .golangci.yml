@@ -1,0 +1,46 @@
+version: "2"
+
+run:
+  # Analyze with the oddk_debug tag so the debug-only daemon files and the e2e
+  # harness (which references DebugSetRawKV) type-check. Production builds omit
+  # the tag; the trivial !oddk_debug stub is the only thing not linted here.
+  build-tags:
+    - oddk_debug
+  issues-exit-code: 1
+
+linters:
+  enable:
+    - testpackage
+    - tagliatelle
+    - gocritic
+    - intrange
+    - gosec
+    - modernize
+  exclusions:
+    rules:
+      # gosec credential/permission checks are expected noise in test and e2e
+      # scaffolding: AWS example keys and intentionally-loose perms used to
+      # assert rejection. Not shipped code.
+      - path: (_test\.go|^e2e/)
+        linters:
+          - gosec
+      # operations has internal tests that exercise unexported helpers
+      # (quotePostgresLiteral, buildCreateDatabaseSQL, …), so they must live in
+      # package operations and testpackage can't apply.
+      - path: internal/operations/.*_test\.go
+        linters:
+          - testpackage
+
+# Formatters are a separate subsystem from linters in golangci-lint v2: they are
+# applied by `golangci-lint fmt`, NOT `golangci-lint run` (and `run --fix` does
+# not format). Run `make fmt` to rewrite files, `make fmt-check` to verify in CI.
+formatters:
+  enable:
+    - gofumpt   # stricter superset of gofmt (also handles EOF newlines, blank-line whitespace)
+    - goimports # group/sort imports and add/remove as needed
+  settings:
+    gofumpt:
+      extra-rules: true
+    goimports:
+      local-prefixes:
+        - github.com/hypersequent/oddk

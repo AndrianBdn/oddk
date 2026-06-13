@@ -1,0 +1,37 @@
+# Binaries
+bin/
+./oddk
+/e2e/e2e
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Key files
+master.key
+
+# Log
+*.log
+
+# Config files
+.claude/*.local.json
+.oddk-cli.json
+
+# OS/Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go files
+# go.sum should be committed for reproducible builds
+
+# Test artifacts
+/tmp/
+*.test
+
+# Internal scripts (use 1Password for credentials)
+_build-internal.sh
