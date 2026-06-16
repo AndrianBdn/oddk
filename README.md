@@ -1,5 +1,10 @@
 # ODDK — Opinionated Database Deployment Kit
 
+<a href="https://github.com/Hypersequent/oddk/releases/latest"><img src="https://img.shields.io/github/v/release/Hypersequent/oddk" /></a>
+<a href="./LICENSE"><img src="https://img.shields.io/github/license/Hypersequent/oddk" /></a>
+<a href="./go.mod"><img src="https://img.shields.io/github/go-mod/go-version/Hypersequent/oddk" /></a>
+[![Go Report Card](https://goreportcard.com/badge/github.com/hypersequent/oddk)](https://goreportcard.com/report/github.com/hypersequent/oddk)
+
 **Run PostgreSQL on your own Linux box with the ergonomics of a managed service.**
 
 ODDK is a single Go binary that manages PostgreSQL the way a cloud provider's
