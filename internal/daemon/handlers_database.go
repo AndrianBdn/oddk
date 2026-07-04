@@ -37,6 +37,7 @@ func (s *Server) handleCreateDatabase(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		DatabaseName string `json:"databaseName"`
+		Username     string `json:"username"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -52,6 +53,7 @@ func (s *Server) handleCreateDatabase(w http.ResponseWriter, r *http.Request) {
 	params := operations.CreateDatabaseParams{
 		InstanceName: name,
 		DatabaseName: req.DatabaseName,
+		Username:     req.Username,
 	}
 
 	result, err := s.executor.CreateDatabaseOp(context.Background(), s.opDeps, params)

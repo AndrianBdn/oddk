@@ -390,9 +390,11 @@ func (c *Client) createDatabaseAction(ctx context.Context, cmd *cli.Command) err
 		return err
 	}
 	databaseName := cmd.String("database")
+	username := cmd.String("username")
 
 	req := map[string]any{
 		"databaseName": databaseName,
+		"username":     username,
 	}
 
 	resp, err := c.request("POST", fmt.Sprintf("/api/rdbms/%s/databases", instanceName), req)
@@ -402,6 +404,8 @@ func (c *Client) createDatabaseAction(ctx context.Context, cmd *cli.Command) err
 
 	var result struct {
 		DatabaseName string `json:"databaseName"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
 		Message      string `json:"message"`
 	}
 
@@ -409,7 +413,16 @@ func (c *Client) createDatabaseAction(ctx context.Context, cmd *cli.Command) err
 		return fmt.Errorf("parse response: %w", err)
 	}
 
+	// An older daemon ignores the unknown username field and creates just the
+	// database — surface that instead of printing success without credentials.
+	if username != "" && result.Username == "" {
+		return fmt.Errorf("database %s was created, but the daemon ignored --username (it likely predates this option — upgrade the daemon, then add the user with add-db-user)", result.DatabaseName)
+	}
+
 	_, _ = fmt.Fprintf(c.out, "%s\n", result.Message)
+	if result.Username != "" {
+		c.printDBUserCredentials(instanceName, result.Username, result.Password, result.DatabaseName, "owner")
+	}
 	return nil
 }
 
@@ -650,6 +663,10 @@ func (c *Client) addDatabaseUserAction(ctx context.Context, cmd *cli.Command) er
 	readonly := cmd.Bool("readonly")
 	owner := cmd.Bool("owner")
 
+	if readonly && owner {
+		return fmt.Errorf("--readonly and --owner are mutually exclusive")
+	}
+
 	req := map[string]any{
 		"username": username,
 		"readOnly": readonly,
@@ -658,6 +675,12 @@ func (c *Client) addDatabaseUserAction(ctx context.Context, cmd *cli.Command) er
 
 	resp, err := c.request("POST", fmt.Sprintf("/api/rdbms/%s/databases/%s/users", instanceName, database), req)
 	if err != nil {
+		// The one-shot create-db hint makes the user the database OWNER, so
+		// never suggest it when read-only access was requested.
+		if !readonly && strings.Contains(err.Error(), "does not exist") {
+			return fmt.Errorf("%w\nHint: to create the database together with its user in one step, use:\n  oddk instance create-db %s --database %s --username %s\n(note: this makes the user the database owner)",
+				err, instanceName, database, username)
+		}
 		return err
 	}
 
@@ -673,12 +696,29 @@ func (c *Client) addDatabaseUserAction(ctx context.Context, cmd *cli.Command) er
 		return fmt.Errorf("parse response: %w", err)
 	}
 
+	access := "read-write"
+	switch {
+	case result.ReadOnly:
+		access = "read-only"
+	case owner:
+		access = "owner"
+	}
+
 	_, _ = fmt.Fprintf(c.out, "%s\n", result.Message)
+	c.printDBUserCredentials(instanceName, result.Username, result.Password, result.Database, access)
+
+	return nil
+}
+
+// printDBUserCredentials prints the one-time credentials block shared by
+// add-db-user and create-db --username: generated password, connection
+// string, and the not-saved warning.
+func (c *Client) printDBUserCredentials(instanceName, username, password, database, access string) {
 	_, _ = fmt.Fprintf(c.out, "\nCredentials:\n")
-	_, _ = fmt.Fprintf(c.out, "Username: %s\n", result.Username)
-	_, _ = fmt.Fprintf(c.out, "Password: %s\n", result.Password)
-	_, _ = fmt.Fprintf(c.out, "Database: %s\n", result.Database)
-	_, _ = fmt.Fprintf(c.out, "Access: %s\n", map[bool]string{true: "read-only", false: "read-write"}[result.ReadOnly])
+	_, _ = fmt.Fprintf(c.out, "Username: %s\n", username)
+	_, _ = fmt.Fprintf(c.out, "Password: %s\n", password)
+	_, _ = fmt.Fprintf(c.out, "Database: %s\n", database)
+	_, _ = fmt.Fprintf(c.out, "Access: %s\n", access)
 
 	// Get instance details for connection string
 	instResp, err := c.request("GET", fmt.Sprintf("/api/rdbms/%s", instanceName), nil)
@@ -689,15 +729,13 @@ func (c *Client) addDatabaseUserAction(ctx context.Context, cmd *cli.Command) er
 		if json.Unmarshal(instResp, &instance) == nil {
 			_, _ = fmt.Fprintf(c.out, "\nConnection string:\n")
 			_, _ = fmt.Fprintf(c.out, "postgresql://%s:%s@10.88.0.1:%d/%s?sslmode=disable\n",
-				result.Username, result.Password, instance.Port, result.Database)
+				username, password, instance.Port, database)
 		}
 	}
 
 	_, _ = fmt.Fprintf(c.out, "\n⚠️  NOTE: This password is not saved. Save it securely now.\n")
 	_, _ = fmt.Fprintf(c.out, "To reset the password later, use: oddk instance reset-db-user-password %s --username %s\n",
-		instanceName, result.Username)
-
-	return nil
+		instanceName, username)
 }
 
 func (c *Client) deleteDatabaseUserAction(ctx context.Context, cmd *cli.Command) error {

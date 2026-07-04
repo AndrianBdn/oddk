@@ -466,13 +466,26 @@ func testDatabaseManagement(h *TestHarness) error {
 		return fmt.Errorf("duplicate user error should mention 'already exists': %v", err)
 	}
 
-	// Test 8: Try to create user for non-existent database (should fail)
+	// Test 8: Try to create user for non-existent database (should fail,
+	// with a hint pointing at the one-shot create-db --username path)
 	_, err = h.addDatabaseUserCLI(instanceName, "baduser", "nonexistent", false)
 	if err == nil {
 		return fmt.Errorf("creating user for non-existent database should fail")
 	}
 	if !strings.Contains(err.Error(), "does not exist") {
 		return fmt.Errorf("non-existent database error should mention 'does not exist': %v", err)
+	}
+	if !strings.Contains(err.Error(), "create-db") {
+		return fmt.Errorf("non-existent database error should hint at create-db: %v", err)
+	}
+	// ...but not when --readonly was requested: the one-shot form creates an
+	// OWNER, so suggesting it would guide a privilege escalation
+	_, err = h.addDatabaseUserCLI(instanceName, "baduser", "nonexistent", true)
+	if err == nil {
+		return fmt.Errorf("creating read-only user for non-existent database should fail")
+	}
+	if strings.Contains(err.Error(), "create-db") {
+		return fmt.Errorf("read-only request must not get the owner-creating create-db hint: %v", err)
 	}
 
 	// Test 9: Delete read-only user
@@ -500,6 +513,80 @@ func testDatabaseManagement(h *TestHarness) error {
 	}
 	if !strings.Contains(err.Error(), "does not exist") {
 		return fmt.Errorf("non-existent user error should mention 'does not exist': %v", err)
+	}
+
+	// Test 12: One-shot create-db --username (creates the owner user)
+	comboOutput, err := h.createDatabaseWithUserCLI(instanceName, "svcdb", "svcowner")
+	if err != nil {
+		return fmt.Errorf("create database with owner user: %w", err)
+	}
+	if !strings.Contains(comboOutput, "owner user svcowner") {
+		return fmt.Errorf("one-shot create output should mention owner user: %s", comboOutput)
+	}
+	if !strings.Contains(comboOutput, "Access: owner") {
+		return fmt.Errorf("one-shot create output should report owner access: %s", comboOutput)
+	}
+	ownerPassword, err := extractCredentialPassword(comboOutput)
+	if err != nil {
+		return fmt.Errorf("one-shot create output: %w", err)
+	}
+	if !strings.Contains(comboOutput, fmt.Sprintf("postgresql://svcowner:%s@10.88.0.1:%d/svcdb", ownerPassword, port)) {
+		return fmt.Errorf("one-shot create output should contain connection string: %s", comboOutput)
+	}
+
+	// The owner must be able to create objects right away (migrations case)
+	if err := h.execSQLAsUser(port, "svcdb", "svcowner", ownerPassword, "CREATE TABLE owner_check (id int)"); err != nil {
+		return fmt.Errorf("owner user should be able to create tables: %w", err)
+	}
+
+	// A read-only user added AFTER the one-shot must see both existing
+	// tables and tables the owner creates later (default privileges are
+	// issued FOR ROLE the owner, not just as postgres)
+	readerOutput, err := h.addDatabaseUserCLI(instanceName, "svcreader", "svcdb", true)
+	if err != nil {
+		return fmt.Errorf("add read-only user to owner-provisioned database: %w", err)
+	}
+	readerPassword, err := extractCredentialPassword(readerOutput)
+	if err != nil {
+		return fmt.Errorf("read-only user output: %w", err)
+	}
+	if err := h.execSQLAsUser(port, "svcdb", "svcreader", readerPassword, "SELECT * FROM owner_check"); err != nil {
+		return fmt.Errorf("read-only user should see pre-existing owner tables: %w", err)
+	}
+	if err := h.execSQLAsUser(port, "svcdb", "svcowner", ownerPassword, "CREATE TABLE post_grant_table (id int)"); err != nil {
+		return fmt.Errorf("owner should be able to create tables after reader was added: %w", err)
+	}
+	if err := h.execSQLAsUser(port, "svcdb", "svcreader", readerPassword, "SELECT * FROM post_grant_table"); err != nil {
+		return fmt.Errorf("read-only user should see tables the owner creates later: %w", err)
+	}
+	if err := h.execSQLAsUser(port, "svcdb", "svcreader", readerPassword, "CREATE TABLE denied_check (id int)"); err == nil {
+		return fmt.Errorf("read-only user should not be able to create tables")
+	}
+
+	// --readonly and --owner together are contradictory and must be rejected
+	_, err = h.runCLI("instance", "add-db-user", instanceName, "--username", "confused", "--database", "svcdb", "--readonly", "--owner")
+	if err == nil {
+		return fmt.Errorf("add-db-user --readonly --owner should fail")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		return fmt.Errorf("readonly+owner error should say mutually exclusive: %v", err)
+	}
+
+	// Test 13: One-shot create with a taken username fails atomically —
+	// no database may be left behind
+	_, err = h.createDatabaseWithUserCLI(instanceName, "orphandb", rwUsername)
+	if err == nil {
+		return fmt.Errorf("one-shot create with existing username should fail")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("taken-username error should mention 'already exists': %v", err)
+	}
+	listOutput, err = h.listDatabasesCLI(instanceName)
+	if err != nil {
+		return fmt.Errorf("list databases after failed one-shot create: %w", err)
+	}
+	if strings.Contains(listOutput, "orphandb") {
+		return fmt.Errorf("failed one-shot create must not leave the database behind: %s", listOutput)
 	}
 
 	if err := h.deleteInstance(instanceName); err != nil {

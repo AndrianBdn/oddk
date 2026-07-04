@@ -408,6 +408,39 @@ func (h *TestHarness) createDatabaseCLI(instanceName, databaseName string) (stri
 	return h.runCLI("instance", "create-db", instanceName, "--database", databaseName)
 }
 
+// createDatabaseWithUserCLI creates a database together with its owner user
+// via CLI (one-shot create-db --username)
+func (h *TestHarness) createDatabaseWithUserCLI(instanceName, databaseName, username string) (string, error) {
+	return h.runCLI("instance", "create-db", instanceName, "--database", databaseName, "--username", username)
+}
+
+// execSQLAsUser connects to a database as the given user and runs one statement.
+func (h *TestHarness) execSQLAsUser(port int, database, username, password, sql string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	connStr := fmt.Sprintf("postgres://%s:%s@10.88.0.1:%d/%s?sslmode=disable", username, password, port, database)
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		return fmt.Errorf("connect as %s: %w", username, err)
+	}
+	defer func() {
+		_ = conn.Close(ctx)
+	}()
+	_, err = conn.Exec(ctx, sql)
+	return err
+}
+
+// extractCredentialPassword pulls the generated password out of add-db-user /
+// create-db --username output ("Password: <value>").
+func extractCredentialPassword(output string) (string, error) {
+	for line := range strings.SplitSeq(output, "\n") {
+		if v, ok := strings.CutPrefix(line, "Password: "); ok {
+			return strings.TrimSpace(v), nil
+		}
+	}
+	return "", fmt.Errorf("no password line in output: %s", output)
+}
+
 // addDatabaseUserCLI creates a database user via CLI
 func (h *TestHarness) addDatabaseUserCLI(instanceName, username, database string, readonly bool) (string, error) {
 	args := []string{"instance", "add-db-user", instanceName, "--username", username, "--database", database}

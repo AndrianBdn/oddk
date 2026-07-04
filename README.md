@@ -215,6 +215,18 @@ while the server is still coming up.
 
 ### Databases & users
 
+Deploying a new service? One command creates the database **and** its owner
+user (rolling back the user if database creation fails), and prints the
+generated password and a ready-to-paste connection string. The user owns the
+database, so migrations just work:
+
+```bash
+oddk instance create-db app --database billing --username billing   # DB + owner user
+```
+
+The pieces are also available separately (read-only and extra users are added
+with `add-db-user` once the database exists):
+
 ```bash
 oddk instance create-db app --database analytics
 oddk instance list-dbs app

@@ -239,13 +239,23 @@ func instanceCommands(client *Client) *cli.Command {
 			},
 			{
 				Name:      "create-db",
-				Usage:     "Create a new database",
+				Usage:     "Create a new database (optionally with its owner user in one step)",
 				ArgsUsage: "<instance-name>",
+				Description: "With --username, the database and its owner user are created together\n" +
+					"(if database creation fails, the just-created user is rolled back) — the\n" +
+					"right setup for deploying a service that runs its own migrations. The\n" +
+					"generated password and connection string are printed once.\n\n" +
+					"For read-only or additional users, use add-db-user once the database\n" +
+					"exists.",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "database",
 						Required: true,
 						Usage:    "Database name to create",
+					},
+					&cli.StringFlag{
+						Name:  "username",
+						Usage: "Also create this user as the database owner",
 					},
 				},
 				Action: client.createDatabaseAction,
@@ -304,6 +314,10 @@ func instanceCommands(client *Client) *cli.Command {
 				Name:      "add-db-user",
 				Usage:     "Add database user",
 				ArgsUsage: "<instance-name>",
+				Description: "Adds a user to an existing database.\n\n" +
+					"Tip: when provisioning a new service, create the database and its owner\n" +
+					"user in one step instead:\n" +
+					"   oddk instance create-db <instance> --database <db> --username <user>",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "username",

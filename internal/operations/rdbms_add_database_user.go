@@ -3,6 +3,7 @@ package operations
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -37,6 +38,9 @@ func AddDatabaseUser(ctx context.Context, deps *Dependencies, params AddDatabase
 	if params.Username == "" {
 		return nil, fmt.Errorf("username is required")
 	}
+	if params.ReadOnly && params.Owner {
+		return nil, operr.Invalidf("readOnly and owner are mutually exclusive")
+	}
 
 	// Connect directly to the target database - if it doesn't exist, we'll get an error
 	conn, err := ConnectToRunningInstance(ctx, deps, params.InstanceName, ConnectOptions{Database: params.DatabaseName})
@@ -62,6 +66,17 @@ func AddDatabaseUser(ctx context.Context, deps *Dependencies, params AddDatabase
 		return nil, operr.Conflictf("user %s already exists", params.Username)
 	}
 
+	// The database owner matters for default privileges: ALTER DEFAULT
+	// PRIVILEGES issued as postgres only covers objects postgres itself
+	// creates later, so grantStatements must also issue them FOR ROLE the
+	// owner (the role that actually creates tables when the database was
+	// provisioned via create-db --username).
+	var dbOwner string
+	ownerQuery := "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()"
+	if err := conn.QueryRow(ctx, ownerQuery).Scan(&dbOwner); err != nil {
+		return nil, fmt.Errorf("failed to look up database owner: %w", err)
+	}
+
 	// Generate a secure password
 	password := util.GenerateSecurePassword(24)
 
@@ -76,9 +91,9 @@ func AddDatabaseUser(ctx context.Context, deps *Dependencies, params AddDatabase
 
 	// Apply database- and schema-level grants; the first failure rolls back
 	// the just-created user.
-	for _, step := range grantStatements(params.DatabaseName, params.Username, params.ReadOnly) {
+	for _, step := range grantStatements(params.DatabaseName, params.Username, params.ReadOnly, dbOwner) {
 		if _, err := conn.Exec(ctx, step.sql); err != nil {
-			dropUserBestEffort(ctx, conn, params.Username)
+			_ = dropUserBestEffort(ctx, conn, params.Username)
 			return nil, fmt.Errorf("failed to %s: %w", step.what, err)
 		}
 	}
@@ -89,7 +104,7 @@ func AddDatabaseUser(ctx context.Context, deps *Dependencies, params AddDatabase
 		// We need a separate connection to postgres database for ALTER DATABASE
 		postgresConn, err := ConnectToRunningInstance(ctx, deps, params.InstanceName, ConnectOptions{Database: "postgres"})
 		if err != nil {
-			dropUserBestEffort(ctx, conn, params.Username)
+			_ = dropUserBestEffort(ctx, conn, params.Username)
 			return nil, fmt.Errorf("failed to connect to postgres database for ownership transfer: %w", err)
 		}
 		defer func() { _ = postgresConn.Close(ctx) }()
@@ -98,7 +113,7 @@ func AddDatabaseUser(ctx context.Context, deps *Dependencies, params AddDatabase
 			pgx.Identifier{params.DatabaseName}.Sanitize(),
 			pgx.Identifier{params.Username}.Sanitize())
 		if _, err := postgresConn.Exec(ctx, alterDBQuery); err != nil {
-			dropUserBestEffort(ctx, conn, params.Username)
+			_ = dropUserBestEffort(ctx, conn, params.Username)
 			return nil, fmt.Errorf("failed to transfer database ownership: %w", err)
 		}
 
@@ -141,39 +156,66 @@ type sqlStep struct {
 // read-write grants (CREATE on the database, ALL on the public schema and
 // existing objects, plus ALL default privileges for future tables, sequences
 // and functions).
-func grantStatements(databaseName, username string, readOnly bool) []sqlStep {
+//
+// ALTER DEFAULT PRIVILEGES only applies to objects later created BY the role
+// that issued it — plain statements run as postgres cover only postgres's
+// future objects. When the database is owned by another role (the usual case
+// after create-db --username, where the owner runs the app's migrations),
+// each default-privileges statement is issued a second time FOR ROLE <owner>
+// so this user also covers tables the owner creates in the future.
+func grantStatements(databaseName, username string, readOnly bool, dbOwner string) []sqlStep {
 	db := pgx.Identifier{databaseName}.Sanitize()
 	user := pgx.Identifier{username}.Sanitize()
+
+	forRoles := []string{""} // "" = as the connecting role (postgres)
+	if dbOwner != "" && dbOwner != "postgres" && dbOwner != username {
+		forRoles = append(forRoles, " FOR ROLE "+pgx.Identifier{dbOwner}.Sanitize())
+	}
 
 	steps := []sqlStep{
 		{"grant connect permission", fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", db, user)},
 	}
 
 	if readOnly {
-		return append(steps,
+		steps = append(steps,
 			sqlStep{"grant usage on schema", fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", user)},
 			sqlStep{"grant select on tables", fmt.Sprintf("GRANT SELECT ON ALL TABLES IN SCHEMA public TO %s", user)},
 			sqlStep{"grant select on sequences", fmt.Sprintf("GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO %s", user)},
-			sqlStep{"set default privileges", fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO %s", user)},
 		)
+		for _, forRole := range forRoles {
+			steps = append(steps,
+				sqlStep{"set default privileges", fmt.Sprintf("ALTER DEFAULT PRIVILEGES%s IN SCHEMA public GRANT SELECT ON TABLES TO %s", forRole, user)},
+			)
+		}
+		return steps
 	}
 
-	return append(steps,
+	steps = append(steps,
 		sqlStep{"grant create permission", fmt.Sprintf("GRANT CREATE ON DATABASE %s TO %s", db, user)},
 		sqlStep{"grant all on schema", fmt.Sprintf("GRANT ALL ON SCHEMA public TO %s", user)},
 		sqlStep{"grant all on tables", fmt.Sprintf("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO %s", user)},
 		sqlStep{"grant all on sequences", fmt.Sprintf("GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO %s", user)},
-		sqlStep{"set default privileges on tables", fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO %s", user)},
-		sqlStep{"set default privileges on sequences", fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO %s", user)},
-		sqlStep{"set default privileges on functions", fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO %s", user)},
 	)
+	for _, forRole := range forRoles {
+		steps = append(steps,
+			sqlStep{"set default privileges on tables", fmt.Sprintf("ALTER DEFAULT PRIVILEGES%s IN SCHEMA public GRANT ALL ON TABLES TO %s", forRole, user)},
+			sqlStep{"set default privileges on sequences", fmt.Sprintf("ALTER DEFAULT PRIVILEGES%s IN SCHEMA public GRANT ALL ON SEQUENCES TO %s", forRole, user)},
+			sqlStep{"set default privileges on functions", fmt.Sprintf("ALTER DEFAULT PRIVILEGES%s IN SCHEMA public GRANT ALL ON FUNCTIONS TO %s", forRole, user)},
+		)
+	}
+	return steps
 }
 
-// dropUserBestEffort rolls back a partially-configured user; failures are
-// ignored because the original error is what the caller reports.
-func dropUserBestEffort(ctx context.Context, conn *pgx.Conn, username string) {
+// dropUserBestEffort rolls back a partially-configured user. The failure (if
+// any) is logged and returned so callers can surface that the user survived,
+// but the original error remains what the caller reports.
+func dropUserBestEffort(ctx context.Context, conn *pgx.Conn, username string) error {
 	dropUserQuery := fmt.Sprintf("DROP USER %s", pgx.Identifier{username}.Sanitize())
-	_, _ = conn.Exec(ctx, dropUserQuery)
+	if _, err := conn.Exec(ctx, dropUserQuery); err != nil {
+		log.Printf("WARNING: failed to roll back user %s: %v", username, err)
+		return err
+	}
+	return nil
 }
 
 // transferSchemaObjectsOwnership transfers ownership of all user objects in public schema
