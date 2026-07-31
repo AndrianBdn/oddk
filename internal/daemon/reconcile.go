@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/andrianbdn/oddk/internal/docker"
+	"github.com/andrianbdn/oddk/internal/operations"
 	"github.com/andrianbdn/oddk/internal/store"
 )
 
@@ -33,6 +34,16 @@ func reconcileInstances(st *store.Store, dockerClient *docker.Client) {
 		// "creating" can only mean a create operation died mid-flight.
 		if inst.Status == "creating" {
 			log.Printf("Reconcile: instance %s is stuck in 'creating' (interrupted create) - marking 'error'; destroy and re-create it", inst.Name)
+			reconcileSetStatus(st, inst.Name, "error")
+			continue
+		}
+
+		// "restoring" means 'snapshot apply' died mid-flight. The container may
+		// well be up and accepting connections, which is exactly why this must
+		// not be left alone: its databases are only partially restored, and the
+		// health check (a bare connect+ping) would report it healthy.
+		if inst.Status == "restoring" {
+			log.Printf("Reconcile: instance %s is stuck in 'restoring' (interrupted snapshot apply) - marking 'error'; its data is incomplete, re-apply the snapshot or restore it from a backup", inst.Name)
 			reconcileSetStatus(st, inst.Name, "error")
 			continue
 		}
@@ -95,7 +106,9 @@ func reconcileSetStatus(st *store.Store, name, status string) {
 // directory. Safe to delete at startup: operations are uninterruptible and
 // none can be in flight before the HTTP server starts, so anything matching
 // these prefixes was orphaned by a previous daemon run.
-var staleBackupArtifactPrefixes = []string{".tmp-", ".pgpass-", ".restore-", ".upgrade-"}
+var staleBackupArtifactPrefixes = []string{
+	".tmp-", ".pgpass-", ".restore-", ".upgrade-", operations.SnapshotStagingPrefix,
+}
 
 // sweepBackupDir removes orphaned temp artifacts from the backup directory and
 // reconciles backup records with the files on disk. Records whose file is gone
@@ -141,10 +154,55 @@ func sweepBackupDir(st *store.Store, backupDir string) {
 			referenced[filepath.Base(rec.LocalLocation.String)] = true
 		}
 	}
+
+	// Snapshots have their OWN catalogue (snapshot_history), so a snapshot
+	// archive is only an orphan if that catalogue does not reference it either.
+	//
+	// This used to blanket-skip every snapshot-prefixed file, because snapshots
+	// were deliberately unrecorded and warning on each startup would have been
+	// noise. They are recorded now, so the blanket skip would hide a genuinely
+	// unmanaged archive — exactly what this check exists to surface.
+	snapshotReferenced, err := st.Snapshot.ReferencedFilenames()
+	if err != nil {
+		log.Printf("Warning: startup snapshot record check skipped: %v", err)
+		snapshotReferenced = map[string]bool{}
+	}
+
 	for _, entry := range entries {
 		name := entry.Name()
-		if !entry.IsDir() && strings.HasSuffix(name, ".tar.zst") && !referenced[name] {
-			log.Printf("Warning: backup directory contains archive %s that no backup record references - ODDK will not manage or clean it up", name)
+		if entry.IsDir() || !strings.HasSuffix(name, ".tar.zst") || referenced[name] {
+			continue
 		}
+		if strings.HasPrefix(name, operations.SnapshotFilePrefix) {
+			if snapshotReferenced[name] {
+				continue
+			}
+			log.Printf("Warning: backup directory contains snapshot %s that no snapshot record references - ODDK will not manage, upload or clean it up", name)
+			continue
+		}
+		log.Printf("Warning: backup directory contains archive %s that no backup record references - ODDK will not manage or clean it up", name)
+	}
+}
+
+// reconcileInterruptedSnapshotRuns closes out scheduled-snapshot runs that a
+// previous process started and never finished.
+//
+// Every incomplete row at startup is by definition from a dead process. Left
+// alone it looks perpetually in-flight: the scheduler's dedup window counts it,
+// so no further snapshot is attempted for the whole plan interval, while nothing
+// records that the run failed. This is the audit signal — the same reasoning
+// that converts a stuck instance status of "restoring" into "error".
+//
+// Deliberately scoped to the snapshot sentinel. Per-instance backup runs use a
+// fixed one-hour dedup window and were not written with this in mind; widening
+// it is a separate change.
+func reconcileInterruptedSnapshotRuns(st *store.Store) {
+	n, err := st.Cron.MarkInterruptedRuns(operations.SnapshotCronInstance)
+	if err != nil {
+		log.Printf("Warning: could not reconcile interrupted snapshot runs: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("Marked %d interrupted snapshot run(s) from a previous daemon process; the next scheduled slot will run normally", n)
 	}
 }

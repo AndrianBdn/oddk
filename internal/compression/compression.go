@@ -64,6 +64,58 @@ func (c *Compressor) CreateTarZstd(ctx context.Context, sourceDir, archivePath s
 	return stat.Size(), nil
 }
 
+// ArchiveEntry maps a path on disk to the name it takes inside an archive.
+// A directory source is added recursively under ArchiveName.
+type ArchiveEntry struct {
+	SourcePath  string
+	ArchiveName string
+}
+
+// CreateTarZstdOrdered creates a tar.zst archive whose top-level entries appear
+// in the order given, rather than in the map-iteration order CreateTarZstd
+// produces.
+//
+// Order is not cosmetic here: tar has no index, so reading one member means
+// decompressing everything ahead of it. A snapshot puts its manifest first so a
+// reader can validate version compatibility from the first few kilobytes
+// instead of streaming through gigabytes of dumps to find it.
+func (c *Compressor) CreateTarZstdOrdered(ctx context.Context, entries []ArchiveEntry, archivePath string) (int64, error) {
+	if len(entries) == 0 {
+		return 0, fmt.Errorf("no entries to archive")
+	}
+
+	// FilesFromDisk takes a map, so its output order is undefined. Call it once
+	// per entry and concatenate to get a deterministic sequence.
+	var files []archives.FileInfo
+	for _, entry := range entries {
+		got, err := archives.FilesFromDisk(ctx, nil, map[string]string{entry.SourcePath: entry.ArchiveName})
+		if err != nil {
+			return 0, fmt.Errorf("read %s from disk: %w", entry.SourcePath, err)
+		}
+		files = append(files, got...)
+	}
+
+	outputFile, err := os.Create(archivePath) // #nosec G304 - archivePath is controlled by caller
+	if err != nil {
+		return 0, fmt.Errorf("failed to create archive file: %w", err)
+	}
+	defer func() { _ = outputFile.Close() }()
+
+	format := archives.CompressedArchive{
+		Compression: archives.Zstd{},
+		Archival:    archives.Tar{},
+	}
+	if err := format.Archive(ctx, outputFile, files); err != nil {
+		return 0, fmt.Errorf("failed to create archive: %w", err)
+	}
+
+	stat, err := outputFile.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get archive size: %w", err)
+	}
+	return stat.Size(), nil
+}
+
 // ExtractTarZstd extracts a tar.zst archive to the destination directory using Go
 func (c *Compressor) ExtractTarZstd(ctx context.Context, archivePath, destDir string) error {
 	// Create destination directory if it doesn't exist

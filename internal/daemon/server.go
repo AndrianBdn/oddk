@@ -30,6 +30,10 @@ type Server struct {
 	cronTracker     *CronTaskTracker
 	healthScheduler *HealthScheduler
 	cancel          context.CancelFunc // Just keep cancel func to stop background processes
+
+	// dirLock is the exclusive advisory lock on the data directory, held for
+	// the daemon's lifetime so 'snapshot apply' cannot run concurrently.
+	dirLock *store.DataDirLock
 }
 
 func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, allowRemote bool) (*Server, error) {
@@ -43,6 +47,25 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 
 	log.Printf("Using data directory: %s", dataDir)
 	log.Printf("Using backup directory: %s", backupDir)
+
+	// Take the data-dir lock before touching anything. 'snapshot apply' holds
+	// this same lock for its whole destructive phase, so refusing to start here
+	// is what stops a systemd Restart=always from bringing the daemon up in the
+	// middle of a restore — where it would drive Docker, sweep the restore's
+	// helper containers, and write the oddk.db being replaced.
+	dirLock, err := store.AcquireDataDirLock(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot start: %w", err)
+	}
+	// On success the Server owns the lock and releases it in Shutdown; if
+	// construction fails anywhere below, drop it here rather than holding it
+	// for the life of the process (the e2e harness builds servers repeatedly).
+	constructed := false
+	defer func() {
+		if !constructed {
+			dirLock.Release()
+		}
+	}()
 
 	masterKey, err := crypto.GetOrCreateKeyFile(dataDir)
 	if err != nil {
@@ -83,6 +106,7 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 	// submit operations.
 	reconcileInstances(store, dockerClient)
 	sweepBackupDir(store, backupDir)
+	reconcileInterruptedSnapshotRuns(store)
 	reencryptLegacySecrets(store, masterKey)
 
 	executor := operations.NewExecutor()
@@ -95,11 +119,12 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 		Logger:    log.New(os.Stdout, "[ODDK] ", log.LstdFlags),
 	}
 
-	cronTracker := NewCronTaskTracker(opDeps, executor)
+	cronTracker := NewCronTaskTracker(opDeps, executor, backupDir)
 
 	healthChecker := services.NewHealthChecker(store, dockerClient, dataDir, backupDir, masterKey)
 	healthScheduler := NewHealthScheduler(healthChecker, healthCheckIntervalSec)
 
+	constructed = true
 	return &Server{
 		store:           store,
 		docker:          dockerClient,
@@ -111,6 +136,7 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 		backupDir:       backupDir,
 		cronTracker:     cronTracker,
 		healthScheduler: healthScheduler,
+		dirLock:         dirLock,
 	}, nil
 }
 
@@ -124,6 +150,8 @@ func (s *Server) Start() error {
 	go s.startCronScheduler(ctx)
 
 	go s.healthScheduler.Start(ctx)
+
+	go s.startLogRetentionSweeper(ctx)
 
 	// Bind to loopback by default. --allow-remote opts into 0.0.0.0; warn
 	// loudly because there's no TLS — the auth token transits cleartext.
@@ -158,6 +186,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	// Release the data-dir lock so a 'snapshot apply' can proceed once the
+	// daemon is down. (The kernel would drop it at process exit anyway, but the
+	// daemon is also constructed in-process by tests.)
+	defer s.dirLock.Release()
 
 	// Shutdown HTTP server with provided context
 	if s.httpServer != nil {

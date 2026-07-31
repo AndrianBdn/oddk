@@ -23,10 +23,6 @@ import (
 	"github.com/andrianbdn/oddk/internal/store/parameters"
 )
 
-// maxRestoreJobs caps the parallelism passed to pg_restore -j so a high core
-// count doesn't overwhelm a freshly-started cluster.
-const maxRestoreJobs = 8
-
 // UpgradeRDBMSOp performs a major-version PostgreSQL upgrade of an instance
 // using a logical dump/restore: it takes a verified full backup, destroys the
 // old cluster volume, creates a fresh cluster at the target version (which
@@ -314,111 +310,25 @@ func (op *UpgradeRDBMSOp) replaceCluster(ctx context.Context, plan *upgradePlan,
 	return nil
 }
 
-// restoreIntoCluster replays globals and every database from the extracted
-// backup into the fresh cluster, then verifies that all expected roles and
-// databases exist. Returns the number of user databases restored.
+// restoreIntoCluster replays the extracted backup into the fresh cluster via
+// the shared RestoreClusterFromArchive engine, adding the upgrade-specific
+// bookkeeping: any failure past this point marks the instance "error" and
+// carries recoverHint, since the pre-upgrade backup is now the only copy.
 func (op *UpgradeRDBMSOp) restoreIntoCluster(ctx context.Context, plan *upgradePlan, extractedDir string, dbs []DatabaseMeta, recoverHint string) (int, error) {
-	name := op.params.Name
-	instance := plan.instance
-
-	// Apply globals (roles + hashed passwords). ON_ERROR_STOP=0 tolerates
-	// the pre-existing postgres role / default ACLs.
-	if err := restoreGlobals(ctx, op.deps, name, plan.targetImage, instance.Port, plan.password, extractedDir); err != nil {
-		op.markError()
-		return 0, fmt.Errorf("restore globals: %w; %s", err, recoverHint)
-	}
-
-	// Verify globals actually created every expected role. psql runs with
-	// ON_ERROR_STOP=0 (it must tolerate initdb collisions like the bootstrap
-	// postgres role), so a role that silently failed to restore would otherwise
-	// slip through — catch it here before declaring success.
-	if err := verifyRolesPresent(ctx, instance.Port, plan.password, plan.roleNames); err != nil {
-		op.markError()
-		return 0, fmt.Errorf("globals restore incomplete: %w; %s", err, recoverHint)
-	}
-
-	// Recreate + restore each database with ownership preserved.
-	jobs := min(max(instance.CPUCores, 1), maxRestoreJobs)
-
-	conn, err := connectDirect(ctx, instance.Port, plan.password, "postgres")
+	restored, err := RestoreClusterFromArchive(ctx, op.deps, RestoreClusterParams{
+		InstanceName:  op.params.Name,
+		Image:         plan.targetImage,
+		Port:          plan.instance.Port,
+		Password:      plan.password,
+		CPUCores:      plan.instance.CPUCores,
+		ExtractedDir:  extractedDir,
+		Databases:     dbs,
+		ExpectedRoles: plan.roleNames,
+	})
 	if err != nil {
 		op.markError()
-		return 0, fmt.Errorf("connect to target cluster: %w; %s", err, recoverHint)
+		return 0, fmt.Errorf("%w; %s", err, recoverHint)
 	}
-	defer func() { _ = conn.Close(ctx) }()
-
-	restored := 0
-	for _, db := range dbs {
-		if db.Name == "template0" || db.Name == "template1" {
-			continue
-		}
-
-		dbDir := filepath.Join(extractedDir, "databases", db.Name)
-		if _, statErr := os.Stat(dbDir); statErr != nil {
-			if db.Name == "postgres" {
-				continue // empty admin db not in archive — nothing to restore
-			}
-			op.markError()
-			return 0, fmt.Errorf("database %s missing from backup archive; %s", db.Name, recoverHint)
-		}
-
-		// The fresh cluster already has a "postgres" database; recreate the
-		// others from template0 with their original owner + encoding/collation
-		// so collation behavior is preserved across the upgrade. Database-level
-		// CREATE grants are replayed after the data restore (see below).
-		if db.Name != "postgres" {
-			createSQL := buildCreateDatabaseSQL(db.Name, db, true)
-			if _, err := conn.Exec(ctx, createSQL); err != nil {
-				op.markError()
-				return 0, fmt.Errorf("create database %s (owner %s): %w; %s", db.Name, db.Owner, err, recoverHint)
-			}
-		}
-
-		if err := restoreDatabaseWithOwner(ctx, op.deps, name, plan.targetImage, instance.Port, plan.password, dbDir, db.Name, jobs); err != nil {
-			op.markError()
-			return 0, fmt.Errorf("restore database %s: %w; %s", db.Name, err, recoverHint)
-		}
-
-		if db.Name != "postgres" {
-			// pg_restore ran with --no-owner --no-privileges, so database-level
-			// CREATE grants are not carried over. Replay the captured grants for
-			// roles present on the fresh cluster (globals restored the roles just
-			// above), mirroring the backup-restore path — otherwise an app role
-			// that could create schemas before the upgrade silently loses that
-			// right after it. Missing roles are logged and skipped; a genuine
-			// grant failure aborts the upgrade (the pre-upgrade backup remains).
-			missingRoles, grantErr := restoreDatabaseCreateGrants(ctx, conn, db.Name, db.CreateGrantees)
-			if grantErr != nil {
-				op.markError()
-				return 0, fmt.Errorf("restore CREATE grants on database %s: %w; %s", db.Name, grantErr, recoverHint)
-			}
-			if len(missingRoles) > 0 {
-				log.Printf(
-					"WARNING: major-upgrade: skipped CREATE grants on database %q for roles absent from the target: %s",
-					db.Name, strings.Join(missingRoles, ", "),
-				)
-			}
-
-			restored++
-		}
-	}
-
-	// Verify the restored cluster has every expected database.
-	presentDBs, err := listUserDatabasesDirect(ctx, instance.Port, plan.password)
-	if err != nil {
-		op.markError()
-		return 0, fmt.Errorf("verify restored cluster: %w; %s", err, recoverHint)
-	}
-	for _, db := range dbs {
-		if db.Name == "template0" || db.Name == "template1" {
-			continue
-		}
-		if !presentDBs[db.Name] {
-			op.markError()
-			return 0, fmt.Errorf("verification failed: database %s missing after upgrade; %s", db.Name, recoverHint)
-		}
-	}
-
 	return restored, nil
 }
 

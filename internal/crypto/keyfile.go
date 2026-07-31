@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const KeyFileSize = 32 // 256 bits for AES-256
@@ -59,4 +60,48 @@ func GetOrCreateKeyFile(dataDir string) ([]byte, error) {
 	}
 
 	return key, nil
+}
+
+// ReadKeyFileAt reads a master key from an arbitrary path, for `snapshot apply`
+// where the operator supplies the source host's key from wherever they archived
+// it.
+//
+// Unlike GetOrCreateKeyFile this never creates a key, and it does not reject
+// loose permissions: a key restored from backup media legitimately arrives
+// 0644, and refusing it would block a disaster recovery for a property of a
+// file that is about to be re-written with 0600 anyway. Symlinks are still
+// refused, and the format is still validated.
+func ReadKeyFileAt(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read master key %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("master key %s is a symlink, refusing to use", path)
+	}
+
+	keyData, err := os.ReadFile(path) //nolint:gosec // operator-supplied path is the point of this function
+	if err != nil {
+		return nil, fmt.Errorf("read master key %s: %w", path, err)
+	}
+	key, err := base64.URLEncoding.DecodeString(strings.TrimSpace(string(keyData)))
+	if err != nil {
+		return nil, fmt.Errorf("master key %s is not a valid ODDK key file (expected base64url): %w", path, err)
+	}
+	if len(key) != KeyFileSize {
+		return nil, fmt.Errorf("master key %s has size %d, expected %d", path, len(key), KeyFileSize)
+	}
+	return key, nil
+}
+
+// WriteKeyFile installs a master key at path with 0600 permissions.
+func WriteKeyFile(path string, key []byte) error {
+	if len(key) != KeyFileSize {
+		return fmt.Errorf("refusing to write master key of size %d, expected %d", len(key), KeyFileSize)
+	}
+	encoded := base64.URLEncoding.EncodeToString(key)
+	if err := os.WriteFile(path, []byte(encoded), 0o600); err != nil {
+		return fmt.Errorf("write master key %s: %w", path, err)
+	}
+	return nil
 }

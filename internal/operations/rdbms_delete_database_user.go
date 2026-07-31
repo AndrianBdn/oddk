@@ -103,14 +103,30 @@ func DeleteDatabaseUser(ctx context.Context, deps *Dependencies, params DeleteDa
 			continue
 		}
 
-		// Reassign all owned objects in this database to postgres
+		// Reassign all owned objects in this database to postgres.
+		//
+		// This MUST succeed before DROP OWNED BY runs below. DROP OWNED BY drops
+		// every object the role still owns, so treating a failed reassign as a
+		// warning and falling through would destroy user tables instead of merely
+		// revoking privileges. Abort the whole operation instead: the role still
+		// owns objects, so the closing DROP USER could not succeed anyway.
+		//
+		// The realistic failure is a large database. REASSIGN OWNED locks every
+		// object it touches in a single transaction, so a database holding more
+		// relations than the shared lock pool
+		// (max_locks_per_transaction * max_connections) exhausts it and errors.
 		reassignQuery := fmt.Sprintf("REASSIGN OWNED BY %s TO postgres",
 			pgx.Identifier{params.Username}.Sanitize())
 		if _, err := dbConn.Exec(ctx, reassignQuery); err != nil {
-			log.Printf("Warning: failed to reassign owned objects in database %s: %v", dbName, err)
+			_ = dbConn.Close(ctx)
+			return nil, fmt.Errorf("reassign objects owned by %s in database %s (user was NOT deleted; "+
+				"on an out-of-shared-memory error raise max_locks_per_transaction): %w",
+				params.Username, dbName, err)
 		}
 
-		// Drop any privileges granted to the user (but not the objects themselves)
+		// Drop privileges granted to the user. The reassign above succeeded, so
+		// the role owns nothing here and this revokes grants without dropping
+		// objects.
 		dropOwnedQuery := fmt.Sprintf("DROP OWNED BY %s",
 			pgx.Identifier{params.Username}.Sanitize())
 		if _, err := dbConn.Exec(ctx, dropOwnedQuery); err != nil {

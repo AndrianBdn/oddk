@@ -28,10 +28,14 @@ oddk instance get-postgres-password app --conn
 - **Opinionated and batteries-included.** Sensible defaults for resources,
   shared memory, networking, and tuning — plus AWS-style *parameter groups* when
   you want to override them.
-- **Operationally complete.** Backups (local + S3 offsite), scheduled daily
-  backups with retention, point-in-time-style restore from any archive, health
+- **Operationally complete.** Whole-deployment *snapshots* — scheduled, shipped
+  to S3, and able to rebuild a single instance or an entire host — plus
+  per-instance backups with retention and single-database restore, health
   monitoring with Email/Slack/Telegram/Webhook alerts, password and user
   management, minor-version image switches, and dump/restore major upgrades.
+- **Actually recoverable.** A snapshot carries every instance's data *and* ODDK's
+  own configuration, so a dead host can be rebuilt from one archive plus the
+  master key — not reassembled by hand from per-database dumps.
 - **Secure by default for a single host.** Secrets encrypted at rest, a
   loopback-only API behind a bearer token, and Postgres bound to a host-local
   bridge — not the public internet.
@@ -245,6 +249,14 @@ oddk instance reset-db-user-password app --username appuser
 oddk instance delete-db-user app --username appuser
 ```
 
+`delete-db-user` first reassigns everything the user owns to `postgres`, then
+revokes its grants and drops the role. If that reassignment fails the command
+aborts and leaves the user in place — it will not proceed to a step that would
+drop the objects instead of the grants. On a very large database the reassign
+can exhaust the shared lock table (`out of shared memory ... increase
+max_locks_per_transaction`); raise `max_locks_per_transaction` with a parameter
+group and retry.
+
 ### Passwords
 
 ```bash
@@ -254,7 +266,69 @@ oddk instance get-postgres-password app --conn          # connection string
 NEW_PGPASSWORD=secret oddk instance set-postgres-password app
 ```
 
-### Backups
+### Snapshots — the recommended way to protect a deployment
+
+A **snapshot** captures *everything*: every instance's databases and roles, plus
+ODDK's own configuration, in one archive. It is what a host migration or a real
+disaster recovery restores from. A per-instance backup cannot do that — it holds
+one instance's data and none of the configuration needed to rebuild it.
+
+```bash
+# Capture the whole deployment
+oddk snapshot make --comment "before major upgrade"
+oddk snapshot list
+
+# Schedule it. One schedule per deployment — a snapshot covers every instance.
+oddk snapshot setup-cron --utc-hour 3                     # daily at 03:00 UTC
+oddk snapshot setup-cron --utc-hour 3 --interval-hours 6  # 03,09,15,21 UTC
+oddk snapshot list-cron
+
+# Offsite (requires `oddk offsite apply`, below)
+oddk snapshot upload <id>
+oddk snapshot download <id>
+oddk snapshot remove-local <id>
+oddk snapshot remove-remote <id>
+```
+
+Restoring comes in two shapes:
+
+```bash
+# Rebuild ONE instance into a deployment that stays up.
+# Creates it if it is gone; replaces its data if it is still there.
+oddk snapshot restore-instance --instance app --file snapshot-db01-20260729140312.tar.zst
+
+# Rebuild a WHOLE HOST — migration or disaster recovery.
+# Runs locally, not through the daemon, so it works when the daemon cannot start.
+systemctl stop oddk
+sudo -u oddk oddk snapshot apply \
+      --file /mnt/restore/snapshot-db01-20260729140312.tar.zst \
+      --master-key /mnt/restore/master.key
+systemctl start oddk
+```
+
+What you need to know:
+
+- **Back up `master.key` separately.** It is deliberately *not* in the archive,
+  and a snapshot cannot be applied without it.
+- **Snapshots are not encrypted.** They contain database contents and role
+  password hashes in plaintext. Store them accordingly.
+- **A stopped instance is captured configuration-only** — no databases. This is
+  reported, never silent.
+- Restoring an instance sets its postgres password to the snapshot's, because the
+  archive carries only the hash. Re-read it with `instance get-postgres-password`.
+- Retention keeps the newest snapshots regardless of age, so a run of failed
+  captures can never expire everything you have.
+- Offsite upload is currently limited to 5 GiB per snapshot (a single S3
+  `PutObject`; no multipart yet).
+
+`oddk checklist` reports whether snapshots are scheduled and how stale the newest
+one is.
+
+### Backups (per-instance)
+
+> **Snapshots are now the recommended way to protect a deployment** — see above.
+> Per-instance backups remain fully supported, and are still the way to restore
+> or clone a **single database**, which snapshots cannot yet do.
 
 ```bash
 oddk backup make app --comment "before deploy"
@@ -287,7 +361,8 @@ oddk backup download app <backup-id>
 ```
 
 When offsite is configured, failed uploads are retried on later cron runs, and
-local retention never deletes a backup whose only copy is local.
+local retention never deletes a backup whose only copy is local. The same offsite
+configuration serves snapshots.
 
 ### Custom images (pgvector, postgis, …)
 

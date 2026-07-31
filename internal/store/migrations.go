@@ -23,6 +23,7 @@ func (s *Store) runAllMigrations() error {
 		{"014_backup_dual_locations", migration014BackupDualLocations},
 		{"015_cron_cleanup_days", migration015CronCleanupDays},
 		{"016_instance_image", migration016InstanceImage},
+		{"017_snapshot_tables", migration017SnapshotTables},
 	}
 
 	for _, m := range migrations {
@@ -382,6 +383,60 @@ func migration015CronCleanupDays(sqx *sqlx.DB) error {
 	// Drop the old table and rename the new one
 	sqx.MustExec(`DROP TABLE cron_plans`)
 	sqx.MustExec(`ALTER TABLE cron_plans_new RENAME TO cron_plans`)
+
+	return nil
+}
+
+// migration017SnapshotTables adds the deployment-wide snapshot schedule and the
+// catalogue of snapshots taken.
+//
+// snapshot_plans is a SINGLETON — `id INTEGER PRIMARY KEY CHECK (id = 1)` — not
+// a per-instance table like cron_plans. A snapshot covers the whole deployment,
+// so per-instance scheduling would be expressing something that cannot happen.
+// The CHECK is what enforces it: without it, nothing stops a second plan row and
+// the scheduler would silently pick whichever it read first.
+//
+// interval_hours is anchored to utc_hour, so a plan runs at every hour h where
+// (h - utc_hour) mod interval_hours == 0. It is constrained to a divisor of 24
+// so the pattern does not go ragged across midnight: interval 5 anchored at 03
+// would fire 03,08,13,18,23 and then 03 again — a 4-hour gap that silently
+// breaks the "every 5 hours" the operator asked for. Divisors are 1,2,3,4,6,8,
+// 12,24; 24 (the default) means once a day at utc_hour, matching cron_plans.
+//
+// snapshot_history mirrors backup_history's dual-location model, including its
+// CHECK: a row with neither a local nor a remote copy describes nothing, and
+// retention must delete the row rather than leave a phantom.
+func migration017SnapshotTables(sqx *sqlx.DB) error {
+	sqx.MustExec(`
+		CREATE TABLE snapshot_plans (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			utc_hour INTEGER NOT NULL CHECK (utc_hour >= 0 AND utc_hour < 24),
+			interval_hours INTEGER NOT NULL DEFAULT 24
+				CHECK (interval_hours IN (1, 2, 3, 4, 6, 8, 12, 24)),
+			cleanup_local_days INTEGER NOT NULL DEFAULT 7,
+			cleanup_remote_days INTEGER NOT NULL DEFAULT 14,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`)
+
+	sqx.MustExec(`
+		CREATE TABLE snapshot_history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			filename TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			size INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL,
+			instances_with_data INTEGER NOT NULL DEFAULT 0,
+			config_only INTEGER NOT NULL DEFAULT 0,
+			local_location TEXT,
+			remote_location TEXT,
+			comment TEXT,
+			CHECK (local_location IS NOT NULL OR remote_location IS NOT NULL)
+		)
+	`)
+
+	sqx.MustExec(`CREATE INDEX idx_snapshot_history_created_at ON snapshot_history(created_at)`)
 
 	return nil
 }

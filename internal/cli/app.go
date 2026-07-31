@@ -33,6 +33,7 @@ func BuildApp(client *Client) *cli.Command {
 			instanceCommands(client),
 			notifyCommands(client),
 			backupCommands(client),
+			snapshotCommands(client),
 			parametersCommands(client),
 			customKVCommands(client),
 			offsiteCommands(client),
@@ -522,6 +523,184 @@ func notifyCommands(client *Client) *cli.Command {
 					},
 				},
 				Action: client.notifyLogsAction,
+			},
+		},
+	}
+}
+
+// snapshotCommands groups whole-deployment operations. `backup` is
+// per-instance; `snapshot` is the entire deployment including oddk.db.
+func snapshotCommands(client *Client) *cli.Command {
+	return &cli.Command{
+		Name:  "snapshot",
+		Usage: "Capture or restore the whole deployment (all instances + configuration)",
+		Commands: []*cli.Command{
+			{
+				Name:  "make",
+				Usage: "Capture every instance and the ODDK configuration into a single archive",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "comment",
+						Usage: "Note stored with the snapshot (e.g. \"before major upgrade\")",
+					},
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "Output as JSON",
+					},
+				},
+				Action: client.snapshotMakeAction,
+			},
+			{
+				Name:  "list",
+				Usage: "List snapshots recorded on this host",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
+				},
+				Action: client.snapshotListAction,
+			},
+			{
+				Name:      "upload",
+				Usage:     "Upload a snapshot to S3 (requires offsite configuration)",
+				ArgsUsage: "<snapshot-id>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
+				},
+				Action: client.snapshotUploadAction,
+			},
+			{
+				Name:      "download",
+				Usage:     "Download a snapshot from S3 back to this host",
+				ArgsUsage: "<snapshot-id>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
+				},
+				Action: client.snapshotDownloadAction,
+			},
+			{
+				Name:      "remove-local",
+				Usage:     "Remove a snapshot's local copy (keeps the S3 copy if there is one)",
+				ArgsUsage: "<snapshot-id>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "force", Usage: "Skip the confirmation prompt"},
+				},
+				Action: client.snapshotRemoveLocalAction,
+			},
+			{
+				Name:      "remove-remote",
+				Usage:     "Remove a snapshot's S3 copy (keeps the local copy if there is one)",
+				ArgsUsage: "<snapshot-id>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "force", Usage: "Skip the confirmation prompt"},
+				},
+				Action: client.snapshotRemoveRemoteAction,
+			},
+			{
+				Name:  "setup-cron",
+				Usage: "Schedule whole-deployment snapshots (one schedule per deployment)",
+				Description: "A snapshot covers every instance, so there is exactly one schedule.\n" +
+					"--interval-hours must divide 24 evenly, so the pattern does not drift\n" +
+					"across midnight; the default of 24 means once a day at --utc-hour.",
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "utc-hour",
+						Usage: "Hour (UTC) the schedule is anchored to",
+					},
+					&cli.IntFlag{
+						Name:  "interval-hours",
+						Usage: "Run every N hours from the anchor (1,2,3,4,6,8,12,24)",
+						Value: 24,
+					},
+					&cli.IntFlag{
+						Name:  "cleanup-local-days",
+						Usage: "Days to keep local snapshot archives",
+						Value: 7,
+					},
+					&cli.IntFlag{
+						Name:  "cleanup-remote-days",
+						Usage: "Days to keep offsite snapshot copies",
+						Value: 14,
+					},
+					&cli.BoolFlag{
+						Name:  "remove",
+						Usage: "Remove the snapshot schedule",
+					},
+				},
+				Action: client.snapshotSetupCronAction,
+			},
+			{
+				Name:  "list-cron",
+				Usage: "Show the snapshot schedule",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
+				},
+				Action: client.snapshotListCronAction,
+			},
+			{
+				Name:  "restore-instance",
+				Usage: "Restore ONE instance out of a snapshot into this live deployment",
+				Description: "Goes through the daemon, so --file is a path on the DAEMON's filesystem.\n" +
+					"If the instance exists its cluster is destroyed and rebuilt from the snapshot;\n" +
+					"otherwise it is created. Other instances are untouched.\n" +
+					"Use 'snapshot apply' instead to rebuild a whole host.",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "instance",
+						Usage:    "Instance to restore out of the snapshot",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:     "file",
+						Usage:    "Path to the snapshot .tar.zst (on the daemon's filesystem)",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:  "master-key",
+						Usage: "Path to the SOURCE host's master.key; only needed when the snapshot came from another deployment",
+					},
+					&cli.BoolFlag{
+						Name:  "yes",
+						Usage: "Skip the confirmation prompt",
+					},
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "Output as JSON",
+					},
+				},
+				Action: client.snapshotRestoreInstanceAction,
+			},
+			{
+				Name:  "apply",
+				Usage: "Rebuild THIS host from a snapshot (replaces oddk.db, master.key and all instance data)",
+				Description: "Runs locally against the data directory, not the daemon, so it works when the\n" +
+					"daemon cannot start. Stop the daemon first and run as the data-dir owner,\n" +
+					"e.g. sudo -u oddk. The target deployment must have no instances.",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "file",
+						Usage:    "Path to the snapshot .tar.zst",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:     "master-key",
+						Usage:    "Path to the source host's master.key (required: without it the restored clusters' postgres password cannot be recovered)",
+						Required: true,
+					},
+					dataDirFlag(),
+					&cli.StringFlag{
+						Name:  "backup-dir",
+						Usage: "Backup directory (defaults to <data-dir>/backups)",
+					},
+					&cli.IntFlag{
+						Name:  "daemon-port",
+						Usage: "Port the daemon would listen on, checked to ensure it is stopped",
+						Value: 5442,
+					},
+					&cli.BoolFlag{
+						Name:  "yes",
+						Usage: "Skip the confirmation prompt",
+					},
+				},
+				Action: client.snapshotApplyAction,
 			},
 		},
 	}

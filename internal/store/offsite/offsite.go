@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 
@@ -239,4 +240,17 @@ func (s *OffsiteStore) GetPreviousSecretKey() (string, error) {
 		return "", fmt.Errorf("get previous secret key: %w", err)
 	}
 	return secretKey, nil
+}
+
+// CleanupOldLogs removes offsite_logs rows created before the retention cutoff
+// and returns how many were deleted. See CronStore.CleanupOldLogs for why the
+// cutoff is passed as an rfc3339time.Time.
+func (s *OffsiteStore) CleanupOldLogs(olderThan time.Duration) (int64, error) {
+	cutoff := rfc3339time.Time{Time: time.Now().Add(-olderThan)}
+	result, err := s.db.Exec(`DELETE FROM offsite_logs WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup old offsite logs: %w", err)
+	}
+	deleted, _ := result.RowsAffected()
+	return deleted, nil
 }

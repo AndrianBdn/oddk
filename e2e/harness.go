@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -170,12 +171,31 @@ func (h *TestHarness) setupFakeS3() {
 // same data and backup directories, simulating a daemon restart (crash
 // recovery, host reboot). Startup reconciliation runs inside daemon.NewServer.
 func (h *TestHarness) restartDaemon() error {
+	if err := h.stopDaemon(); err != nil {
+		return err
+	}
+	return h.startDaemon()
+}
+
+// stopDaemon shuts the in-process daemon down and waits for its port to be
+// free. Used on its own by tests that must run a daemon-less command (e.g.
+// 'snapshot apply') between a stop and a start.
+func (h *TestHarness) stopDaemon() error {
+	if h.server == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := h.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("shutdown daemon: %w", err)
 	}
+	h.server = nil
+	return nil
+}
 
+// startDaemon starts a fresh daemon on the same data and backup directories.
+// Startup reconciliation runs inside daemon.NewServer.
+func (h *TestHarness) startDaemon() error {
 	backupDir := filepath.Join(h.dataDir, "backups")
 	server, err := daemon.NewServer(testPort, h.dataDir, backupDir, 2, false)
 	if err != nil {
@@ -588,4 +608,18 @@ func (h *TestHarness) waitForPostgreSQL(port int) error {
 		time.Sleep(250 * time.Millisecond)
 	}
 	return fmt.Errorf("timeout waiting for PostgreSQL on 10.88.0.1:%d to accept queries: %w", port, lastErr)
+}
+
+// imageExists reports whether an image tag is present locally.
+func (h *TestHarness) imageExists(tag string) (string, bool) {
+	images, err := h.docker.ImageList(context.Background(), image.ListOptions{All: true})
+	if err != nil {
+		return "", false
+	}
+	for _, img := range images {
+		if slices.Contains(img.RepoTags, tag) {
+			return img.ID, true
+		}
+	}
+	return "", false
 }

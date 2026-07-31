@@ -1057,25 +1057,8 @@ func runDaemon(port int, dataDir, backupDir string, allowRemote bool) error {
 // tokens. The caller must Close the returned db. All `auth` subcommands run
 // locally against the database, not the daemon HTTP API.
 func openAuthStore(cmd *cli.Command) (*auth.AuthStore, *sqlx.DB, error) {
-	dataDir := cmd.String("data-dir")
-	if dataDir == "" {
-		u, err := user.Current()
-		if err != nil {
-			return nil, nil, fmt.Errorf("determine current user: %w", err)
-		}
-		if u.Username == "oddk" {
-			dataDir = filepath.Join(u.HomeDir, "data")
-		} else {
-			return nil, nil, fmt.Errorf("--data-dir is required when not running as the oddk user")
-		}
-	}
-
-	// Safeguard: the auth commands open SQLite directly and create WAL/SHM
-	// sidecar files in the data dir, so the invoking user must own it. The usual
-	// mistake is forgetting `sudo -u oddk`, which would otherwise surface as a
-	// confusing low-level permission/IO error (or leave daemon-unreadable files
-	// behind). Fail clearly and tell them which user to become.
-	if err := ensureDataDirOwnedByCurrentUser(dataDir); err != nil {
+	dataDir, err := resolveLocalDataDir(cmd)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -1085,6 +1068,34 @@ func openAuthStore(cmd *cli.Command) (*auth.AuthStore, *sqlx.DB, error) {
 	}
 
 	return store.OpenAuthOnly(dbPath)
+}
+
+// resolveLocalDataDir resolves the data dir the same way the daemon does for
+// the oddk user, using the passwd home rather than $HOME (which sudo may leave
+// as the caller's), and verifies the caller owns it.
+//
+// Shared by the commands that bypass the HTTP API and touch the data dir
+// directly — `auth` and `snapshot apply`. Both create SQLite WAL/SHM sidecars
+// there, so the invoking user must own it; the usual mistake is a forgotten
+// `sudo -u oddk`, which would otherwise surface as a confusing low-level IO
+// error or leave daemon-unreadable files behind.
+func resolveLocalDataDir(cmd *cli.Command) (string, error) {
+	dataDir := cmd.String("data-dir")
+	if dataDir == "" {
+		u, err := user.Current()
+		if err != nil {
+			return "", fmt.Errorf("determine current user: %w", err)
+		}
+		if u.Username != "oddk" {
+			return "", fmt.Errorf("--data-dir is required when not running as the oddk user")
+		}
+		dataDir = filepath.Join(u.HomeDir, "data")
+	}
+
+	if err := ensureDataDirOwnedByCurrentUser(dataDir); err != nil {
+		return "", err
+	}
+	return dataDir, nil
 }
 
 // ensureDataDirOwnedByCurrentUser fails if the data dir is owned by a different

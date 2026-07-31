@@ -75,40 +75,19 @@ func BackupRDBMS(ctx context.Context, deps *Dependencies, params *BackupRDBMSPar
 		_ = os.RemoveAll(tempDir) // Clean up temp dir
 	}()
 
-	// 1. Backup globals using pg_dumpall
-	globalsPath := filepath.Join(tempDir, "globals.sql")
-	if err := backupGlobals(ctx, deps, instance, password, globalsPath); err != nil {
-		return nil, fmt.Errorf("backup globals: %w", err)
-	}
-
-	// 2. Dump every database (directory-format pg_dump) into tempDir.
-	if err := dumpAllDatabases(ctx, deps, instance, password, tempDir); err != nil {
+	// 1. Stage the full instance dump (globals, databases, metadata).
+	if err := stageInstanceDump(ctx, deps, instance, password, tempDir); err != nil {
 		return nil, err
 	}
 
-	// 3. Record per-database metadata (owner, encoding, collation, locale
-	//    provider) so restore and major-upgrade can recreate databases
-	//    faithfully instead of with the target cluster's defaults.
-	major, ok := parseMajorVersion(instance.Version)
-	if !ok {
-		return nil, fmt.Errorf("cannot parse instance version %q", instance.Version)
-	}
-	metas, err := captureDatabaseMetadata(ctx, deps, params.Name, major)
-	if err != nil {
-		return nil, fmt.Errorf("capture database metadata: %w", err)
-	}
-	if err := writeDatabaseMetadata(tempDir, metas); err != nil {
-		return nil, fmt.Errorf("write database metadata: %w", err)
-	}
-
-	// 4. Create tar archive with zstd compression
+	// 2. Create tar archive with zstd compression
 	archivePath := backupPath + ".tar.zst"
 	size, err := compression.NewCompressor().CreateTarZstd(ctx, tempDir, archivePath)
 	if err != nil {
 		return nil, fmt.Errorf("create archive: %w", err)
 	}
 
-	// 5. Record backup in database
+	// 3. Record backup in database
 	record := recordBackup(deps, params, archivePath, size, timestamp)
 
 	return &BackupRDBMSResult{
@@ -117,6 +96,52 @@ func BackupRDBMS(ctx context.Context, deps *Dependencies, params *BackupRDBMSPar
 		Size:       size,
 		Timestamp:  timestamp,
 	}, nil
+}
+
+// stageInstanceDump writes a complete dump of one instance into dir:
+// globals.sql, databases/<db>/, databases.json and instance.json.
+//
+// This is the shared body of both archive shapes — a per-instance backup
+// (where dir becomes the archive root) and one instances/<name>/ subtree of a
+// snapshot — so the two can never drift into producing different layouts.
+//
+// The instance must be running: everything except instance.json is read from
+// the live cluster.
+func stageInstanceDump(ctx context.Context, deps *Dependencies, instance *instances.RDBMSInstance, password, dir string) error {
+	// 1. Backup globals using pg_dumpall
+	globalsPath := filepath.Join(dir, "globals.sql")
+	if err := backupGlobals(ctx, deps, instance, password, globalsPath); err != nil {
+		return fmt.Errorf("backup globals: %w", err)
+	}
+
+	// 2. Dump every database (directory-format pg_dump) into dir.
+	if err := dumpAllDatabases(ctx, deps, instance, password, dir); err != nil {
+		return err
+	}
+
+	// 3. Record per-database metadata (owner, encoding, collation, locale
+	//    provider) so restore and major-upgrade can recreate databases
+	//    faithfully instead of with the target cluster's defaults.
+	major, ok := parseMajorVersion(instance.Version)
+	if !ok {
+		return fmt.Errorf("cannot parse instance version %q", instance.Version)
+	}
+	metas, err := captureDatabaseMetadata(ctx, deps, instance.Name, major)
+	if err != nil {
+		return fmt.Errorf("capture database metadata: %w", err)
+	}
+	if err := writeDatabaseMetadata(dir, metas); err != nil {
+		return fmt.Errorf("write database metadata: %w", err)
+	}
+
+	// 4. Record the instance's own configuration (version, image, port, CPU/RAM,
+	//    parameter group) so the container itself can be rebuilt on another
+	//    host, not just the data inside it.
+	if err := writeInstanceMetadata(dir, captureInstanceMetadata(deps, instance)); err != nil {
+		return fmt.Errorf("write instance metadata: %w", err)
+	}
+
+	return nil
 }
 
 // dumpAllDatabases lists the instance's databases and dumps each one in

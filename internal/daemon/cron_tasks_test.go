@@ -8,7 +8,7 @@ import (
 
 func TestCronTaskTracker_Sequential(t *testing.T) {
 	// Create tracker with nil dependencies (we're only testing the logic)
-	tracker := daemon.NewCronTaskTracker(nil, nil)
+	tracker := daemon.NewCronTaskTracker(nil, nil, "")
 
 	// Test: Initial state should be empty
 	current, queueLen, queued := tracker.GetStatus()
@@ -28,7 +28,7 @@ func TestCronTaskTracker_Sequential(t *testing.T) {
 }
 
 func TestCronTaskTracker_GetStatus(t *testing.T) {
-	tracker := daemon.NewCronTaskTracker(nil, nil)
+	tracker := daemon.NewCronTaskTracker(nil, nil, "")
 
 	// Initial state
 	current, queueLen, queued := tracker.GetStatus()

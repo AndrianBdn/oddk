@@ -361,3 +361,74 @@ func (s *BackupStore) cleanupOrphanedRecords(orphaned []int) error {
 	}
 	return nil
 }
+
+// ReconcileLocalLocations re-points or clears the local_location of every
+// backup record against the files actually present in backupDir, and reports
+// what it did.
+//
+// Needed after 'snapshot apply': the restored oddk.db carries the SOURCE host's
+// backup paths, but the snapshot archive contains no backup files. Left alone,
+// the first ListAllBackups — which the daemon runs at startup and 'oddk
+// checklist' runs again — hard-deletes every record whose local file is missing
+// and which has no remote copy, silently destroying the backup catalogue of a
+// deployment that has no offsite configured.
+//
+// Records whose file IS present under backupDir (the operator copied the backup
+// directory across) are re-pointed to the new path rather than dropped.
+//
+// A record with no local file here AND no remote copy cannot be cleared: the
+// schema enforces CHECK (local_location IS NOT NULL OR remote_location IS NOT
+// NULL), because a record referencing nothing is meaningless by design. Those
+// are left untouched and returned as danglingAfter so the caller can warn that
+// the startup sweep will drop them — which is recoverable only by copying the
+// old host's backup directory across BEFORE the daemon first starts.
+//
+// Deliberately does not use ListAllBackups, whose orphan cleanup is the very
+// behaviour being pre-empted here.
+func (s *BackupStore) ReconcileLocalLocations(backupDir string) (repointed, cleared, danglingAfter int, err error) {
+	type row struct {
+		ID            int            `db:"id"`
+		LocalLocation sql.NullString `db:"local_location"`
+		RemoteLoc     sql.NullString `db:"remote_location"`
+	}
+	var rows []row
+	if err := s.db.Select(&rows, `SELECT id, local_location, remote_location FROM backup_history`); err != nil {
+		return 0, 0, 0, fmt.Errorf("read backup history: %w", err)
+	}
+
+	for _, r := range rows {
+		if !r.LocalLocation.Valid || r.LocalLocation.String == "" {
+			if !r.RemoteLoc.Valid || r.RemoteLoc.String == "" {
+				danglingAfter++
+			}
+			continue
+		}
+
+		candidate := filepath.Join(backupDir, filepath.Base(r.LocalLocation.String))
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			if candidate != r.LocalLocation.String {
+				if _, execErr := s.db.Exec(
+					`UPDATE backup_history SET local_location = ? WHERE id = ?`, candidate, r.ID); execErr != nil {
+					return repointed, cleared, danglingAfter, fmt.Errorf("re-point backup %d: %w", r.ID, execErr)
+				}
+				repointed++
+			}
+			continue
+		}
+
+		// No file here. Only clearing the stale path is safe when a remote copy
+		// keeps the row valid under the CHECK constraint; otherwise the row
+		// cannot be represented without a location at all, so leave it and let
+		// the caller report it.
+		if !r.RemoteLoc.Valid || r.RemoteLoc.String == "" {
+			danglingAfter++
+			continue
+		}
+		if _, execErr := s.db.Exec(
+			`UPDATE backup_history SET local_location = NULL WHERE id = ?`, r.ID); execErr != nil {
+			return repointed, cleared, danglingAfter, fmt.Errorf("clear local location of backup %d: %w", r.ID, execErr)
+		}
+		cleared++
+	}
+	return repointed, cleared, danglingAfter, nil
+}

@@ -45,6 +45,25 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /api/backups", s.withAuth(s.handleListAllBackups))
 	mux.HandleFunc("POST /api/rdbms/{name}/restore", s.withAuth(s.handleRDBMSRestore))
 
+	// Whole-deployment snapshot (design: internal-docs/snapshots.done.md, internal
+	// repo only). `apply` is deliberately NOT an endpoint: it runs daemon-less
+	// so disaster recovery works when the daemon cannot start.
+	mux.HandleFunc("POST /api/snapshot", s.withAuth(s.handleSnapshotMake))
+	// Restoring ONE instance out of a snapshot IS an endpoint, unlike apply: the
+	// deployment stays up, so it needs the executor and the health-check pause.
+	mux.HandleFunc("POST /api/snapshot/restore-instance", s.withAuth(s.handleSnapshotRestoreInstance))
+	mux.HandleFunc("GET /api/snapshots", s.withAuth(s.handleSnapshotList))
+	mux.HandleFunc("POST /api/snapshot/{id}/upload", s.withAuth(s.handleSnapshotUpload))
+	mux.HandleFunc("POST /api/snapshot/{id}/download", s.withAuth(s.handleSnapshotDownload))
+	mux.HandleFunc("DELETE /api/snapshot/{id}/local", s.withAuth(s.handleSnapshotRemoveLocal))
+	mux.HandleFunc("DELETE /api/snapshot/{id}/remote", s.withAuth(s.handleSnapshotRemoveRemote))
+
+	// Deployment-wide snapshot schedule. Separate from /api/cron/backup because
+	// a snapshot has no instance: one plan for the whole deployment.
+	mux.HandleFunc("POST /api/cron/snapshot", s.withAuth(s.handleCronSnapshotSet))
+	mux.HandleFunc("GET /api/cron/snapshot", s.withAuth(s.handleCronSnapshotGet))
+	mux.HandleFunc("DELETE /api/cron/snapshot", s.withAuth(s.handleCronSnapshotDelete))
+
 	// Password management
 	mux.HandleFunc("GET /api/rdbms/{name}/password", s.withAuth(s.handleGetPassword))
 	mux.HandleFunc("PUT /api/rdbms/{name}/password", s.withAuth(s.handleSetPassword))

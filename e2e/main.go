@@ -99,6 +99,18 @@ func main() {
 		{Name: "CreateAutoPull", Fn: testCreateAutoPull},
 		{Name: "InstanceUpdate", Fn: testInstanceUpdate},
 		{Name: "ImageRepullSwitch", Fn: testImageRepullSwitch},
+		{Name: "SnapshotMake", Fn: testSnapshotMake},
+		{Name: "SnapshotRoundTrip", Fn: testSnapshotRoundTrip},
+		{Name: "SnapshotRestoreInstance", Fn: testSnapshotRestoreInstance},
+		{
+			Name: "SnapshotCron",
+			Fn:   testSnapshotCron,
+			KVMap: map[string]string{
+				"cron.debug_ticker_interval.int": "1",
+				"cron.debug_force_run.int":       "1",
+			},
+		},
+		{Name: "SnapshotUpload", Fn: testSnapshotUpload, RunFakeS3: true},
 		{Name: "MajorUpgrade", Fn: testMajorUpgrade},
 		{Name: "MajorUpgradeCustomImage", Fn: testMajorUpgradeCustomImage},
 		{Name: "MajorUpgradeLocale", Fn: testMajorUpgradeLocale},

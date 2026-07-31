@@ -45,6 +45,25 @@ type checklistResponse struct {
 			None   int `json:"none"`
 		} `json:"backupCopies"`
 	} `json:"instances"`
+	Snapshots struct {
+		Scheduled     bool `json:"scheduled"`
+		UTCHour       int  `json:"utcHour"`
+		IntervalHours int  `json:"intervalHours"`
+		LastSnapshot  *struct {
+			Timestamp string `json:"timestamp"`
+			SizeBytes int64  `json:"sizeBytes"`
+			Location  string `json:"location"`
+		} `json:"lastSnapshot"`
+		Total  int `json:"total"`
+		Copies struct {
+			LocalAndRemote int `json:"localAndRemote"`
+			RemoteOnly     int `json:"remoteOnly"`
+			LocalOnly      int `json:"localOnly"`
+			None           int `json:"none"`
+		} `json:"copies"`
+		Stale       bool   `json:"stale"`
+		StaleDetail string `json:"staleDetail"`
+	} `json:"snapshots"`
 	Notifications struct {
 		Configured []struct {
 			Name string `json:"name"`
@@ -153,6 +172,42 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 			bc := inst.BackupCopies
 			detail("", "backups stored", formatBackupsStored(inst.CompletedBackups, bc.Both, bc.Remote, bc.Local, bc.None))
 		}
+	}
+	_, _ = fmt.Fprintln(out)
+
+	// Snapshots are global (not per-instance) and are what a host migration or
+	// disaster recovery actually restores from, so an audit that omitted them
+	// could report healthy per-instance backups for a deployment that cannot be
+	// rebuilt at all.
+	snap := result.Snapshots
+	_, _ = fmt.Fprintln(out, "Snapshots (whole deployment)")
+	if snap.Scheduled {
+		if snap.IntervalHours >= 24 || snap.IntervalHours == 0 {
+			_, _ = fmt.Fprintf(out, "  %s scheduled: daily at %02d:00 UTC\n", glyphOK, snap.UTCHour)
+		} else {
+			_, _ = fmt.Fprintf(out, "  %s scheduled: every %dh from %02d:00 UTC\n", glyphOK, snap.IntervalHours, snap.UTCHour)
+		}
+	} else {
+		_, _ = fmt.Fprintf(out, "  %s not scheduled (oddk snapshot setup-cron --utc-hour <h>)\n", glyphTodo)
+	}
+	// A failed capture writes no record at all, so showing the newest COMPLETED
+	// snapshot with a green glyph would read fine on a schedule that has been
+	// failing for weeks. The staleness check is the only thing that surfaces it.
+	switch {
+	case snap.LastSnapshot != nil && snap.Stale:
+		_, _ = fmt.Fprintf(out, "  %s last snapshot: %s (%s) - STALE: %s\n",
+			glyphBad, snap.LastSnapshot.Timestamp, snap.LastSnapshot.Location, snap.StaleDetail)
+	case snap.LastSnapshot != nil:
+		_, _ = fmt.Fprintf(out, "  %s last snapshot: %s (%s)\n",
+			glyphOK, snap.LastSnapshot.Timestamp, snap.LastSnapshot.Location)
+	case snap.Stale:
+		_, _ = fmt.Fprintf(out, "  %s last snapshot: never - %s\n", glyphBad, snap.StaleDetail)
+	default:
+		_, _ = fmt.Fprintf(out, "  %s last snapshot: never\n", glyphTodo)
+	}
+	if snap.Total > 0 {
+		_, _ = fmt.Fprintf(out, "    stored: %s\n", formatBackupsStored(
+			snap.Total, snap.Copies.LocalAndRemote, snap.Copies.RemoteOnly, snap.Copies.LocalOnly, snap.Copies.None))
 	}
 	_, _ = fmt.Fprintln(out)
 

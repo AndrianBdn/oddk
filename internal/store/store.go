@@ -19,6 +19,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/store/notifications"
 	"github.com/andrianbdn/oddk/internal/store/offsite"
 	"github.com/andrianbdn/oddk/internal/store/parameters"
+	"github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
 type AuthToken struct {
@@ -39,6 +40,7 @@ type Store struct {
 	Health        *health.HealthStore
 	KV            *kvstore.KVStore
 	Offsite       *offsite.OffsiteStore
+	Snapshot      *snapshot.SnapshotStore
 }
 
 func NewStore(dbPath, dataDir string) (*Store, error) {
@@ -74,6 +76,7 @@ func NewStore(dbPath, dataDir string) (*Store, error) {
 		Health:        health.NewHealthStore(sqx),
 		KV:            kvstore.NewKVStore(sqx),
 		Offsite:       offsite.NewOffsiteStore(sqx),
+		Snapshot:      snapshot.NewSnapshotStore(sqx),
 	}
 	err = store.migrateDB()
 	if err != nil {
@@ -171,4 +174,33 @@ func (s *Store) runSingleMigration(name string, fn func(sqx *sqlx.DB) error) err
 
 	s.Sqlx.MustExec("INSERT INTO app_migrations (name, migrated_at) VALUES (?, ?)", name, time.Now().Format(time.RFC3339))
 	return nil
+}
+
+// VacuumInto writes a consistent copy of the store to path using SQLite's
+// VACUUM INTO. It is safe against a live database — SQLite serialises it with
+// other work — so a snapshot can be taken without stopping the daemon. The
+// destination must not already exist.
+//
+// The copy is also compacted, which matters because a snapshot embeds it.
+func (s *Store) VacuumInto(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("destination already exists: %s", path)
+	}
+	if _, err := s.Sqlx.Exec("VACUUM INTO ?", path); err != nil {
+		return fmt.Errorf("vacuum into %s: %w", path, err)
+	}
+	return nil
+}
+
+// AppliedMigrations returns the names of migrations applied to this store, in
+// application order. A snapshot records these so a restore can reason about
+// schema compatibility more precisely than a version string allows.
+func (s *Store) AppliedMigrations() ([]string, error) {
+	var names []string
+	// app_migrations is (name, migrated_at) with no id column; rowid is
+	// insertion order, which is application order.
+	if err := s.Sqlx.Select(&names, `SELECT name FROM app_migrations ORDER BY rowid`); err != nil {
+		return nil, fmt.Errorf("read applied migrations: %w", err)
+	}
+	return names, nil
 }

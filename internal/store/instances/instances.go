@@ -128,6 +128,27 @@ func (s *InstanceStore) UpdateParameterGroup(name, parameterGroup string) error 
 	return nil
 }
 
+// UpdateResources rewrites the shape an instance runs at.
+//
+// Needed by snapshot restore-instance, which rebuilds a container from the
+// SNAPSHOT's recorded port/CPU/RAM. Without it the container would be created at
+// the snapshot's values while the row kept the old ones, so the catalogue would
+// report a port nothing listens on — and IsPortInUse would guard the wrong one.
+func (s *InstanceStore) UpdateResources(name string, port, cpuCores, ramMB int) error {
+	now := rfc3339time.Now()
+	result, err := s.db.Exec(
+		`UPDATE rdbms_instances SET port = ?, cpu_cores = ?, ram_mb = ?, updated_at = ? WHERE name = ?`,
+		port, cpuCores, ramMB, now, name)
+	if err != nil {
+		return fmt.Errorf("update resources: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("instance %s not found", name)
+	}
+	return nil
+}
+
 func (s *InstanceStore) Delete(name string) error {
 	_, err := s.db.Exec(`DELETE FROM rdbms_instances WHERE name = ?`, name)
 	if err != nil {

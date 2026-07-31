@@ -16,15 +16,17 @@ type CronTaskTracker struct {
 	pendingTasks []string // Queue of tasks waiting to run
 	opDeps       *operations.Dependencies
 	executor     *operations.Executor
+	backupDir    string // where a scheduled snapshot writes its archive
 }
 
 // NewCronTaskTracker creates a new cron task tracker
-func NewCronTaskTracker(opDeps *operations.Dependencies, executor *operations.Executor) *CronTaskTracker {
+func NewCronTaskTracker(opDeps *operations.Dependencies, executor *operations.Executor, backupDir string) *CronTaskTracker {
 	return &CronTaskTracker{
 		currentTask:  "",
 		pendingTasks: make([]string, 0),
 		opDeps:       opDeps,
 		executor:     executor,
+		backupDir:    backupDir,
 	}
 }
 
@@ -60,13 +62,24 @@ func (t *CronTaskTracker) RunTask(ctx context.Context, instanceName string) bool
 	return true
 }
 
-// executeTask runs a single cron task and then checks for next queued task
+// executeTask runs a single cron task and then checks for next queued task.
+//
+// The queue is keyed by instance name, and a deployment-wide snapshot has none,
+// so it rides the same queue under the SnapshotCronInstance sentinel — which
+// cannot collide with a real instance name. Sharing the queue is the point: a
+// snapshot dumps every instance, so it must not run alongside a per-instance
+// backup.
 func (t *CronTaskTracker) executeTask(ctx context.Context, instanceName string) {
-	cronTaskOp := operations.NewCronTaskOp(t.opDeps, instanceName)
-	if err := t.executor.Execute(ctx, cronTaskOp); err != nil {
-		log.Printf("Cron task failed for instance %s: %v", instanceName, err)
+	var op operations.Operation
+	if instanceName == operations.SnapshotCronInstance {
+		op = operations.NewSnapshotCronTaskOp(t.opDeps, t.backupDir)
 	} else {
-		log.Printf("Cron task completed successfully for instance %s", instanceName)
+		op = operations.NewCronTaskOp(t.opDeps, instanceName)
+	}
+	if err := t.executor.Execute(ctx, op); err != nil {
+		log.Printf("Cron task failed for %s: %v", instanceName, err)
+	} else {
+		log.Printf("Cron task completed successfully for %s", instanceName)
 	}
 
 	// Task finished, check if there's a next task to run

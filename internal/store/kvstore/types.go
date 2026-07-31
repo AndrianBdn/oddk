@@ -36,6 +36,10 @@ const (
 
 	// Backup debug settings
 	KeyBackupDebugTimeMachine KeyInt = "backup.debug_time_machine.int" // When 1, enables debug endpoint to time-shift backups
+
+	// Operational log retention, in days, covering cron_logs, notification_logs
+	// and offsite_logs. 0 disables cleanup (keep forever).
+	KeyLogsRetentionDays KeyInt = "logs.retention_days.int"
 )
 
 // KVRecord represents a key-value record in the database

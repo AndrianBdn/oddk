@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/andrianbdn/oddk/internal/rfc3339time"
 )
 
 // checklistNotificationLogWindow bounds how far back the checklist looks for
@@ -17,7 +19,42 @@ type ChecklistResult struct {
 	GeneratedAt   string                 `json:"generatedAt"`
 	Health        ChecklistHealth        `json:"health"`
 	Instances     []ChecklistInstance    `json:"instances"`
+	Snapshots     ChecklistSnapshots     `json:"snapshots"`
 	Notifications ChecklistNotifications `json:"notifications"`
+}
+
+// ChecklistSnapshots summarizes whole-deployment snapshot state. Like
+// notifications, this is global rather than per-instance — a snapshot covers
+// every instance, so there is exactly one schedule.
+//
+// It belongs on the checklist because a snapshot is what a host migration or
+// disaster recovery actually restores from. An audit that reports healthy
+// per-instance backups while no snapshot has ever been taken is describing a
+// deployment that cannot be rebuilt.
+type ChecklistSnapshots struct {
+	Scheduled     bool              `json:"scheduled"`
+	UTCHour       int               `json:"utcHour,omitempty"`
+	IntervalHours int               `json:"intervalHours,omitempty"`
+	LastSnapshot  *ChecklistBackup  `json:"lastSnapshot,omitempty"`
+	Total         int               `json:"total"`
+	Copies        ChecklistSnapCopy `json:"copies"`
+
+	// Stale is set when a schedule exists but the newest snapshot is older than
+	// two intervals. Without it a schedule that has been failing for weeks reads
+	// green: the newest COMPLETED snapshot is still shown, and a failed capture
+	// writes no record at all, so there is nothing to make the gap visible.
+	Stale       bool   `json:"stale"`
+	StaleDetail string `json:"staleDetail,omitempty"`
+}
+
+// ChecklistSnapCopy breaks snapshots down by where they actually exist, the
+// same way BackupCopies does — "we have 30 snapshots" means nothing if they are
+// all on the machine that just died.
+type ChecklistSnapCopy struct {
+	LocalAndRemote int `json:"localAndRemote"`
+	RemoteOnly     int `json:"remoteOnly"`
+	LocalOnly      int `json:"localOnly"`
+	None           int `json:"none"`
 }
 
 // ChecklistHealth summarizes the latest daemon-wide health check.
@@ -214,12 +251,102 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 		result.Instances = append(result.Instances, row)
 	}
 
+	if err := op.collectSnapshots(&result.Snapshots); err != nil {
+		return err
+	}
+
 	if err := op.collectNotifications(&result.Notifications); err != nil {
 		return err
 	}
 
 	op.result = result
 	return nil
+}
+
+// collectSnapshots fills the deployment-wide snapshot summary.
+func (op *ChecklistOp) collectSnapshots(out *ChecklistSnapshots) error {
+	plan, err := op.deps.Store.Snapshot.GetPlan()
+	if err != nil {
+		return err
+	}
+	if plan != nil {
+		out.Scheduled = true
+		out.UTCHour = plan.UTCHour
+		out.IntervalHours = plan.IntervalHours
+	}
+
+	records, err := op.deps.Store.Snapshot.List()
+	if err != nil {
+		return err
+	}
+	out.Total = len(records)
+
+	for _, rec := range records {
+		switch {
+		case rec.LocalPath != "" && rec.RemotePath != "":
+			out.Copies.LocalAndRemote++
+		case rec.RemotePath != "":
+			out.Copies.RemoteOnly++
+		case rec.LocalPath != "":
+			out.Copies.LocalOnly++
+		default:
+			out.Copies.None++
+		}
+	}
+
+	// List() is newest-first, so the first completed record is the newest one.
+	var newest *rfc3339time.Time
+	for _, rec := range records {
+		if rec.Status != "completed" {
+			continue
+		}
+		out.LastSnapshot = &ChecklistBackup{
+			ID:        rec.ID,
+			Timestamp: rec.CreatedAt.Format(time.RFC3339),
+			SizeBytes: rec.Size,
+			Location:  locationLabel(rec.LocalPath != "", rec.RemotePath != ""),
+			Comment:   rec.CommentStr,
+		}
+		created := rec.CreatedAt
+		newest = &created
+		break
+	}
+
+	// A failed capture writes no record, so the catalogue alone cannot show that
+	// snapshots have stopped happening — only comparing the newest one against
+	// the schedule can. Two intervals of slack absorbs the jitter ladder and one
+	// missed run without crying wolf.
+	if plan != nil {
+		interval := time.Duration(plan.IntervalHours) * time.Hour
+		if interval <= 0 {
+			interval = 24 * time.Hour
+		}
+		switch {
+		case newest == nil:
+			out.Stale = true
+			out.StaleDetail = "snapshots are scheduled but none has ever completed"
+		case time.Since(newest.Time) > 2*interval:
+			out.Stale = true
+			out.StaleDetail = fmt.Sprintf("newest snapshot is %s old, more than two %s intervals",
+				time.Since(newest.Time).Round(time.Hour), interval)
+		}
+	}
+	return nil
+}
+
+// locationLabel names where a copy exists, matching the per-instance backup
+// vocabulary the checklist already uses.
+func locationLabel(hasLocal, hasRemote bool) string {
+	switch {
+	case hasLocal && hasRemote:
+		return "local+s3"
+	case hasRemote:
+		return "s3"
+	case hasLocal:
+		return "local"
+	default:
+		return "none"
+	}
 }
 
 // collectHealth fills the health summary and returns per-instance name sets

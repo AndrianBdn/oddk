@@ -30,6 +30,15 @@ const (
 	// Cron debug settings - 0 (disabled) by default
 	defaultCronDebugTickerInterval = 0
 	defaultCronDebugForceRun       = 0
+
+	// Operational log retention (in days) - 365 default.
+	//
+	// cron_logs and offsite_logs are the evidence that backups ran and were
+	// shipped offsite; 365 days matches the window SOC 2 Type II observation
+	// periods and PCI DSS 10.5.1 assume. None of these tables hold personal
+	// data (notification_logs records the config name, not the recipient), so
+	// nothing argues for a shorter window. 0 disables cleanup entirely.
+	defaultLogsRetentionDays = 365
 )
 
 // systemIntDefaults maps every required integer system parameter to its
@@ -43,6 +52,7 @@ var systemIntDefaults = map[KeyInt]int{
 	KeyHealthDebugFail:         defaultHealthDebugFail,
 	KeyCronDebugTickerInterval: defaultCronDebugTickerInterval,
 	KeyCronDebugForceRun:       defaultCronDebugForceRun,
+	KeyLogsRetentionDays:       defaultLogsRetentionDays,
 }
 
 // RequiredInt returns the value of a required integer system parameter.
@@ -121,6 +131,13 @@ func (kv *KVStore) EnsureSystemDefaults() error {
 	// Ensure cron debug force run exists (disabled by default)
 	if !kv.ExistsRaw(KeyCronDebugForceRun.String()) {
 		if err := kv.SetInt(KeyCronDebugForceRun, defaultCronDebugForceRun); err != nil {
+			return err
+		}
+	}
+
+	// Ensure operational log retention exists
+	if !kv.ExistsRaw(KeyLogsRetentionDays.String()) {
+		if err := kv.SetInt(KeyLogsRetentionDays, defaultLogsRetentionDays); err != nil {
 			return err
 		}
 	}

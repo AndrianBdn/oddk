@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 
@@ -180,4 +181,17 @@ func (s *NotificationStore) GetLogs(limit int) ([]NotificationLog, error) {
 	}
 
 	return logs, nil
+}
+
+// CleanupOldLogs removes notification_logs rows created before the retention
+// cutoff and returns how many were deleted. See CronStore.CleanupOldLogs for
+// why the cutoff is passed as an rfc3339time.Time.
+func (s *NotificationStore) CleanupOldLogs(olderThan time.Duration) (int64, error) {
+	cutoff := rfc3339time.Time{Time: time.Now().Add(-olderThan)}
+	result, err := s.db.Exec(`DELETE FROM notification_logs WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup old notification logs: %w", err)
+	}
+	deleted, _ := result.RowsAffected()
+	return deleted, nil
 }
