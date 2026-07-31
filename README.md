@@ -283,6 +283,10 @@ oddk snapshot setup-cron --utc-hour 3                     # daily at 03:00 UTC
 oddk snapshot setup-cron --utc-hour 3 --interval-hours 6  # 03,09,15,21 UTC
 oddk snapshot list-cron
 
+# Already scheduling per-instance backups? Move those schedules over in one step.
+oddk snapshot migrate-from-backups --dry-run   # preview; changes nothing
+oddk snapshot migrate-from-backups --yes
+
 # Offsite (requires `oddk offsite apply`, below)
 oddk snapshot upload <id>
 oddk snapshot download <id>
@@ -322,7 +326,33 @@ What you need to know:
   `PutObject`; no multipart yet).
 
 `oddk checklist` reports whether snapshots are scheduled and how stale the newest
-one is.
+one is. Once snapshots are scheduled, it stops flagging instances for having no
+per-instance backup schedule — the snapshot covers them.
+
+#### Moving an existing deployment onto snapshots
+
+`oddk snapshot migrate-from-backups` turns your per-instance backup schedules
+into the single deployment-wide snapshot schedule and then removes them. It picks
+the most common hour and the **longest** retention window any schedule used, so
+nothing is silently shortened; `--utc-hour`, `--interval-hours` and the two
+`--cleanup-*-days` flags override the derived values. Offsite settings are global
+and already shared by both paths, so there is nothing there to move.
+
+Snapshots are scheduled *before* the backup schedules are removed, so an
+interrupted run leaves both active rather than neither. Re-running on an
+already-migrated host is a quiet success, and an existing snapshot schedule is
+kept rather than overwritten unless you pass an override flag — both make it safe
+to run across a fleet. Add `--dry-run` to preview, `--yes` to skip the prompt, and
+`--json` (with either) for scripted rollouts.
+
+> **Your existing backups are kept, but they stop being pruned.** Age-based
+> cleanup only ever runs from a backup schedule, so removing the schedule ends it
+> permanently. The command reports how many archives and how much disk this
+> leaves behind. They stay restorable with `oddk backup restore`; remove them
+> with `oddk backup remove-local` once you trust the snapshot schedule.
+
+This is a transitional command. Per-instance `backup` itself is unaffected — it
+is still the only way to restore or clone a **single database**.
 
 ### Backups (per-instance)
 
@@ -436,7 +466,17 @@ events are delivered automatically with configurable thresholds.
 
 - **Encrypted secrets at rest.** Postgres passwords and S3 keys are encrypted
   with AES-256-GCM (self-describing `3ncr.org/1` format) using a 32-byte master
-  key at `{dataDir}/master.key` (mode `0600`).
+  key at `{dataDir}/master.key` (mode `0600`). The key file is one
+  self-describing line so it can be identified wherever it ends up:
+  `ODDK-SECRET-MASTER-KEY;V1;<base64url>;<checksum>`. The checksum is the first
+  4 bytes of SHA-256 over the base64url text — `printf %s '<payload>' |
+  sha256sum | cut -c1-8` — and exists to tell "the right key, copied badly"
+  apart from "the wrong key". Key files written by ODDK <= 0.1.59 were a bare
+  base64url string; they are still read and are rewritten in place on the next
+  daemon start (the key material never changes). Because ODDK <= 0.1.59 cannot
+  read the new format, that first start also saves the previous file as
+  `master.key.pre-v1` — if you roll the binary back, restore it with
+  `mv master.key.pre-v1 master.key`.
 - **Tokenized API auth.** Tokens are Argon2-hashed and compared in constant
   time; the plaintext is shown only at creation.
 - **Loopback by default.** The API binds `127.0.0.1`. `--allow-remote` exists

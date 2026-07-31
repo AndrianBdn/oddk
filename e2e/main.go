@@ -111,6 +111,7 @@ func main() {
 			},
 		},
 		{Name: "SnapshotUpload", Fn: testSnapshotUpload, RunFakeS3: true},
+		{Name: "SnapshotMigrateFromBackups", Fn: testSnapshotMigrateFromBackups},
 		{Name: "MajorUpgrade", Fn: testMajorUpgrade},
 		{Name: "MajorUpgradeCustomImage", Fn: testMajorUpgradeCustomImage},
 		{Name: "MajorUpgradeLocale", Fn: testMajorUpgradeLocale},

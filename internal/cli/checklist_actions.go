@@ -152,10 +152,17 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 			}
 			detail(glyphOK, "parameter group", paramGroup)
 
-			if inst.BackupCron != nil {
+			switch {
+			case inst.BackupCron != nil:
 				detail(glyphOK, "daily backup", fmt.Sprintf("%02d:00 UTC · keep local %dd, remote %dd",
 					inst.BackupCron.UTCHour, inst.BackupCron.CleanupLocalDays, inst.BackupCron.CleanupRemoteDays))
-			} else {
+			case result.Snapshots.Scheduled:
+				// A scheduled snapshot captures every instance, so the absence of a
+				// per-instance schedule is the intended end state after
+				// `snapshot migrate-from-backups` — not an outstanding task. Without
+				// this, every instance on every migrated host reads as a to-do.
+				detail(glyphOK, "daily backup", "covered by scheduled snapshots")
+			default:
 				detail(glyphTodo, "daily backup", "not scheduled")
 			}
 

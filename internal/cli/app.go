@@ -636,6 +636,30 @@ func snapshotCommands(client *Client) *cli.Command {
 				Action: client.snapshotListCronAction,
 			},
 			{
+				Name:  "migrate-from-backups",
+				Usage: "Adopt the per-instance backup schedules as the snapshot schedule, then remove them",
+				Description: "Transitional command for deployments that still schedule per-instance backups.\n" +
+					"Derives one deployment-wide snapshot schedule from the existing backup\n" +
+					"schedules (most common hour; the LONGEST retention window, so nothing is\n" +
+					"shortened), then removes them. Offsite settings are global and shared by\n" +
+					"both paths already, so there is nothing there to migrate.\n\n" +
+					"Snapshots are scheduled BEFORE the backup schedules are removed, so an\n" +
+					"interrupted run leaves both active rather than neither.\n\n" +
+					"Existing backups are NOT deleted, but note that removing a backup schedule\n" +
+					"also ends age-based cleanup of that instance's archives — the command\n" +
+					"reports what is left for you to prune once you trust the new schedule.",
+				Flags: []cli.Flag{
+					&cli.IntFlag{Name: "utc-hour", Usage: "Override the derived anchor hour (UTC)"},
+					&cli.IntFlag{Name: "interval-hours", Usage: "Override the interval (1,2,3,4,6,8,12,24; default 24 to match backups)"},
+					&cli.IntFlag{Name: "cleanup-local-days", Usage: "Override the derived local retention"},
+					&cli.IntFlag{Name: "cleanup-remote-days", Usage: "Override the derived offsite retention"},
+					&cli.BoolFlag{Name: "dry-run", Usage: "Show what would change and exit without changing anything"},
+					&cli.BoolFlag{Name: "yes", Usage: "Skip the confirmation prompt"},
+					&cli.BoolFlag{Name: "json", Usage: "Output as JSON; requires --yes or --dry-run"},
+				},
+				Action: client.snapshotMigrateFromBackupsAction,
+			},
+			{
 				Name:  "restore-instance",
 				Usage: "Restore ONE instance out of a snapshot into this live deployment",
 				Description: "Goes through the daemon, so --file is a path on the DAEMON's filesystem.\n" +
