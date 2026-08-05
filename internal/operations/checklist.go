@@ -35,6 +35,7 @@ type ChecklistSnapshots struct {
 	Scheduled     bool              `json:"scheduled"`
 	UTCHour       int               `json:"utcHour,omitempty"`
 	IntervalHours int               `json:"intervalHours,omitempty"`
+	Format        string            `json:"format,omitempty"`
 	LastSnapshot  *ChecklistBackup  `json:"lastSnapshot,omitempty"`
 	Total         int               `json:"total"`
 	Copies        ChecklistSnapCopy `json:"copies"`
@@ -273,6 +274,7 @@ func (op *ChecklistOp) collectSnapshots(out *ChecklistSnapshots) error {
 		out.Scheduled = true
 		out.UTCHour = plan.UTCHour
 		out.IntervalHours = plan.IntervalHours
+		out.Format = plan.Format
 	}
 
 	records, err := op.deps.Store.Snapshot.List()

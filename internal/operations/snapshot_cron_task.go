@@ -118,16 +118,34 @@ func (op *SnapshotCronTaskOp) set(column string, value any) {
 }
 
 func (op *SnapshotCronTaskOp) runSnapshot(ctx context.Context) error {
+	// The plan carries the format. A read ERROR fails the capture phase — a
+	// deployment configured for logical snapshots must never silently receive
+	// a physical one because the plan could not be read (retention still runs;
+	// no phase failure aborts the chain). A plan REMOVED mid-run is different:
+	// that is an ordinary state, and the default format is fine for a run that
+	// was already scheduled. SpreadCheckpoint is always set on the scheduled
+	// path: nobody is waiting at a prompt, so pg_basebackup's paced checkpoint
+	// (which avoids an I/O spike on a live server) is the right trade.
+	format := ""
+	plan, planErr := op.deps.Store.Snapshot.GetPlan()
+	if planErr != nil {
+		return fmt.Errorf("read snapshot plan (its format decides how to capture): %w", planErr)
+	}
+	if plan != nil {
+		format = plan.Format
+	}
 	result, err := MakeSnapshot(ctx, op.deps, &MakeSnapshotParams{
-		BackupDir: op.backupDir,
-		Comment:   "scheduled",
+		BackupDir:        op.backupDir,
+		Comment:          "scheduled",
+		Format:           format,
+		SpreadCheckpoint: true,
 	})
 	if err != nil {
 		return err
 	}
 	op.snapshotID = result.ID
-	log.Printf("Scheduled snapshot created: %s (%d bytes, %d instance(s) with data, %d configuration-only)",
-		result.Path, result.Size, result.InstancesWithData, result.ConfigOnly)
+	log.Printf("Scheduled snapshot created: %s (%s, %d bytes, %d instance(s) with data, %d configuration-only)",
+		result.Path, result.Format, result.Size, result.InstancesWithData, result.ConfigOnly)
 	if result.ConfigOnly > 0 {
 		// A configuration-only instance restores to an empty cluster, so this
 		// must be visible in the operational log, not just on an interactive run.

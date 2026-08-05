@@ -46,9 +46,10 @@ type checklistResponse struct {
 		} `json:"backupCopies"`
 	} `json:"instances"`
 	Snapshots struct {
-		Scheduled     bool `json:"scheduled"`
-		UTCHour       int  `json:"utcHour"`
-		IntervalHours int  `json:"intervalHours"`
+		Scheduled     bool   `json:"scheduled"`
+		UTCHour       int    `json:"utcHour"`
+		IntervalHours int    `json:"intervalHours"`
+		Format        string `json:"format"`
 		LastSnapshot  *struct {
 			Timestamp string `json:"timestamp"`
 			SizeBytes int64  `json:"sizeBytes"`
@@ -189,10 +190,16 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 	snap := result.Snapshots
 	_, _ = fmt.Fprintln(out, "Snapshots (whole deployment)")
 	if snap.Scheduled {
+		// The format is part of the schedule (physical is the default; a
+		// pre-0.1.61 daemon sends none — show nothing rather than guess).
+		formatSuffix := ""
+		if snap.Format != "" {
+			formatSuffix = ", " + snap.Format
+		}
 		if snap.IntervalHours >= 24 || snap.IntervalHours == 0 {
-			_, _ = fmt.Fprintf(out, "  %s scheduled: daily at %02d:00 UTC\n", glyphOK, snap.UTCHour)
+			_, _ = fmt.Fprintf(out, "  %s scheduled: daily at %02d:00 UTC%s\n", glyphOK, snap.UTCHour, formatSuffix)
 		} else {
-			_, _ = fmt.Fprintf(out, "  %s scheduled: every %dh from %02d:00 UTC\n", glyphOK, snap.IntervalHours, snap.UTCHour)
+			_, _ = fmt.Fprintf(out, "  %s scheduled: every %dh from %02d:00 UTC%s\n", glyphOK, snap.IntervalHours, snap.UTCHour, formatSuffix)
 		}
 	} else {
 		_, _ = fmt.Fprintf(out, "  %s not scheduled (oddk snapshot setup-cron --utc-hour <h>)\n", glyphTodo)

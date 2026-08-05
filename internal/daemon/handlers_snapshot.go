@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
@@ -23,16 +25,38 @@ func (s *Server) handleSnapshotMake(w http.ResponseWriter, r *http.Request) {
 	// fail the response for a snapshot that actually succeeded.
 	s.clearWriteDeadline(w, "snapshot make")
 
-	// A comment is optional, and a GET-shaped POST with no body is normal here,
-	// so a decode failure must not fail the snapshot.
+	// A POST with no body is normal here (comment and format are optional),
+	// but a body that FAILS to parse must be a 400, not silently treated as
+	// empty: it may have carried "format":"logical", and producing a physical
+	// archive against an explicit request is the one substitution this
+	// endpoint must never make.
 	var req struct {
 		Comment string `json:"comment"`
+		Format  string `json:"format"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	body, readErr := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if readErr != nil {
+		s.writeError(w, http.StatusBadRequest, "could not read request body")
+		return
+	}
+	if len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+
+	// Empty means the default (physical); an unknown value is a client bug and
+	// must not silently produce some other format's archive.
+	format, err := operations.NormalizeSnapshotFormat(req.Format)
+	if err != nil {
+		s.writeOpError(w, err)
+		return
+	}
 
 	var result *operations.MakeSnapshotResult
 	op := &snapshotMakeOp{
-		params: &operations.MakeSnapshotParams{BackupDir: s.backupDir, Comment: req.Comment},
+		params: &operations.MakeSnapshotParams{BackupDir: s.backupDir, Comment: req.Comment, Format: format},
 		deps:   s.opDeps,
 		result: &result,
 	}
@@ -165,6 +189,10 @@ type SnapshotCronRequest struct {
 	IntervalHours     int `json:"intervalHours"`
 	CleanupLocalDays  int `json:"cleanupLocalDays"`
 	CleanupRemoteDays int `json:"cleanupRemoteDays"`
+
+	// Format is "physical" or "logical". Empty follows the merge rule below:
+	// an existing plan keeps its format, a new plan defaults to physical.
+	Format string `json:"format,omitempty"`
 }
 
 // validSnapshotIntervals are the divisors of 24.
@@ -195,14 +223,28 @@ func (s *Server) handleCronSnapshotSet(w http.ResponseWriter, r *http.Request) {
 		s.writeOpError(w, err)
 		return
 	}
-	defaults := struct{ interval, local, remote int }{24, 7, 14}
+	defaults := struct {
+		interval, local, remote int
+		format                  string
+	}{24, 7, 14, operations.SnapshotFormatPhysical}
 	if existing != nil {
 		defaults.interval = existing.IntervalHours
 		defaults.local = existing.CleanupLocalDays
 		defaults.remote = existing.CleanupRemoteDays
+		if existing.Format != "" {
+			defaults.format = existing.Format
+		}
 	}
 	if req.IntervalHours == 0 {
 		req.IntervalHours = defaults.interval
+	}
+	if req.Format == "" {
+		req.Format = defaults.format
+	}
+	format, err := operations.NormalizeSnapshotFormat(req.Format)
+	if err != nil {
+		s.writeOpError(w, err)
+		return
 	}
 	if !slices.Contains(validSnapshotIntervals, req.IntervalHours) {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf(
@@ -221,7 +263,7 @@ func (s *Server) handleCronSnapshotSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.Snapshot.SetPlan(req.UTCHour, req.IntervalHours, req.CleanupLocalDays, req.CleanupRemoteDays); err != nil {
+	if err := s.store.Snapshot.SetPlan(req.UTCHour, req.IntervalHours, req.CleanupLocalDays, req.CleanupRemoteDays, format); err != nil {
 		s.writeOpError(w, err)
 		return
 	}

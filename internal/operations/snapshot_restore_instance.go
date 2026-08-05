@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -62,6 +63,15 @@ type RestoreInstanceResult struct {
 	// hide: globals.sql sets the postgres role to the SOURCE's hash, so the only
 	// plaintext that can still authenticate is the source's.
 	PasswordChanged bool `json:"passwordChanged"`
+
+	// Format is how the entry was captured ("physical" or "logical").
+	Format string `json:"format"`
+
+	// FinalStatus is the instance's status after the restore: "running", or
+	// "stopped" for a physical cold capture — the instance was stopped when
+	// the snapshot was taken, and the restore reproduces that (after starting
+	// once to verify the cluster actually recovers).
+	FinalStatus string `json:"finalStatus"`
 }
 
 // RestoreInstanceFromSnapshot rebuilds one instance from a snapshot archive.
@@ -104,6 +114,12 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		return nil, operr.NotFoundf("snapshot does not contain instance %q (it has: %s)",
 			params.InstanceName, instanceNameList(manifest))
 	}
+	physical := entryFormat(entry) == SnapshotFormatPhysical
+	if physical && entry.HasData && manifest.SourceArch != "" && manifest.SourceArch != runtime.GOARCH {
+		return nil, operr.Invalidf(
+			"instance %q was captured physically on %s, but this host is %s; physical clusters are not portable across architectures. Restore on a %s host, or take a --logical snapshot on the source",
+			params.InstanceName, manifest.SourceArch, runtime.GOARCH, manifest.SourceArch)
+	}
 	if !entry.HasData {
 		// A configuration-only entry has instance.json but no databases. Building
 		// an empty cluster from it would produce an instance that looks healthy
@@ -130,8 +146,13 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 
 	// 3. The image must be present before anything destructive. A missing image
 	//    discovered after the cluster is torn down would leave the instance with
-	//    no data and no container.
+	//    no data and no container. For a physical entry the image must also
+	//    still serve the recorded major — a physical data directory only starts
+	//    on its own major.
 	if _, err := ensureImagesPresent(ctx, deps.Docker, []SnapshotInstanceEntry{entry}, params.Progress, nil); err != nil {
+		return nil, err
+	}
+	if err := checkPhysicalImageMajor(deps.Docker, entry); err != nil {
 		return nil, err
 	}
 
@@ -192,23 +213,36 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	if err := checkHostResources(metas); err != nil {
 		return nil, err
 	}
-	if err := checkLocaleProviders(extractedDir, metas); err != nil {
-		return nil, err
-	}
 	if err := checkRestorePortFree(deps, meta, existing); err != nil {
 		return nil, err
 	}
 
-	dbs, dbsFound, err := readDatabaseMetadata(instanceDir)
-	if err != nil {
-		return nil, err
-	}
-	if !dbsFound {
-		return nil, operr.Invalidf("archive has no %s for instance %s", databaseMetadataFile, params.InstanceName)
-	}
-	roleNames, err := roleNamesFromGlobals(filepath.Join(instanceDir, "globals.sql"))
-	if err != nil {
-		return nil, err
+	// The archive members each format needs must be proven present here, while
+	// refusal is still free. The locale-provider check applies only to logical
+	// restores: a physical cluster carries its collation state byte-for-byte
+	// and no CREATE DATABASE is ever issued.
+	var dbs []DatabaseMeta
+	var roleNames []string
+	if physical {
+		if err := verifyPhysicalStaging(instanceDir, params.InstanceName); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := checkLocaleProviders(extractedDir, metas); err != nil {
+			return nil, err
+		}
+		var dbsFound bool
+		dbs, dbsFound, err = readDatabaseMetadata(instanceDir)
+		if err != nil {
+			return nil, err
+		}
+		if !dbsFound {
+			return nil, operr.Invalidf("archive has no %s for instance %s", databaseMetadataFile, params.InstanceName)
+		}
+		roleNames, err = roleNamesFromGlobals(filepath.Join(instanceDir, "globals.sql"))
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// 7. Resolve the parameter group NOW, not at container-create time. It can
@@ -257,6 +291,8 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		RAMMB:           meta.RAMMB,
 		Image:           meta.Image,
 		PasswordChanged: true,
+		Format:          entryFormat(entry),
+		FinalStatus:     "running",
 	}
 
 	// ---- Destructive from here ----
@@ -318,6 +354,48 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	if err := deps.Store.Instances.UpdateContainerID(meta.Name, containerID); err != nil {
 		return nil, fmt.Errorf("record container id: %w", err)
 	}
+
+	if physical {
+		// Fill the volume BEFORE the container's first start: the entrypoint
+		// then sees PG_VERSION, skips initdb, and the archived cluster comes up
+		// as-is, recovered to consistency by PostgreSQL.
+		if err := restorePhysicalIntoCreatedContainer(ctx, deps, containerID, meta.Version, instanceDir); err != nil {
+			return nil, err
+		}
+		emitLine(params.Progress, "  ✓ Volume created and cluster files restored")
+		if err := deps.Docker.StartContainer(containerID); err != nil {
+			return nil, fmt.Errorf("start container: %w", err)
+		}
+		if err := waitForPostgresReady(ctx, meta.Port, password); err != nil {
+			return nil, fmt.Errorf("restored cluster did not become ready: %w", err)
+		}
+		count, countErr := countUserDatabases(ctx, meta.Port, password)
+		if countErr != nil {
+			return nil, fmt.Errorf("verify restored cluster: %w", countErr)
+		}
+		result.Databases = count
+		emitLine(params.Progress, "  ✓ PostgreSQL recovered; serving %d database(s)", count)
+
+		if entry.CaptureMode == captureModeCold {
+			// The instance was STOPPED when captured; reproduce that state.
+			// It was still started once above so the restore is verified, not
+			// assumed.
+			if err := deps.Docker.StopContainer(containerID); err != nil {
+				return nil, fmt.Errorf("stop cold-captured instance after verification: %w", err)
+			}
+			if err := deps.Store.Instances.UpdateStatus(meta.Name, "stopped"); err != nil {
+				return nil, fmt.Errorf("mark instance stopped: %w", err)
+			}
+			result.FinalStatus = "stopped"
+			emitLine(params.Progress, "  ✓ Instance left stopped, matching its state when the snapshot was taken")
+			return result, nil
+		}
+		if err := deps.Store.Instances.UpdateStatus(meta.Name, "running"); err != nil {
+			return nil, fmt.Errorf("mark instance running: %w", err)
+		}
+		return result, nil
+	}
+
 	if err := deps.Docker.StartContainer(containerID); err != nil {
 		return nil, fmt.Errorf("start container: %w", err)
 	}

@@ -11,13 +11,19 @@ import (
 // covers every instance, so a per-instance plan would express something that
 // cannot happen.
 type Plan struct {
-	ID                int              `db:"id" json:"-"`
-	UTCHour           int              `db:"utc_hour" json:"utcHour"`
-	IntervalHours     int              `db:"interval_hours" json:"intervalHours"`
-	CleanupLocalDays  int              `db:"cleanup_local_days" json:"cleanupLocalDays"`
-	CleanupRemoteDays int              `db:"cleanup_remote_days" json:"cleanupRemoteDays"`
-	CreatedAt         rfc3339time.Time `db:"created_at" json:"createdAt"`
-	UpdatedAt         rfc3339time.Time `db:"updated_at" json:"updatedAt"`
+	ID                int `db:"id" json:"-"`
+	UTCHour           int `db:"utc_hour" json:"utcHour"`
+	IntervalHours     int `db:"interval_hours" json:"intervalHours"`
+	CleanupLocalDays  int `db:"cleanup_local_days" json:"cleanupLocalDays"`
+	CleanupRemoteDays int `db:"cleanup_remote_days" json:"cleanupRemoteDays"`
+
+	// Format is "physical" (pg_basebackup, the default) or "logical"
+	// (portable pg_dump archives). Migration 018 backfills existing plans to
+	// physical — that DEFAULT is the deliberate "binary by default" switch.
+	Format string `db:"format" json:"format"`
+
+	CreatedAt rfc3339time.Time `db:"created_at" json:"createdAt"`
+	UpdatedAt rfc3339time.Time `db:"updated_at" json:"updatedAt"`
 }
 
 // RunsAtHour reports whether the plan fires at the given UTC hour.
@@ -48,6 +54,10 @@ type Record struct {
 	Status            string           `db:"status" json:"status"`
 	InstancesWithData int              `db:"instances_with_data" json:"instancesWithData"`
 	ConfigOnly        int              `db:"config_only" json:"configOnly"`
+
+	// Format is "physical" or "logical". Rows written before 0.1.61 default to
+	// "logical" (migration 018) — every pre-physical archive is logical.
+	Format string `db:"format" json:"format"`
 
 	LocalLocation  sql.NullString `db:"local_location" json:"-"`
 	RemoteLocation sql.NullString `db:"remote_location" json:"-"`

@@ -274,13 +274,15 @@ disaster recovery restores from. A per-instance backup cannot do that — it hol
 one instance's data and none of the configuration needed to rebuild it.
 
 ```bash
-# Capture the whole deployment
+# Capture the whole deployment (physical/binary by default — see below)
 oddk snapshot make --comment "before major upgrade"
+oddk snapshot make --logical            # portable pg_dump-based format
 oddk snapshot list
 
 # Schedule it. One schedule per deployment — a snapshot covers every instance.
 oddk snapshot setup-cron --utc-hour 3                     # daily at 03:00 UTC
 oddk snapshot setup-cron --utc-hour 3 --interval-hours 6  # 03,09,15,21 UTC
+oddk snapshot setup-cron --utc-hour 3 --logical           # schedule portable snapshots
 oddk snapshot list-cron
 
 # Already scheduling per-instance backups? Move those schedules over in one step.
@@ -312,12 +314,27 @@ systemctl start oddk
 
 What you need to know:
 
+- **Snapshots are physical (binary) by default.** Each running instance is
+  captured with `pg_basebackup` — fast, gentle on a busy server, and
+  byte-for-byte faithful (per-database settings, database-level privileges and
+  ICU collations all survive, which the logical format cannot promise). A
+  physical snapshot restores onto the same PostgreSQL major and the same CPU
+  architecture; `--logical` produces the portable `pg_dump`-based format for
+  cross-architecture moves and single-database restore workflows.
+- **UNLOGGED tables come back empty from a physical restore.** This is standard
+  physical-backup semantics (RDS storage snapshots behave the same): unlogged
+  tables are truncated by any crash recovery, which is what a physical restore
+  performs — the trade you accept for their WAL-free write speed. If an
+  unlogged table's contents must survive a restore, either make it a normal
+  table or use `--logical`, which dumps its rows.
 - **Back up `master.key` separately.** It is deliberately *not* in the archive,
   and a snapshot cannot be applied without it.
 - **Snapshots are not encrypted.** They contain database contents and role
   password hashes in plaintext. Store them accordingly.
-- **A stopped instance is captured configuration-only** — no databases. This is
-  reported, never silent.
+- **A stopped instance is captured as a cold copy** of its data directory (and
+  restored back to a stopped instance). Only with `--logical` — which needs a
+  live server to dump — is it reduced to configuration-only; that is reported,
+  never silent.
 - Restoring an instance sets its postgres password to the snapshot's, because the
   archive carries only the hash. Re-read it with `instance get-postgres-password`.
 - Retention keeps the newest snapshots regardless of age, so a run of failed

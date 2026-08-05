@@ -538,10 +538,19 @@ func snapshotCommands(client *Client) *cli.Command {
 			{
 				Name:  "make",
 				Usage: "Capture every instance and the ODDK configuration into a single archive",
+				Description: "Snapshots are PHYSICAL by default: each running instance is captured\n" +
+					"with pg_basebackup (fast, low server strain, byte-for-byte fidelity) and\n" +
+					"each stopped instance as a cold copy of its data directory. Pass --logical\n" +
+					"for the portable pg_dump-based format, which restores across architectures\n" +
+					"and on older ODDK versions, and supports single-database restore.",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:  "comment",
 						Usage: "Note stored with the snapshot (e.g. \"before major upgrade\")",
+					},
+					&cli.BoolFlag{
+						Name:  "logical",
+						Usage: "Portable pg_dump-based snapshot instead of the physical (binary) default",
 					},
 					&cli.BoolFlag{
 						Name:  "json",
@@ -619,6 +628,10 @@ func snapshotCommands(client *Client) *cli.Command {
 						Name:  "cleanup-remote-days",
 						Usage: "Days to keep offsite snapshot copies",
 						Value: 14,
+					},
+					&cli.BoolFlag{
+						Name:  "logical",
+						Usage: "Schedule portable pg_dump-based snapshots instead of the physical (binary) default (--logical=false switches back)",
 					},
 					&cli.BoolFlag{
 						Name:  "remove",

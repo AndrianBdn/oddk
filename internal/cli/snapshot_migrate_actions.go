@@ -240,6 +240,11 @@ func derivedSnapshotPlan(plans []backupCronPlan) (snapshotPlan, bool) {
 	out := snapshotPlan{
 		UTCHour:       hours[0],
 		IntervalHours: 24, // backup schedules are daily-only; match them
+		// A NEW plan gets the daemon's default format. Recorded here so the
+		// preview and the JSON report describe the plan that will actually be
+		// written (applyMigration itself omits the field and lets the daemon
+		// default; an adopted existing plan keeps its own format).
+		Format: "physical",
 	}
 	for _, p := range plans {
 		out.CleanupLocalDays = max(out.CleanupLocalDays, p.CleanupLocalDays)

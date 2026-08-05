@@ -24,6 +24,7 @@ func (s *Store) runAllMigrations() error {
 		{"015_cron_cleanup_days", migration015CronCleanupDays},
 		{"016_instance_image", migration016InstanceImage},
 		{"017_snapshot_tables", migration017SnapshotTables},
+		{"018_snapshot_format", migration018SnapshotFormat},
 	}
 
 	for _, m := range migrations {
@@ -437,6 +438,28 @@ func migration017SnapshotTables(sqx *sqlx.DB) error {
 	`)
 
 	sqx.MustExec(`CREATE INDEX idx_snapshot_history_created_at ON snapshot_history(created_at)`)
+
+	return nil
+}
+
+// migration018SnapshotFormat records each snapshot's and the schedule's format:
+// "physical" (pg_basebackup, the default since 0.1.61) or "logical" (the
+// original pg_dump archives).
+//
+// The two DEFAULTs point in different directions ON PURPOSE. An existing PLAN
+// backfills to 'physical' — that is the "snapshots become binary by default"
+// switch, applied to already-scheduled deployments on upgrade. Existing
+// HISTORY rows backfill to 'logical' because that is simply what every
+// pre-0.1.61 archive is.
+func migration018SnapshotFormat(sqx *sqlx.DB) error {
+	sqx.MustExec(`
+		ALTER TABLE snapshot_plans ADD COLUMN format TEXT NOT NULL DEFAULT 'physical'
+			CHECK (format IN ('physical', 'logical'))
+	`)
+	sqx.MustExec(`
+		ALTER TABLE snapshot_history ADD COLUMN format TEXT NOT NULL DEFAULT 'logical'
+			CHECK (format IN ('physical', 'logical'))
+	`)
 
 	return nil
 }

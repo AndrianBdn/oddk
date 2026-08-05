@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +150,18 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 	pass("Snapshot version is supported",
 		fmt.Sprintf("snapshot %s (this binary: %s)", manifest.OddkVersion, version.Version))
 
+	// 1b. A physical data directory is only supported on the platform that
+	//     wrote it. Refusing here — from the manifest alone — beats a cluster
+	//     that starts and then corrupts subtly. Logical archives restore on any
+	//     architecture; --logical is the documented cross-arch path.
+	if err := checkSnapshotArch(manifest); err != nil {
+		return fail("Snapshot architecture matches this host",
+			fmt.Sprintf("snapshot: %s, this host: %s", manifest.SourceArch, runtime.GOARCH), err)
+	}
+	if manifestHasPhysicalData(manifest) {
+		pass("Snapshot architecture matches this host", runtime.GOARCH)
+	}
+
 	// 2. The daemon must not be running: it and this command would both write
 	//    oddk.db and drive Docker.
 	if daemonIsListening(params.DaemonPort) {
@@ -189,6 +202,18 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 	plan.PulledImages = pulled
 	pass("Instance images are available", imageSummary(manifest, pulled))
 
+	// 4b. Each physical entry's image must still serve the recorded major —
+	//     a moving tag that drifted majors would produce clusters PostgreSQL
+	//     refuses to start, discovered only after the destructive phase.
+	if manifestHasPhysicalData(manifest) {
+		for _, entry := range manifest.Instances {
+			if err := checkPhysicalImageMajor(params.Docker, entry); err != nil {
+				return fail("Images match the recorded PostgreSQL majors", "", err)
+			}
+		}
+		pass("Images match the recorded PostgreSQL majors", "")
+	}
+
 	// 5. Extract. Everything above was cheap; this is where real work starts,
 	//    but it still only writes into a staging directory.
 	//
@@ -222,10 +247,20 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 	}
 	pass("Master key decrypts instance credentials", "")
 
-	// 7. Load each instance's configuration from the archive.
+	// 7. Load each instance's configuration from the archive, and prove every
+	//    physical entry actually carries its base tar — a truncated archive
+	//    must be a refusal here, not a failure after oddk.db was replaced.
 	instances, err := loadSnapshotInstances(extractedDir, manifest)
 	if err != nil {
 		return fail("Instance configuration is readable", "", err)
+	}
+	for _, entry := range manifest.Instances {
+		if !entry.HasData || entryFormat(entry) != SnapshotFormatPhysical {
+			continue
+		}
+		if err := verifyPhysicalStaging(filepath.Join(extractedDir, snapshotInstancesDir, entry.Name), entry.Name); err != nil {
+			return fail("Instance configuration is readable", "", err)
+		}
 	}
 	plan.Instances = instances
 
@@ -238,10 +273,13 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 	}
 	pass("Host can run the recorded instance sizes", resourceSummary(instances))
 
-	// 9. Every database must use a locale provider this restore can reproduce.
-	//    buildCreateDatabaseSQL only reproduces libc locales; an ICU/builtin
-	//    database would come back with silently different collation.
-	if err := checkLocaleProviders(extractedDir, instances); err != nil {
+	// 9. Every LOGICALLY captured database must use a locale provider this
+	//    restore can reproduce — buildCreateDatabaseSQL only reproduces libc
+	//    locales. Physical entries are exempt on purpose: no CREATE DATABASE is
+	//    ever issued for them, the collation state arrives byte-for-byte inside
+	//    the cluster (and the same-image pull above pins the libc it was built
+	//    against), so ICU/builtin databases restore fine physically.
+	if err := checkLocaleProviders(extractedDir, logicalInstanceMetas(manifest, instances)); err != nil {
 		return fail("Database locales can be reproduced", "", err)
 	}
 	pass("Database locales can be reproduced", "")
@@ -618,7 +656,7 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 		}
 
 		emitLine(progress, "Restoring instance %s (this may take a while)...", meta.Name)
-		if err := rebuildInstanceFromSnapshot(ctx, deps, plan, meta, progress); err != nil {
+		if err := rebuildInstanceFromSnapshot(ctx, deps, plan, entry, meta, progress); err != nil {
 			return nil, fmt.Errorf("restore instance %s: %w", meta.Name, err)
 		}
 		result.Restored = append(result.Restored, meta.Name)
@@ -628,17 +666,20 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 }
 
 // rebuildInstanceFromSnapshot creates the instance's volume and container with
-// the password recorded in the restored store, waits for readiness, and replays
-// its dump.
+// the password recorded in the restored store, waits for readiness, and
+// restores its data — replaying dumps for a logical entry, streaming the
+// archived cluster into the volume for a physical one.
 //
-// The password is the crux: the cluster is initialised with the very plaintext
-// the source host used, so the ALTER ROLE postgres inside globals.sql is a
-// no-op and ODDK's stored credential stays valid. That is the whole reason the
-// master key is required.
+// The password is the crux either way: a logical rebuild initialises the
+// cluster with the very plaintext the source host used (so globals.sql's ALTER
+// ROLE postgres is a no-op), and a physical rebuild arrives with the source's
+// password hash inside pg_authid, so only that same plaintext authenticates.
+// That is the whole reason the master key is required.
 func rebuildInstanceFromSnapshot(
 	ctx context.Context,
 	deps *Dependencies,
 	plan *SnapshotApplyPlan,
+	entry SnapshotInstanceEntry,
 	meta *InstanceMeta,
 	progress io.Writer,
 ) (err error) {
@@ -699,6 +740,49 @@ func rebuildInstanceFromSnapshot(
 	if err := deps.Store.Instances.UpdateContainerID(meta.Name, containerID); err != nil {
 		return fmt.Errorf("record container id: %w", err)
 	}
+
+	instanceDir := filepath.Join(plan.ExtractedDir, snapshotInstancesDir, meta.Name)
+
+	if entryFormat(entry) == SnapshotFormatPhysical {
+		// The volume must be filled BEFORE the container's first start: the
+		// entrypoint sees PG_VERSION and skips initdb, so the archived cluster
+		// — roles, per-database GUCs, ACLs, collation state and all — comes up
+		// as-is, recovered to consistency by PostgreSQL itself.
+		if err := restorePhysicalIntoCreatedContainer(ctx, deps, containerID, meta.Version, instanceDir); err != nil {
+			return err
+		}
+		emitLine(progress, "  ✓ Volume created and cluster files restored")
+		if err := deps.Docker.StartContainer(containerID); err != nil {
+			return fmt.Errorf("start container: %w", err)
+		}
+		if err := waitForPostgresReady(ctx, meta.Port, password); err != nil {
+			return fmt.Errorf("restored cluster did not become ready: %w", err)
+		}
+		count, countErr := countUserDatabases(ctx, meta.Port, password)
+		if countErr != nil {
+			return fmt.Errorf("verify restored cluster: %w", countErr)
+		}
+		emitLine(progress, "  ✓ PostgreSQL recovered; serving %d database(s)", count)
+
+		if entry.CaptureMode == captureModeCold {
+			// The instance was STOPPED when captured; reproduce that. It was
+			// still started once above — deliberately, because a restore whose
+			// cluster has never reached readiness is not a verified restore.
+			if err := deps.Docker.StopContainer(containerID); err != nil {
+				return fmt.Errorf("stop cold-captured instance after verification: %w", err)
+			}
+			if err := deps.Store.Instances.UpdateStatus(meta.Name, "stopped"); err != nil {
+				return fmt.Errorf("mark instance stopped: %w", err)
+			}
+			emitLine(progress, "  ✓ Instance left stopped, matching its state when the snapshot was taken")
+			return nil
+		}
+		if err := deps.Store.Instances.UpdateStatus(meta.Name, "running"); err != nil {
+			return fmt.Errorf("mark instance running: %w", err)
+		}
+		return nil
+	}
+
 	if err := deps.Docker.StartContainer(containerID); err != nil {
 		return fmt.Errorf("start container: %w", err)
 	}
@@ -709,7 +793,6 @@ func rebuildInstanceFromSnapshot(
 	}
 	emitLine(progress, "  ✓ PostgreSQL ready")
 
-	instanceDir := filepath.Join(plan.ExtractedDir, snapshotInstancesDir, meta.Name)
 	dbs, found, err := readDatabaseMetadata(instanceDir)
 	if err != nil {
 		return err
@@ -742,6 +825,50 @@ func rebuildInstanceFromSnapshot(
 		return fmt.Errorf("mark instance running: %w", err)
 	}
 	return nil
+}
+
+// checkSnapshotArch refuses a snapshot with physical data captured on a
+// different architecture. PostgreSQL data directories are only supported on
+// the platform that wrote them; amd64<->arm64 happens to share endianness but
+// is unsupported upstream, and a cluster that starts anyway can corrupt
+// subtly. Logical archives are exempt — --logical is the cross-arch path.
+func checkSnapshotArch(manifest *SnapshotManifest) error {
+	if !manifestHasPhysicalData(manifest) {
+		return nil
+	}
+	if manifest.SourceArch == "" || manifest.SourceArch == runtime.GOARCH {
+		return nil
+	}
+	return operr.Invalidf(
+		"snapshot holds physical data directories captured on %s, but this host is %s; physical clusters are not portable across architectures. Restore on a %s host, or take a --logical snapshot on the source",
+		manifest.SourceArch, runtime.GOARCH, manifest.SourceArch)
+}
+
+// manifestHasPhysicalData reports whether any entry carries a physical capture.
+func manifestHasPhysicalData(manifest *SnapshotManifest) bool {
+	for _, entry := range manifest.Instances {
+		if entry.HasData && entryFormat(entry) == SnapshotFormatPhysical {
+			return true
+		}
+	}
+	return false
+}
+
+// logicalInstanceMetas filters the loaded instance configs down to the ones
+// whose data was captured logically — the only ones the locale-provider check
+// applies to.
+func logicalInstanceMetas(manifest *SnapshotManifest, metas []*InstanceMeta) []*InstanceMeta {
+	byName := make(map[string]SnapshotInstanceEntry, len(manifest.Instances))
+	for _, entry := range manifest.Instances {
+		byName[entry.Name] = entry
+	}
+	out := make([]*InstanceMeta, 0, len(metas))
+	for _, meta := range metas {
+		if entryFormat(byName[meta.Name]) == SnapshotFormatLogical {
+			out = append(out, meta)
+		}
+	}
+	return out
 }
 
 // markInstanceUnbuilt records that an instance exists in configuration but has

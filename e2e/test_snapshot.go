@@ -20,12 +20,15 @@ type snapshotManifest struct {
 	FormatVersion int      `json:"formatVersion"`
 	OddkVersion   string   `json:"oddkVersion"`
 	SourceHost    string   `json:"sourceHost"`
+	SourceArch    string   `json:"sourceArch"`
 	Migrations    []string `json:"migrations"`
 	Instances     []struct {
-		Name       string `json:"name"`
-		Version    string `json:"version"`
-		HasData    bool   `json:"hasData"`
-		SkipReason string `json:"skipReason"`
+		Name        string `json:"name"`
+		Version     string `json:"version"`
+		HasData     bool   `json:"hasData"`
+		Format      string `json:"format"`
+		CaptureMode string `json:"captureMode"`
+		SkipReason  string `json:"skipReason"`
 	} `json:"instances"`
 }
 
@@ -130,16 +133,20 @@ func testSnapshotMake(h *TestHarness) error {
 		return fmt.Errorf("stop instance: %w (output: %s)", err, output)
 	}
 
-	log.Println("Step 3: Taking snapshot")
-	output, err = h.runCLI("snapshot", "make")
+	log.Println("Step 3: Taking a LOGICAL snapshot (this test pins the portable layout)")
+	output, err = h.runCLI("snapshot", "make", "--logical")
 	if err != nil {
 		return fmt.Errorf("snapshot make failed: %w (output: %s)", err, output)
 	}
 	if !strings.Contains(output, "NOT encrypted by the master key") {
 		return fmt.Errorf("snapshot output is missing the not-encrypted warning; got: %s", output)
 	}
+	// In logical mode a stopped instance cannot be captured at all.
 	if !strings.Contains(output, "configuration-only") {
 		return fmt.Errorf("snapshot output does not report configuration-only instances; got: %s", output)
+	}
+	if !strings.Contains(output, "Format: logical") {
+		return fmt.Errorf("snapshot output does not report the logical format; got: %s", output)
 	}
 
 	log.Println("Step 4: Locating the snapshot archive")
@@ -204,8 +211,11 @@ func testSnapshotMake(h *TestHarness) error {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return fmt.Errorf("parse manifest: %w", err)
 	}
+	// A logical snapshot stamps v1 because its layout genuinely is v1; only
+	// physical archives bump (the version describes the archive, not the
+	// binary — the OddkVersion gate governs old-reader compatibility).
 	if manifest.FormatVersion != 1 {
-		return fmt.Errorf("manifest formatVersion = %d, want 1", manifest.FormatVersion)
+		return fmt.Errorf("manifest formatVersion = %d, want 1 for a logical archive", manifest.FormatVersion)
 	}
 	if manifest.OddkVersion == "" || manifest.SourceHost == "" {
 		return fmt.Errorf("manifest missing version/host: %+v", manifest)
@@ -217,6 +227,9 @@ func testSnapshotMake(h *TestHarness) error {
 		return fmt.Errorf("manifest lists %d instances, want 2", len(manifest.Instances))
 	}
 	for _, inst := range manifest.Instances {
+		if inst.Format != "logical" {
+			return fmt.Errorf("instance %s has format %q, want logical", inst.Name, inst.Format)
+		}
 		switch inst.Name {
 		case runningName:
 			if !inst.HasData {

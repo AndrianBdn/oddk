@@ -20,11 +20,12 @@ import (
 )
 
 type snapshotInstanceEntry struct {
-	Name       string `json:"name"`
-	Version    string `json:"version"`
-	Image      string `json:"image"`
-	HasData    bool   `json:"hasData"`
-	SkipReason string `json:"skipReason,omitempty"`
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Image       string `json:"image"`
+	HasData     bool   `json:"hasData"`
+	CaptureMode string `json:"captureMode,omitempty"`
+	SkipReason  string `json:"skipReason,omitempty"`
 }
 
 type snapshotMakeResult struct {
@@ -32,6 +33,7 @@ type snapshotMakeResult struct {
 	Path              string                  `json:"path"`
 	Size              int64                   `json:"size"`
 	Timestamp         string                  `json:"timestamp"`
+	Format            string                  `json:"format"`
 	Instances         []snapshotInstanceEntry `json:"instances"`
 	InstancesWithData int                     `json:"instancesWithData"`
 	ConfigOnly        int                     `json:"configOnly"`
@@ -40,9 +42,12 @@ type snapshotMakeResult struct {
 func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error {
 	_, _ = fmt.Fprintln(c.out, "Snapshotting deployment (this may take a while)...")
 
-	var body any
+	body := map[string]string{}
 	if comment := cmd.String("comment"); comment != "" {
-		body = map[string]string{"comment": comment}
+		body["comment"] = comment
+	}
+	if cmd.Bool("logical") {
+		body["format"] = "logical"
 	}
 	resp, err := c.request("POST", "/api/snapshot", body)
 	if err != nil {
@@ -64,6 +69,12 @@ func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error
 		w := tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
 		for _, inst := range result.Instances {
 			if inst.HasData {
+				// A cold capture is a real capture, but the operator should see
+				// that the instance was stopped — its restore comes back stopped.
+				if inst.CaptureMode == "cold" {
+					_, _ = fmt.Fprintf(w, "  %s %s\tPostgreSQL %s (stopped; captured cold)\n", glyphOK, inst.Name, inst.Version)
+					continue
+				}
 				_, _ = fmt.Fprintf(w, "  %s %s\tPostgreSQL %s\n", glyphOK, inst.Name, inst.Version)
 				continue
 			}
@@ -82,9 +93,20 @@ func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error
 	} else {
 		_, _ = fmt.Fprintf(c.out, "Snapshot: %s\n", result.Path)
 	}
-	_, _ = fmt.Fprintf(c.out, "Size: %d bytes\n", result.Size)
-	_, _ = fmt.Fprintf(c.out, "Instances: %d (%d with data, %d configuration-only)\n",
-		len(result.Instances), result.InstancesWithData, result.ConfigOnly)
+	// humanSize, matching 'snapshot list' — the same value was rendered two
+	// different ways. It also makes the 5 GiB offsite upload limit something an
+	// operator can check at a glance. The exact byte count is still in --json.
+	_, _ = fmt.Fprintf(c.out, "Size: %s\n", humanSize(result.Size))
+	_, _ = fmt.Fprintf(c.out, "Format: %s\n", describeSnapshotFormat(result.Format))
+	// The per-instance list above already names every instance, so spelling out
+	// "N with data, 0 configuration-only" just restates the total. Break it down
+	// only when there is actually a split to report.
+	if result.ConfigOnly > 0 {
+		_, _ = fmt.Fprintf(c.out, "Instances: %d (%d with data, %d configuration-only)\n",
+			len(result.Instances), result.InstancesWithData, result.ConfigOnly)
+	} else {
+		_, _ = fmt.Fprintf(c.out, "Instances: %d\n", len(result.Instances))
+	}
 
 	if result.ConfigOnly > 0 {
 		_, _ = fmt.Fprintf(c.out,
@@ -108,6 +130,7 @@ type snapshotPlan struct {
 	IntervalHours     int    `json:"intervalHours"`
 	CleanupLocalDays  int    `json:"cleanupLocalDays"`
 	CleanupRemoteDays int    `json:"cleanupRemoteDays"`
+	Format            string `json:"format"`
 	UpdatedAt         string `json:"updatedAt"`
 }
 
@@ -117,11 +140,25 @@ type snapshotRecord struct {
 	CreatedAt         string `json:"createdAt"`
 	Size              int64  `json:"size"`
 	Status            string `json:"status"`
+	Format            string `json:"format"`
 	InstancesWithData int    `json:"instancesWithData"`
 	ConfigOnly        int    `json:"configOnly"`
 	LocalLocation     string `json:"localLocation,omitempty"`
 	RemoteLocation    string `json:"remoteLocation,omitempty"`
 	Comment           string `json:"comment,omitempty"`
+}
+
+// describeSnapshotFormat renders a format value for humans, tolerating the
+// empty string an old daemon (or an old catalogue row) reports.
+func describeSnapshotFormat(format string) string {
+	switch format {
+	case "physical":
+		return "physical (pg_basebackup)"
+	case "logical", "":
+		return "logical (portable pg_dump)"
+	default:
+		return format
+	}
 }
 
 // snapshotSetupCronAction configures (or removes) the deployment-wide snapshot
@@ -142,7 +179,7 @@ func (c *Client) snapshotSetupCronAction(ctx context.Context, cmd *cli.Command) 
 	// Send ONLY what the operator actually set, so the daemon can merge with the
 	// existing plan. Sending the flag defaults unconditionally would make
 	// `setup-cron --utc-hour 4` silently reset a 6-hour interval back to daily.
-	body := map[string]int{"utcHour": cmd.Int("utc-hour")}
+	body := map[string]any{"utcHour": cmd.Int("utc-hour")}
 	if cmd.IsSet("interval-hours") {
 		body["intervalHours"] = cmd.Int("interval-hours")
 	}
@@ -151,6 +188,16 @@ func (c *Client) snapshotSetupCronAction(ctx context.Context, cmd *cli.Command) 
 	}
 	if cmd.IsSet("cleanup-remote-days") {
 		body["cleanupRemoteDays"] = cmd.Int("cleanup-remote-days")
+	}
+	// IsSet-gated like the rest: --logical selects logical, an explicit
+	// --logical=false switches an existing plan back to physical, and leaving
+	// the flag off preserves whatever the plan already uses.
+	if cmd.IsSet("logical") {
+		if cmd.Bool("logical") {
+			body["format"] = "logical"
+		} else {
+			body["format"] = "physical"
+		}
 	}
 
 	resp, err := c.request("POST", "/api/cron/snapshot", body)
@@ -199,6 +246,7 @@ func printSnapshotPlan(out io.Writer, plan *snapshotPlan) {
 			plan.IntervalHours, plan.UTCHour)
 		_, _ = fmt.Fprintf(out, "  Runs at: %s UTC\n", snapshotRunHours(plan))
 	}
+	_, _ = fmt.Fprintf(out, "  Format: %s\n", describeSnapshotFormat(plan.Format))
 	_, _ = fmt.Fprintf(out, "  Keep local:  %d days\n", plan.CleanupLocalDays)
 	_, _ = fmt.Fprintf(out, "  Keep offsite: %d days\n", plan.CleanupRemoteDays)
 }
@@ -238,10 +286,14 @@ func (c *Client) snapshotListAction(ctx context.Context, cmd *cli.Command) error
 	}
 
 	w := tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ID\tCREATED\tSIZE\tINSTANCES\tCOPIES\tCOMMENT")
+	_, _ = fmt.Fprintln(w, "ID\tCREATED\tSIZE\tFORMAT\tINSTANCES\tCOPIES\tCOMMENT")
 	for _, r := range records {
-		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%d+%d\t%s\t%s\n",
-			r.ID, r.CreatedAt, humanSize(r.Size),
+		format := r.Format
+		if format == "" {
+			format = "logical" // pre-0.1.61 rows predate the column
+		}
+		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d+%d\t%s\t%s\n",
+			r.ID, r.CreatedAt, humanSize(r.Size), format,
 			r.InstancesWithData, r.ConfigOnly,
 			copiesLabel(r.LocalLocation, r.RemoteLocation), r.Comment)
 	}
@@ -386,6 +438,8 @@ type snapshotRestoreInstanceResult struct {
 	RAMMB           int    `json:"ramMb"`
 	Image           string `json:"image"`
 	PasswordChanged bool   `json:"passwordChanged"`
+	Format          string `json:"format"`
+	FinalStatus     string `json:"finalStatus"`
 }
 
 // snapshotRestoreInstanceAction restores ONE instance out of a snapshot into
@@ -458,8 +512,19 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 	_, _ = fmt.Fprintf(c.out, "  Databases: %d\n", result.Databases)
 	_, _ = fmt.Fprintf(c.out, "  Config:    port %d, %d CPU, %d MB, image %s\n",
 		result.Port, result.CPUCores, result.RAMMB, result.Image)
+	if result.Format != "" {
+		_, _ = fmt.Fprintf(c.out, "  Format:    %s\n", describeSnapshotFormat(result.Format))
+	}
 	if result.SourceHost != "" {
 		_, _ = fmt.Fprintf(c.out, "  Source:    %s (snapshot taken %s)\n", result.SourceHost, result.SnapshotAt)
+	}
+	if result.FinalStatus == "stopped" {
+		// A cold-captured instance comes back the way it was captured. Saying
+		// nothing would read as a restore that failed to start the instance.
+		_, _ = fmt.Fprintf(c.out,
+			"\n  The instance was STOPPED when this snapshot was taken, so it has been\n"+
+				"  restored, verified, and left stopped. Start it with: oddk instance start %s\n",
+			result.Instance)
 	}
 	if result.PasswordChanged {
 		// Anything holding the previous credential is now broken, so this cannot

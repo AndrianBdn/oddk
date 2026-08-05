@@ -67,12 +67,12 @@ func TestSnapshotPlanIsSingleton(t *testing.T) {
 		t.Fatalf("GetPlan on a fresh store = (%v, %v), want (nil, nil)", plan, err)
 	}
 
-	if err := st.Snapshot.SetPlan(3, 24, 7, 14); err != nil {
+	if err := st.Snapshot.SetPlan(3, 24, 7, 14, "physical"); err != nil {
 		t.Fatal(err)
 	}
 	// A second SetPlan must REPLACE, not add: the scheduler reads one row, and a
 	// second would make which schedule applies a coin flip.
-	if err := st.Snapshot.SetPlan(9, 6, 3, 5); err != nil {
+	if err := st.Snapshot.SetPlan(9, 6, 3, 5, "logical"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -80,10 +80,8 @@ func TestSnapshotPlanIsSingleton(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan == nil {
-		t.Fatal("GetPlan returned nil after SetPlan")
-	}
-	if plan.UTCHour != 9 || plan.IntervalHours != 6 || plan.CleanupLocalDays != 3 || plan.CleanupRemoteDays != 5 {
+	if plan == nil || plan.UTCHour != 9 || plan.IntervalHours != 6 ||
+		plan.CleanupLocalDays != 3 || plan.CleanupRemoteDays != 5 || plan.Format != "logical" {
 		t.Errorf("plan = %+v, want the second SetPlan's values", plan)
 	}
 

@@ -111,6 +111,8 @@ func main() {
 			},
 		},
 		{Name: "SnapshotUpload", Fn: testSnapshotUpload, RunFakeS3: true},
+		{Name: "SnapshotPhysicalMake", Fn: testSnapshotPhysicalMake},
+		{Name: "SnapshotLogicalRoundTrip", Fn: testSnapshotLogicalRoundTrip},
 		{Name: "SnapshotMigrateFromBackups", Fn: testSnapshotMigrateFromBackups},
 		{Name: "MajorUpgrade", Fn: testMajorUpgrade},
 		{Name: "MajorUpgradeCustomImage", Fn: testMajorUpgradeCustomImage},

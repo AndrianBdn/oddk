@@ -26,18 +26,19 @@ func NewSnapshotStore(db *sqlx.DB) *SnapshotStore {
 
 // SetPlan creates or replaces the deployment's snapshot schedule, preserving
 // created_at across updates (as CronStore.CreatePlan does).
-func (s *SnapshotStore) SetPlan(utcHour, intervalHours, cleanupLocalDays, cleanupRemoteDays int) error {
+func (s *SnapshotStore) SetPlan(utcHour, intervalHours, cleanupLocalDays, cleanupRemoteDays int, format string) error {
 	now := rfc3339time.Now()
 	_, err := s.db.Exec(`
-		INSERT INTO snapshot_plans (id, utc_hour, interval_hours, cleanup_local_days, cleanup_remote_days, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO snapshot_plans (id, utc_hour, interval_hours, cleanup_local_days, cleanup_remote_days, format, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			utc_hour = excluded.utc_hour,
 			interval_hours = excluded.interval_hours,
 			cleanup_local_days = excluded.cleanup_local_days,
 			cleanup_remote_days = excluded.cleanup_remote_days,
+			format = excluded.format,
 			updated_at = excluded.updated_at
-	`, planID, utcHour, intervalHours, cleanupLocalDays, cleanupRemoteDays, now, now)
+	`, planID, utcHour, intervalHours, cleanupLocalDays, cleanupRemoteDays, format, now, now)
 	if err != nil {
 		return fmt.Errorf("set snapshot plan: %w", err)
 	}
@@ -85,12 +86,16 @@ func (s *SnapshotStore) RecordSnapshot(rec *Record) error {
 		comment = sql.NullString{String: rec.CommentStr, Valid: true}
 	}
 
+	format := rec.Format
+	if format == "" {
+		format = "logical"
+	}
 	result, err := s.db.Exec(`
 		INSERT INTO snapshot_history
-			(filename, created_at, size, status, instances_with_data, config_only, local_location, remote_location, comment)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(filename, created_at, size, status, instances_with_data, config_only, format, local_location, remote_location, comment)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, rec.Filename, rec.CreatedAt, rec.Size, rec.Status,
-		rec.InstancesWithData, rec.ConfigOnly, local, rec.RemoteLocation, comment)
+		rec.InstancesWithData, rec.ConfigOnly, format, local, rec.RemoteLocation, comment)
 	if err != nil {
 		return fmt.Errorf("record snapshot: %w", err)
 	}

@@ -147,6 +147,70 @@ func pgDataMountTarget(version string) string {
 	return "/var/lib/postgresql/data"
 }
 
+// PGDataMountTarget is where an instance's data volume is mounted inside its
+// container: the data directory itself for PG <= 17, its parent for PG 18+
+// (the official image moved PGDATA to /var/lib/postgresql/<major>/docker).
+// Exported for the physical snapshot paths, which must know where inside the
+// volume the cluster lives.
+func PGDataMountTarget(version string) string {
+	return pgDataMountTarget(version)
+}
+
+// ImagePGMajor reports the PostgreSQL major version a local image serves, read
+// from the PG_MAJOR environment variable the official images (and everything
+// derived from them: pgvector, postgis, ...) carry. Best-effort: ok is false
+// when the image cannot be inspected or does not declare PG_MAJOR, and callers
+// must skip their check rather than refuse — a non-standard image is not proof
+// of a mismatch.
+func (c *Client) ImagePGMajor(imageName string) (int, bool) {
+	inspect, err := c.cli.ImageInspect(c.ctx, imageName)
+	if err != nil || inspect.Config == nil {
+		return 0, false
+	}
+	return ParsePGMajorEnv(inspect.Config.Env)
+}
+
+// ParsePGMajorEnv extracts PG_MAJOR from a docker env list. Exported for the
+// package's external tests, matching its other pure helpers.
+func ParsePGMajorEnv(env []string) (int, bool) {
+	for _, e := range env {
+		if value, ok := strings.CutPrefix(e, "PG_MAJOR="); ok {
+			// Historically "9.6"-style values existed; the major is the part
+			// before the first dot either way.
+			major, err := strconv.Atoi(strings.Split(value, ".")[0])
+			if err == nil && major > 0 {
+				return major, true
+			}
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// ContainerPGData returns the container's effective PGDATA path, read from its
+// environment (which includes image-inherited variables). The fallback mirrors
+// the official images' conventions for containers that somehow lack the
+// variable: the volume mount target for PG <= 17, <target>/<major>/docker for
+// PG 18+.
+func (c *Client) ContainerPGData(containerID, version string) (string, error) {
+	inspect, err := c.cli.ContainerInspect(c.ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("inspect container: %w", err)
+	}
+	if inspect.Config != nil {
+		for _, env := range inspect.Config.Env {
+			if value, ok := strings.CutPrefix(env, "PGDATA="); ok && value != "" {
+				return value, nil
+			}
+		}
+	}
+	target := pgDataMountTarget(version)
+	if major, err := strconv.Atoi(strings.Split(version, ".")[0]); err == nil && major >= 18 {
+		return fmt.Sprintf("%s/%d/docker", target, major), nil
+	}
+	return target, nil
+}
+
 func (c *Client) CreateContainer(name, version, image string, port int, password string, cpuCores, ramMB int, parameterGroupName string, parameterGroupParams []parameters.Parameter) (string, error) {
 	volumeName := fmt.Sprintf("oddk-data-%s", name)
 	containerName := fmt.Sprintf("oddk-pg-%s", name)
