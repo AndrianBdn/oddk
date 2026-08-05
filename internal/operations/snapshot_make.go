@@ -296,6 +296,13 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 	// which is correct — a snapshot is an INPUT to a restored host, not
 	// something that host produced. Provenance lives in manifest.json, outside
 	// the SQLite copy, where it cannot self-reference.
+	// The per-instance list (not just the counts) goes into the catalogue so
+	// the checklist can answer "is THIS instance's data in the newest
+	// snapshot?" — a configuration-only entry must not read as coverage.
+	recorded := make([]snapshotstore.RecordInstance, 0, len(entries))
+	for _, e := range entries {
+		recorded = append(recorded, snapshotstore.RecordInstance{Name: e.Name, HasData: e.HasData})
+	}
 	record := &snapshotstore.Record{
 		Filename:          filepath.Base(archivePath),
 		CreatedAt:         rfc3339time.Time{Time: timestamp},
@@ -304,6 +311,7 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 		Format:            format,
 		InstancesWithData: withData,
 		ConfigOnly:        len(entries) - withData,
+		Instances:         recorded,
 		LocalPath:         archivePath,
 		CommentStr:        params.Comment,
 	}

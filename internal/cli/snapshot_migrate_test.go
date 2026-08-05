@@ -86,15 +86,25 @@ func defaultMigrateDaemon() *fakeMigrateDaemon {
 			{"instanceName": "staging", "utcHour": 3, "cleanupLocalDays": 5,  "cleanupRemoteDays": 5}
 		]`,
 		snapshotPlan: "null",
+		// The checklist no longer reports per-instance backups (they are
+		// legacy); the size estimate is derived from GET /api/backups instead:
+		// each instance's newest COMPLETED backup (app -> #3, billing -> #2),
+		// so failed records and older duplicates must not inflate it.
 		checklistRaw: `{"instances": [
-			{"name": "app",     "lastGoodBackup": {"id": 1, "sizeBytes": 1073741824, "location": "local"}},
-			{"name": "billing", "lastGoodBackup": {"id": 2, "sizeBytes": 536870912,  "location": "local"}},
-			{"name": "staging", "completedBackups": 0}
+			{"name": "app"}, {"name": "billing"}, {"name": "staging"}
 		], "snapshots": {"scheduled": false}}`,
+		// Estimate = app's #3 (newest completed, 1.5 GiB) + billing's #2
+		// (0.5 GiB) = 2.0 GiB — NOT app's older #1, NOT the failed #4 despite
+		// its newer timestamp, and NOT #5: "ghost" is a destroyed instance
+		// (absent from the checklist), whose surviving backup records a
+		// snapshot would not capture. Unmanaged local bytes = #1 + #2 =
+		// 1.5 GiB (records with a local copy, any status, migrating plans only).
 		backupsRaw: `[
-			{"id": 1, "instanceName": "app",     "size": 1073741824, "localLocation": "/b/1.tar.zst", "remoteLocation": "s3://x/1"},
-			{"id": 2, "instanceName": "billing", "size": 536870912,  "localLocation": "/b/2.tar.zst"},
-			{"id": 3, "instanceName": "app",     "size": 1073741824, "remoteLocation": "s3://x/3"}
+			{"id": 1, "instanceName": "app",     "timestamp": "2026-07-01T03:00:00Z", "size": 1073741824, "status": "completed", "localLocation": "/b/1.tar.zst", "remoteLocation": "s3://x/1"},
+			{"id": 2, "instanceName": "billing", "timestamp": "2026-07-08T03:00:00Z", "size": 536870912,  "status": "completed", "localLocation": "/b/2.tar.zst"},
+			{"id": 3, "instanceName": "app",     "timestamp": "2026-07-08T03:00:00Z", "size": 1610612736, "status": "completed", "remoteLocation": "s3://x/3"},
+			{"id": 4, "instanceName": "app",     "timestamp": "2026-07-09T03:00:00Z", "size": 999999999999, "status": "failed"},
+			{"id": 5, "instanceName": "ghost",   "timestamp": "2026-07-09T03:00:00Z", "size": 999999999999, "status": "completed", "remoteLocation": "s3://x/5"}
 		]`,
 	}
 }
@@ -123,6 +133,10 @@ func TestMigrateFromBackups_DerivesPlanAndOrdersCalls(t *testing.T) {
 		"Keep offsite: 30 days",
 		"did not agree on an hour",
 		"Removed 3 backup schedule(s)",
+		// Estimate: each instance's newest COMPLETED backup from /api/backups
+		// (app #3 1.5 GiB + billing #2 0.5 GiB), not older duplicates and not
+		// the failed record — see defaultMigrateDaemon's backupsRaw.
+		"x ~2.0 GiB",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected output to contain %q, got:\n%s", want, out)

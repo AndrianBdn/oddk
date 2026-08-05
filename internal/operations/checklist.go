@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
-	"github.com/andrianbdn/oddk/internal/rfc3339time"
+	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
 // checklistNotificationLogWindow bounds how far back the checklist looks for
@@ -36,7 +37,7 @@ type ChecklistSnapshots struct {
 	UTCHour       int               `json:"utcHour,omitempty"`
 	IntervalHours int               `json:"intervalHours,omitempty"`
 	Format        string            `json:"format,omitempty"`
-	LastSnapshot  *ChecklistBackup  `json:"lastSnapshot,omitempty"`
+	LastSnapshot  *ChecklistArchive `json:"lastSnapshot,omitempty"`
 	Total         int               `json:"total"`
 	Copies        ChecklistSnapCopy `json:"copies"`
 
@@ -67,39 +68,55 @@ type ChecklistHealth struct {
 }
 
 // ChecklistInstance is the per-instance audit row.
+//
+// Per-instance backups are a legacy feature and deliberately absent from the
+// audit: the protection question is answered by snapshot coverage alone. The
+// one backup-shaped field left is LegacyBackupCron — a per-instance backup
+// schedule that still exists marks an un-migrated deployment, and an audit
+// that silently hid it would bury the one signal that migration isn't done.
 type ChecklistInstance struct {
-	Name             string                `json:"name"`
-	Version          string                `json:"version"`
-	Status           string                `json:"status"`
-	Health           string                `json:"health"` // "ok", "failing", "not-checked", "unknown"
-	ParameterGroup   string                `json:"parameterGroup"`
-	BackupCron       *ChecklistBackupCron  `json:"backupCron,omitempty"`
-	LastGoodBackup   *ChecklistBackup      `json:"lastGoodBackup,omitempty"`
-	CompletedBackups int                   `json:"completedBackups"`
-	BackupCopies     ChecklistBackupCopies `json:"backupCopies"`
+	Name             string               `json:"name"`
+	Version          string               `json:"version"`
+	Status           string               `json:"status"`
+	Health           string               `json:"health"` // "ok", "failing", "not-checked", "unknown"
+	ParameterGroup   string               `json:"parameterGroup"`
+	LegacyBackupCron *ChecklistBackupCron `json:"legacyBackupCron,omitempty"`
+	SnapshotCoverage ChecklistCoverage    `json:"snapshotCoverage"`
 }
 
-// ChecklistBackupCopies breaks the completed backups down by where their copies
-// live. The four buckets are mutually exclusive and sum to CompletedBackups.
-// "None" counts completed records whose local file is gone and that have no
-// remote copy (an orphaned record worth surfacing). A local copy only counts
-// when the archive is actually present on disk (see the FileExists check below).
-type ChecklistBackupCopies struct {
-	Both   int `json:"both"`   // local + s3
-	Remote int `json:"remote"` // s3 only
-	Local  int `json:"local"`  // local only
-	None   int `json:"none"`   // completed record, no copy on disk or s3
+// ChecklistCoverage reports whether this instance's DATA is in the newest
+// completed snapshot. States:
+//
+//   - "covered":      the newest snapshot holds this instance's data.
+//   - "config-only":  the newest snapshot holds only this instance's
+//     configuration (it was stopped during a logical capture, or its container
+//     was missing/unsafe during a physical one) — a restore from it would
+//     produce no database contents, so this must NOT read as protection.
+//   - "not-captured": the instance post-dates the newest snapshot (also the
+//     case for an instance destroyed and re-created under the same name — the
+//     archive holds the predecessor's data, not this incarnation's).
+//   - "no-snapshots": no snapshot has ever completed.
+//
+// Snapshot names which instances had data since migration 019; for an older
+// newest-record the state is decided by creation-time alone (optimistically
+// "covered"), which self-corrects at the first post-upgrade capture.
+type ChecklistCoverage struct {
+	State    string            `json:"state"`
+	Snapshot *ChecklistArchive `json:"snapshot,omitempty"` // set for covered/config-only
 }
 
-// ChecklistBackupCron describes the scheduled daily backup, if any.
+// ChecklistBackupCron describes a still-scheduled per-instance daily backup.
+// Legacy: `snapshot migrate-from-backups` removes these; one surviving is an
+// outstanding migration task, which is the only reason it is still reported.
 type ChecklistBackupCron struct {
 	UTCHour           int `json:"utcHour"`
 	CleanupLocalDays  int `json:"cleanupLocalDays"`
 	CleanupRemoteDays int `json:"cleanupRemoteDays"`
 }
 
-// ChecklistBackup describes the most recent completed backup of an instance.
-type ChecklistBackup struct {
+// ChecklistArchive describes one snapshot archive: the newest completed one
+// globally, and the one an instance's coverage refers to.
+type ChecklistArchive struct {
 	ID        int    `json:"id"`
 	Timestamp string `json:"timestamp"`
 	SizeBytes int64  `json:"sizeBytes"`
@@ -128,7 +145,8 @@ type ChecklistNotificationEvent struct {
 }
 
 // ChecklistOp aggregates a read-only audit snapshot across all instances:
-// health, parameter group, backup state and global notification status.
+// health, parameter group, snapshot coverage (plus a warning for legacy
+// per-instance backup schedules) and global snapshot + notification status.
 type ChecklistOp struct {
 	deps   *Dependencies
 	result *ChecklistResult
@@ -157,17 +175,26 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 		return err
 	}
 
+	// Per-instance backup crons are legacy; one still existing is an
+	// un-migrated deployment, surfaced as a warning on the instance row.
 	plans, err := op.deps.Store.Cron.ListPlans()
 	if err != nil {
 		return fmt.Errorf("list cron plans: %w", err)
 	}
-	cronByInstance := make(map[string]*ChecklistBackupCron, len(plans))
+	legacyCronByInstance := make(map[string]*ChecklistBackupCron, len(plans))
 	for _, plan := range plans {
-		cronByInstance[plan.InstanceName] = &ChecklistBackupCron{
+		legacyCronByInstance[plan.InstanceName] = &ChecklistBackupCron{
 			UTCHour:           plan.UTCHour,
 			CleanupLocalDays:  plan.CleanupLocalDays,
 			CleanupRemoteDays: plan.CleanupRemoteDays,
 		}
+	}
+
+	// Collected before the instance loop because each instance row needs the
+	// newest completed snapshot to decide its coverage.
+	newestSnapshot, err := op.collectSnapshots(&result.Snapshots)
+	if err != nil {
+		return err
 	}
 
 	instanceList, err := op.deps.Store.Instances.List()
@@ -197,63 +224,17 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 		}
 
 		row := ChecklistInstance{
-			Name:           inst.Name,
-			Version:        inst.Version,
-			Status:         inst.Status,
-			Health:         health,
-			ParameterGroup: inst.ParameterGroup,
-			BackupCron:     cronByInstance[inst.Name],
-		}
-
-		backups, err := op.deps.Store.Backup.ListBackups(inst.Name)
-		if err != nil {
-			return fmt.Errorf("list backups for %s: %w", inst.Name, err)
-		}
-		for _, b := range backups {
-			if b.Status != "completed" {
-				continue
-			}
-			row.CompletedBackups++
-			// A recorded local location only counts as a copy if the file is
-			// actually on disk (it may have been deleted outside ODDK while a
-			// remote copy keeps the record alive).
-			hasLocal := b.LocalPath != "" && b.FileExists
-			hasRemote := b.RemotePath != ""
-			switch {
-			case hasLocal && hasRemote:
-				row.BackupCopies.Both++
-			case hasRemote:
-				row.BackupCopies.Remote++
-			case hasLocal:
-				row.BackupCopies.Local++
-			default:
-				row.BackupCopies.None++
-			}
-			if row.LastGoodBackup == nil { // list is ordered timestamp DESC
-				location := "none"
-				switch {
-				case hasLocal && hasRemote:
-					location = "local+s3"
-				case hasLocal:
-					location = "local"
-				case hasRemote:
-					location = "s3"
-				}
-				row.LastGoodBackup = &ChecklistBackup{
-					ID:        b.ID,
-					Timestamp: b.Timestamp.UTC().Format(time.RFC3339),
-					SizeBytes: b.Size,
-					Location:  location,
-					Comment:   b.CommentStr,
-				}
-			}
+			Name:             inst.Name,
+			Version:          inst.Version,
+			Status:           inst.Status,
+			Health:           health,
+			ParameterGroup:   inst.ParameterGroup,
+			LegacyBackupCron: legacyCronByInstance[inst.Name],
+			SnapshotCoverage: snapshotCoverage(newestSnapshot, result.Snapshots.LastSnapshot,
+				inst.Name, inst.CreatedAt.Time),
 		}
 
 		result.Instances = append(result.Instances, row)
-	}
-
-	if err := op.collectSnapshots(&result.Snapshots); err != nil {
-		return err
 	}
 
 	if err := op.collectNotifications(&result.Notifications); err != nil {
@@ -264,11 +245,13 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 	return nil
 }
 
-// collectSnapshots fills the deployment-wide snapshot summary.
-func (op *ChecklistOp) collectSnapshots(out *ChecklistSnapshots) error {
+// collectSnapshots fills the deployment-wide snapshot summary and returns the
+// newest completed snapshot record (nil when none has ever completed), which
+// the per-instance rows use to decide snapshot coverage.
+func (op *ChecklistOp) collectSnapshots(out *ChecklistSnapshots) (*snapshotstore.Record, error) {
 	plan, err := op.deps.Store.Snapshot.GetPlan()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if plan != nil {
 		out.Scheduled = true
@@ -279,38 +262,58 @@ func (op *ChecklistOp) collectSnapshots(out *ChecklistSnapshots) error {
 
 	records, err := op.deps.Store.Snapshot.List()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	out.Total = len(records)
 
+	// A recorded local location only counts as a copy if the archive is
+	// actually on disk — it may have been deleted outside ODDK (the catalogue
+	// only reconciles paths during `snapshot apply`). Same rule the backup
+	// catalogue applies via FileExists; an audit reporting a local copy that
+	// is not there would be describing a restore that cannot happen.
+	hasLocalFile := func(rec *snapshotstore.Record) bool {
+		if rec.LocalPath == "" {
+			return false
+		}
+		_, statErr := os.Stat(rec.LocalPath)
+		return statErr == nil
+	}
+
 	for _, rec := range records {
 		switch {
-		case rec.LocalPath != "" && rec.RemotePath != "":
+		case hasLocalFile(rec) && rec.RemotePath != "":
 			out.Copies.LocalAndRemote++
 		case rec.RemotePath != "":
 			out.Copies.RemoteOnly++
-		case rec.LocalPath != "":
+		case hasLocalFile(rec):
 			out.Copies.LocalOnly++
 		default:
 			out.Copies.None++
 		}
 	}
 
-	// List() is newest-first, so the first completed record is the newest one.
-	var newest *rfc3339time.Time
+	// List() is newest-first, so the first completed record WITH A SURVIVING
+	// COPY is the newest restorable one. A completed record whose archive
+	// exists nowhere (local file deleted outside ODDK, no remote) must not
+	// drive the audit: a "covered" verdict or a green last-snapshot line
+	// naming an archive with zero copies would describe a restore that cannot
+	// happen. Such records still show up in the "no copies" bucket above.
+	var newest *snapshotstore.Record
 	for _, rec := range records {
 		if rec.Status != "completed" {
 			continue
 		}
-		out.LastSnapshot = &ChecklistBackup{
+		if !hasLocalFile(rec) && rec.RemotePath == "" {
+			continue
+		}
+		out.LastSnapshot = &ChecklistArchive{
 			ID:        rec.ID,
-			Timestamp: rec.CreatedAt.Format(time.RFC3339),
+			Timestamp: rec.CreatedAt.UTC().Format(time.RFC3339),
 			SizeBytes: rec.Size,
-			Location:  locationLabel(rec.LocalPath != "", rec.RemotePath != ""),
+			Location:  locationLabel(hasLocalFile(rec), rec.RemotePath != ""),
 			Comment:   rec.CommentStr,
 		}
-		created := rec.CreatedAt
-		newest = &created
+		newest = rec
 		break
 	}
 
@@ -326,14 +329,54 @@ func (op *ChecklistOp) collectSnapshots(out *ChecklistSnapshots) error {
 		switch {
 		case newest == nil:
 			out.Stale = true
-			out.StaleDetail = "snapshots are scheduled but none has ever completed"
-		case time.Since(newest.Time) > 2*interval:
+			out.StaleDetail = "snapshots are scheduled but none with a surviving copy has ever completed"
+		case time.Since(newest.CreatedAt.Time) > 2*interval:
 			out.Stale = true
 			out.StaleDetail = fmt.Sprintf("newest snapshot is %s old, more than two %s intervals",
-				time.Since(newest.Time).Round(time.Hour), interval)
+				time.Since(newest.CreatedAt.Time).Round(time.Hour), interval)
 		}
 	}
-	return nil
+	return newest, nil
+}
+
+// snapshotCoverage decides an instance's ChecklistCoverage against the newest
+// completed snapshot (see ChecklistCoverage for the state vocabulary).
+//
+// The creation-time comparison is exact for "did this instance exist when the
+// capture began": captures and instance creation serialize through the
+// process-wide executor, and `restore-instance` backdates a re-created row to
+// its snapshot's capture time. It also catches the same-name trap — an
+// instance destroyed and re-created after the capture is YOUNGER than the
+// snapshot, whose entry under that name holds the predecessor's data.
+func snapshotCoverage(newest *snapshotstore.Record, ref *ChecklistArchive,
+	instanceName string, createdAt time.Time,
+) ChecklistCoverage {
+	if newest == nil {
+		return ChecklistCoverage{State: "no-snapshots"}
+	}
+	if newest.CreatedAt.Before(createdAt) {
+		return ChecklistCoverage{State: "not-captured"}
+	}
+
+	// Pre-019 record: the archive predates per-instance bookkeeping, so
+	// data-presence is unknowable. Report optimistically — the state becomes
+	// precise at the first capture recorded by this version.
+	if newest.Instances == nil {
+		return ChecklistCoverage{State: "covered", Snapshot: ref}
+	}
+
+	for _, entry := range newest.Instances {
+		if entry.Name != instanceName {
+			continue
+		}
+		if entry.HasData {
+			return ChecklistCoverage{State: "covered", Snapshot: ref}
+		}
+		return ChecklistCoverage{State: "config-only", Snapshot: ref}
+	}
+	// Existed at capture time yet absent from the entry list — nothing of it
+	// is in the archive, so it is not captured.
+	return ChecklistCoverage{State: "not-captured"}
 }
 
 // locationLabel names where a copy exists, matching the per-instance backup

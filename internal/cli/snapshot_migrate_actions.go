@@ -315,15 +315,40 @@ func (c *Client) fillMigrationEstimates(plans []backupCronPlan, report *snapshot
 		return fmt.Errorf("parse checklist: %w", err)
 	}
 
+	backups, err := c.fetchAllBackups()
+	if err != nil {
+		return err
+	}
+
 	// A real snapshot beats any estimate derived from per-instance backups.
+	// The fallback sums each LIVE instance's newest completed backup, computed
+	// from GET /api/backups — the checklist no longer reports per-instance
+	// backups (they are legacy and excluded from the audit). Backup records
+	// survive `instance destroy`, and a snapshot will not capture a destroyed
+	// instance, so its backups must not inflate the estimate.
+	live := make(map[string]bool, len(checklist.Instances))
+	for _, inst := range checklist.Instances {
+		live[inst.Name] = true
+	}
 	if snap := checklist.Snapshots.LastSnapshot; snap != nil && snap.SizeBytes > 0 {
 		report.EstimatedBytes = snap.SizeBytes
 		report.EstimateSource = "lastSnapshot"
 	} else {
-		for _, inst := range checklist.Instances {
-			if inst.LastGoodBackup != nil {
-				report.EstimatedBytes += inst.LastGoodBackup.SizeBytes
+		newest := make(map[string]backupSummary)
+		for _, b := range backups {
+			if b.Status != "completed" || !live[b.InstanceName] {
+				continue
 			}
+			// Timestamps are RFC3339 UTC from the daemon, so string order is
+			// chronological; ties (same second) go to the higher ID.
+			cur, ok := newest[b.InstanceName]
+			if !ok || b.Timestamp > cur.Timestamp ||
+				(b.Timestamp == cur.Timestamp && b.ID > cur.ID) {
+				newest[b.InstanceName] = b
+			}
+		}
+		for _, b := range newest {
+			report.EstimatedBytes += b.Size
 		}
 		report.EstimateSource = "sumOfBackups"
 	}
@@ -332,11 +357,6 @@ func (c *Client) fillMigrationEstimates(plans []backupCronPlan, report *snapshot
 	migrating := make(map[string]bool, len(plans))
 	for _, p := range plans {
 		migrating[p.InstanceName] = true
-	}
-
-	backups, err := c.fetchAllBackups()
-	if err != nil {
-		return err
 	}
 	seen := map[string]bool{}
 	for _, b := range backups {
@@ -361,7 +381,9 @@ func (c *Client) fillMigrationEstimates(plans []backupCronPlan, report *snapshot
 type backupSummary struct {
 	ID             int    `json:"id"`
 	InstanceName   string `json:"instanceName"`
+	Timestamp      string `json:"timestamp"`
 	Size           int64  `json:"size"`
+	Status         string `json:"status"`
 	LocalLocation  string `json:"localLocation,omitempty"`
 	RemoteLocation string `json:"remoteLocation,omitempty"`
 }

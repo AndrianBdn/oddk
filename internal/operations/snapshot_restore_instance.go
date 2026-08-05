@@ -15,6 +15,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
+	"github.com/andrianbdn/oddk/internal/rfc3339time"
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/instances"
 	"github.com/andrianbdn/oddk/internal/util"
@@ -316,6 +317,36 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 			return nil, fmt.Errorf("mark instance restoring: %w", err)
 		}
 	}
+
+	// A successful restore makes the instance's contents exactly what the
+	// snapshot captured, so for coverage purposes it "exists since" the
+	// capture, not since its row was (re-)created. Backdate created_at when
+	// the row is YOUNGER than the archive — the fresh row created above, or a
+	// row re-created via `oddk create` after the capture and now restored in
+	// place — so the checklist recognises the restored instance as covered by
+	// the archive it came from instead of reporting it "not yet captured".
+	//
+	// Two deliberate exclusions: an older row is never forward-dated, and a
+	// FOREIGN deployment's archive (MasterKeyPath set) never backdates — this
+	// host's own snapshots do not hold the foreign data, so "not yet captured"
+	// is the truthful verdict until the next local capture.
+	//
+	// Runs in a success-only defer: a failed restore may have destroyed a
+	// younger cluster whose data the archive does NOT hold, so it must not
+	// claim coverage. Best-effort on the success path — a completed restore
+	// must not be failed over audit bookkeeping (same stance as
+	// RecordSnapshot's catalogue write).
+	rowYoungerThanArchive := existing == nil || existing.CreatedAt.After(manifest.CreatedAt)
+	defer func() {
+		if err != nil || params.MasterKeyPath != "" || !rowYoungerThanArchive {
+			return
+		}
+		if backdateErr := deps.Store.Instances.BackdateCreatedAt(
+			meta.Name, rfc3339time.Time{Time: manifest.CreatedAt}); backdateErr != nil {
+			emitLine(params.Progress,
+				"  (warning: could not backdate %s for snapshot coverage: %v)", meta.Name, backdateErr)
+		}
+	}()
 
 	defer func() {
 		if err == nil {

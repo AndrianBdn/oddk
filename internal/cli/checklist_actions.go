@@ -25,38 +25,24 @@ type checklistResponse struct {
 		Status         string `json:"status"`
 		Health         string `json:"health"`
 		ParameterGroup string `json:"parameterGroup"`
-		BackupCron     *struct {
-			UTCHour           int `json:"utcHour"`
-			CleanupLocalDays  int `json:"cleanupLocalDays"`
-			CleanupRemoteDays int `json:"cleanupRemoteDays"`
-		} `json:"backupCron"`
-		LastGoodBackup *struct {
-			ID        int    `json:"id"`
-			Timestamp string `json:"timestamp"`
-			SizeBytes int64  `json:"sizeBytes"`
-			Location  string `json:"location"`
-			Comment   string `json:"comment"`
-		} `json:"lastGoodBackup"`
-		CompletedBackups int `json:"completedBackups"`
-		BackupCopies     struct {
-			Both   int `json:"both"`
-			Remote int `json:"remote"`
-			Local  int `json:"local"`
-			None   int `json:"none"`
-		} `json:"backupCopies"`
+		// Legacy: a per-instance backup schedule that still exists marks an
+		// un-migrated deployment. Backups are otherwise absent from the audit.
+		LegacyBackupCron *struct {
+			UTCHour int `json:"utcHour"`
+		} `json:"legacyBackupCron"`
+		SnapshotCoverage struct {
+			State    string            `json:"state"`
+			Snapshot *checklistArchive `json:"snapshot"`
+		} `json:"snapshotCoverage"`
 	} `json:"instances"`
 	Snapshots struct {
-		Scheduled     bool   `json:"scheduled"`
-		UTCHour       int    `json:"utcHour"`
-		IntervalHours int    `json:"intervalHours"`
-		Format        string `json:"format"`
-		LastSnapshot  *struct {
-			Timestamp string `json:"timestamp"`
-			SizeBytes int64  `json:"sizeBytes"`
-			Location  string `json:"location"`
-		} `json:"lastSnapshot"`
-		Total  int `json:"total"`
-		Copies struct {
+		Scheduled     bool              `json:"scheduled"`
+		UTCHour       int               `json:"utcHour"`
+		IntervalHours int               `json:"intervalHours"`
+		Format        string            `json:"format"`
+		LastSnapshot  *checklistArchive `json:"lastSnapshot"`
+		Total         int               `json:"total"`
+		Copies        struct {
 			LocalAndRemote int `json:"localAndRemote"`
 			RemoteOnly     int `json:"remoteOnly"`
 			LocalOnly      int `json:"localOnly"`
@@ -80,6 +66,15 @@ type checklistNotificationEvent struct {
 	Status    string `json:"status"`
 	Detail    string `json:"detail"`
 	CreatedAt string `json:"createdAt"`
+}
+
+// checklistArchive mirrors operations.ChecklistArchive: one snapshot archive.
+type checklistArchive struct {
+	ID        int    `json:"id"`
+	Timestamp string `json:"timestamp"`
+	SizeBytes int64  `json:"sizeBytes"`
+	Location  string `json:"location"`
+	Comment   string `json:"comment"`
 }
 
 func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
@@ -129,7 +124,7 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 			if glyph == "" {
 				glyph = " "
 			}
-			_, _ = fmt.Fprintf(out, "  %s %-16s %s\n", glyph, label, value)
+			_, _ = fmt.Fprintf(out, "  %s %-17s %s\n", glyph, label, value)
 		}
 
 		for _, inst := range result.Instances {
@@ -153,32 +148,33 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 			}
 			detail(glyphOK, "parameter group", paramGroup)
 
+			// Backups are legacy and deliberately absent from the audit; an
+			// instance's protection is its snapshot coverage. "config-only"
+			// means the newest snapshot holds only this instance's
+			// configuration — a restore from it would produce no database
+			// contents, which must read as a problem, not protection.
+			cov := inst.SnapshotCoverage
 			switch {
-			case inst.BackupCron != nil:
-				detail(glyphOK, "daily backup", fmt.Sprintf("%02d:00 UTC · keep local %dd, remote %dd",
-					inst.BackupCron.UTCHour, inst.BackupCron.CleanupLocalDays, inst.BackupCron.CleanupRemoteDays))
-			case result.Snapshots.Scheduled:
-				// A scheduled snapshot captures every instance, so the absence of a
-				// per-instance schedule is the intended end state after
-				// `snapshot migrate-from-backups` — not an outstanding task. Without
-				// this, every instance on every migrated host reads as a to-do.
-				detail(glyphOK, "daily backup", "covered by scheduled snapshots")
-			default:
-				detail(glyphTodo, "daily backup", "not scheduled")
+			case cov.State == "covered" && cov.Snapshot != nil:
+				detail(glyphOK, "snapshot coverage", fmt.Sprintf("#%d · %s · %s",
+					cov.Snapshot.ID, cov.Snapshot.Timestamp, cov.Snapshot.Location))
+			case cov.State == "config-only" && cov.Snapshot != nil:
+				detail(glyphBad, "snapshot coverage", fmt.Sprintf(
+					"configuration-only in #%d — NO data captured", cov.Snapshot.ID))
+			case cov.State == "not-captured":
+				detail(glyphTodo, "snapshot coverage", "not yet captured (newer than the newest snapshot)")
+			default: // "no-snapshots", or an unknown state from a newer daemon
+				detail(glyphTodo, "snapshot coverage", "no completed snapshots")
 			}
 
-			if b := inst.LastGoodBackup; b != nil {
-				val := fmt.Sprintf("%s · %s · %s · #%d", b.Timestamp, formatSize(b.SizeBytes), b.Location, b.ID)
-				if b.Comment != "" {
-					val += fmt.Sprintf(" · %q", b.Comment)
-				}
-				detail(glyphOK, "last good backup", val)
-			} else {
-				detail(glyphTodo, "last good backup", "never")
+			// The one backup-shaped line left: a still-scheduled per-instance
+			// backup cron marks an un-migrated deployment. Silently hiding it
+			// would bury the only signal that migration isn't finished.
+			if inst.LegacyBackupCron != nil {
+				detail(glyphTodo, "legacy backups", fmt.Sprintf(
+					"daily backup cron at %02d:00 UTC still scheduled — migrate: oddk snapshot migrate-from-backups",
+					inst.LegacyBackupCron.UTCHour))
 			}
-
-			bc := inst.BackupCopies
-			detail("", "backups stored", formatBackupsStored(inst.CompletedBackups, bc.Both, bc.Remote, bc.Local, bc.None))
 		}
 	}
 	_, _ = fmt.Fprintln(out)
@@ -220,7 +216,7 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 		_, _ = fmt.Fprintf(out, "  %s last snapshot: never\n", glyphTodo)
 	}
 	if snap.Total > 0 {
-		_, _ = fmt.Fprintf(out, "    stored: %s\n", formatBackupsStored(
+		_, _ = fmt.Fprintf(out, "    stored: %s\n", formatStoredCopies(
 			snap.Total, snap.Copies.LocalAndRemote, snap.Copies.RemoteOnly, snap.Copies.LocalOnly, snap.Copies.None))
 	}
 	_, _ = fmt.Fprintln(out)
@@ -288,11 +284,11 @@ func healthGlyph(health string) string {
 	}
 }
 
-// formatBackupsStored renders the completed-backup count with a breakdown of
+// formatStoredCopies renders the stored-snapshot count with a breakdown of
 // where the copies live. With a single bucket it collapses to "9 local+s3";
 // with several it shows the total plus each non-empty bucket, e.g.
 // "9 · 7 local+s3, 1 s3, 1 local". Buckets are mutually exclusive and sum to total.
-func formatBackupsStored(total, both, remote, local, none int) string {
+func formatStoredCopies(total, both, remote, local, none int) string {
 	var parts []string
 	if both > 0 {
 		parts = append(parts, fmt.Sprintf("%d local+s3", both))
@@ -314,18 +310,4 @@ func formatBackupsStored(total, both, remote, local, none int) string {
 	default:
 		return fmt.Sprintf("%d · %s", total, strings.Join(parts, ", "))
 	}
-}
-
-// formatSize renders a byte count in a human-readable binary unit
-func formatSize(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%dB", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }

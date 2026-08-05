@@ -59,12 +59,32 @@ type Record struct {
 	// "logical" (migration 018) — every pre-physical archive is logical.
 	Format string `db:"format" json:"format"`
 
+	// InstancesJSON records which instances the archive holds and whether each
+	// was captured with data (migration 019), as a JSON array of RecordInstance.
+	// NULL on pre-019 rows — readers must treat that as "unknown", not "none".
+	InstancesJSON sql.NullString `db:"instances_json" json:"-"`
+
 	LocalLocation  sql.NullString `db:"local_location" json:"-"`
 	RemoteLocation sql.NullString `db:"remote_location" json:"-"`
 	Comment        sql.NullString `db:"comment" json:"-"`
 
-	// Flattened for JSON output, mirroring BackupRecord.
-	LocalPath  string `db:"-" json:"localLocation,omitempty"`
-	RemotePath string `db:"-" json:"remoteLocation,omitempty"`
-	CommentStr string `db:"-" json:"comment,omitempty"`
+	// Flattened for JSON output, mirroring BackupRecord. Instances is nil for a
+	// pre-019 row (unknown coverage) and non-nil — possibly empty — once the
+	// column is populated. Deliberately NOT omitempty: an empty deployment's
+	// snapshot must serialize as "instances": [] (known empty), distinct from
+	// null (pre-019, unknown) — omitempty would collapse the two, and the
+	// contract says unknown must never be read as "no instances".
+	LocalPath  string           `db:"-" json:"localLocation,omitempty"`
+	RemotePath string           `db:"-" json:"remoteLocation,omitempty"`
+	CommentStr string           `db:"-" json:"comment,omitempty"`
+	Instances  []RecordInstance `db:"-" json:"instances"`
+}
+
+// RecordInstance is one instance's entry in a snapshot record: its name and
+// whether the archive actually holds its data. HasData false means the entry
+// is configuration-only — a restore of that instance from this archive would
+// produce no database contents.
+type RecordInstance struct {
+	Name    string `json:"name"`
+	HasData bool   `json:"hasData"`
 }

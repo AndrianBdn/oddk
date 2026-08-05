@@ -2,8 +2,10 @@ package snapshot
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -90,12 +92,25 @@ func (s *SnapshotStore) RecordSnapshot(rec *Record) error {
 	if format == "" {
 		format = "logical"
 	}
+
+	// Persist the per-instance list when the caller provided one. A nil slice
+	// stores NULL (unknown), matching pre-019 rows; an empty non-nil slice
+	// stores "[]" — a snapshot of a deployment with no instances.
+	instancesJSON := rec.InstancesJSON
+	if !instancesJSON.Valid && rec.Instances != nil {
+		encoded, err := json.Marshal(rec.Instances)
+		if err != nil {
+			return fmt.Errorf("encode snapshot instances: %w", err)
+		}
+		instancesJSON = sql.NullString{String: string(encoded), Valid: true}
+	}
+
 	result, err := s.db.Exec(`
 		INSERT INTO snapshot_history
-			(filename, created_at, size, status, instances_with_data, config_only, format, local_location, remote_location, comment)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(filename, created_at, size, status, instances_with_data, config_only, format, instances_json, local_location, remote_location, comment)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, rec.Filename, rec.CreatedAt, rec.Size, rec.Status,
-		rec.InstancesWithData, rec.ConfigOnly, format, local, rec.RemoteLocation, comment)
+		rec.InstancesWithData, rec.ConfigOnly, format, instancesJSON, local, rec.RemoteLocation, comment)
 	if err != nil {
 		return fmt.Errorf("record snapshot: %w", err)
 	}
@@ -269,6 +284,18 @@ func flatten(r *Record) {
 	}
 	if r.Comment.Valid {
 		r.CommentStr = r.Comment.String
+	}
+	if r.InstancesJSON.Valid && r.InstancesJSON.String != "" {
+		var instances []RecordInstance
+		if err := json.Unmarshal([]byte(r.InstancesJSON.String), &instances); err != nil {
+			// A malformed column must read as "unknown" (like a pre-019 row),
+			// not crash a listing; the record itself is still usable.
+			log.Printf("WARNING: snapshot %d has malformed instances_json (%v); treating coverage as unknown", r.ID, err)
+		} else if instances == nil {
+			r.Instances = []RecordInstance{}
+		} else {
+			r.Instances = instances
+		}
 	}
 }
 

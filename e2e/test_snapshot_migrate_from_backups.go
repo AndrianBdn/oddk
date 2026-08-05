@@ -94,6 +94,16 @@ func testSnapshotMigrateFromBackups(h *TestHarness) error {
 		return fmt.Errorf("dry run removed a backup schedule; got: %s", output)
 	}
 
+	// Before migration, the audit must flag both instances' surviving backup
+	// crons as legacy — that warning is the signal that migration isn't done.
+	output, err = h.runCLI("checklist")
+	if err != nil {
+		return fmt.Errorf("checklist before migration: %w (output: %s)", err, output)
+	}
+	if got := strings.Count(output, "legacy backups"); got != 2 {
+		return fmt.Errorf("checklist should flag 2 legacy backup crons before migration, found %d; got: %s", got, output)
+	}
+
 	log.Println("Step 3: Migrating for real")
 	output, err = h.runCLI("snapshot", "migrate-from-backups", "--yes")
 	if err != nil {
@@ -142,17 +152,19 @@ func testSnapshotMigrateFromBackups(h *TestHarness) error {
 		return fmt.Errorf("backup schedules survived the migration; got: %s", output)
 	}
 
-	log.Println("Step 4: The checklist stops flagging instances that snapshots now cover")
+	log.Println("Step 4: The checklist stops flagging the migrated instances")
 	output, err = h.runCLI("checklist")
 	if err != nil {
 		return fmt.Errorf("checklist: %w (output: %s)", err, output)
 	}
-	if !strings.Contains(output, "covered by scheduled snapshots") {
-		return fmt.Errorf("checklist should report instances as covered by snapshots rather than "+
-			"as an outstanding task, otherwise every migrated host reads as broken; got: %s", output)
+	// The legacy warnings must be gone — otherwise every migrated host reads
+	// as carrying an outstanding task forever.
+	if strings.Contains(output, "legacy backups") {
+		return fmt.Errorf("checklist still flags a legacy backup cron after migration; got: %s", output)
 	}
-	if strings.Contains(output, "daily backup     not scheduled") {
-		return fmt.Errorf("checklist still reports 'not scheduled' after migration; got: %s", output)
+	// And the snapshot schedule the migration created must show as configured.
+	if !strings.Contains(output, "scheduled: daily at") {
+		return fmt.Errorf("checklist does not report the migrated snapshot schedule; got: %s", output)
 	}
 
 	log.Println("Step 5: Re-running on a migrated host is a quiet success")

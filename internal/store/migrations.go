@@ -25,6 +25,7 @@ func (s *Store) runAllMigrations() error {
 		{"016_instance_image", migration016InstanceImage},
 		{"017_snapshot_tables", migration017SnapshotTables},
 		{"018_snapshot_format", migration018SnapshotFormat},
+		{"019_snapshot_instances", migration019SnapshotInstances},
 	}
 
 	for _, m := range migrations {
@@ -461,5 +462,22 @@ func migration018SnapshotFormat(sqx *sqlx.DB) error {
 			CHECK (format IN ('physical', 'logical'))
 	`)
 
+	return nil
+}
+
+// migration019SnapshotInstances records WHICH instances each snapshot holds and
+// whether each was captured with data, as a JSON array of {"name","hasData"}.
+//
+// The counts added in 017 (instances_with_data, config_only) cannot answer the
+// question the checklist audit asks per instance: "is THIS instance's data in
+// the newest snapshot?" — a configuration-only entry (stopped under logical;
+// vanished/error container under physical) was indistinguishable from a real
+// capture, so the audit credited coverage that a restore could not deliver.
+//
+// Nullable with no default: NULL marks a pre-019 row, for which the checklist
+// falls back to the optimistic created-at heuristic rather than pretending to
+// know what an old archive holds.
+func migration019SnapshotInstances(sqx *sqlx.DB) error {
+	sqx.MustExec(`ALTER TABLE snapshot_history ADD COLUMN instances_json TEXT`)
 	return nil
 }

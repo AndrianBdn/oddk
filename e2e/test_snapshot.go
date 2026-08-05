@@ -149,6 +149,32 @@ func testSnapshotMake(h *TestHarness) error {
 		return fmt.Errorf("snapshot output does not report the logical format; got: %s", output)
 	}
 
+	log.Println("Step 3b: The checklist reports per-instance snapshot coverage honestly")
+	// The audit is snapshot-centric (backups are legacy). The RUNNING instance
+	// was captured with data, so it must read covered; the STOPPED instance is
+	// configuration-only in a LOGICAL archive — a restore of it would produce
+	// no database contents, and the audit must say so instead of crediting
+	// coverage the archive cannot deliver.
+	checklistOut, err := h.runCLI("checklist")
+	if err != nil {
+		return fmt.Errorf("checklist: %w (output: %s)", err, checklistOut)
+	}
+	if !strings.Contains(checklistOut, "✓ snapshot coverage") {
+		return fmt.Errorf("checklist does not report the running instance as covered; got: %s", checklistOut)
+	}
+	if !strings.Contains(checklistOut, "configuration-only in #") {
+		return fmt.Errorf("checklist does not report the stopped instance's configuration-only capture; got: %s", checklistOut)
+	}
+	if strings.Contains(checklistOut, "not yet captured") {
+		return fmt.Errorf("checklist reports an instance as not captured, but the snapshot covered both; got: %s", checklistOut)
+	}
+	// The retired backup lines must not resurface in the audit.
+	for _, gone := range []string{"last good backup", "backups stored", "daily backup "} {
+		if strings.Contains(checklistOut, gone) {
+			return fmt.Errorf("retired backup line %q resurfaced in the checklist; got: %s", gone, checklistOut)
+		}
+	}
+
 	log.Println("Step 4: Locating the snapshot archive")
 	backupDir := filepath.Join(h.dataDir, "backups")
 	matches, err := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst"))

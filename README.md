@@ -214,9 +214,9 @@ oddk instance destroy app
 
 oddk list             # all instances at a glance
 oddk checklist        # audit overview, one detailed block per instance: health,
-                      # parameter group, backup cron, last good backup, and stored
-                      # backups by copy location (local+s3 / s3 / local); plus
-                      # global notification status
+                      # parameter group, and snapshot coverage (is this instance's
+                      # data in the newest snapshot?); plus global snapshot and
+                      # notification status
 oddk checklist --json # same data as JSON
 ```
 
@@ -342,9 +342,13 @@ What you need to know:
 - Offsite upload is currently limited to 5 GiB per snapshot (a single S3
   `PutObject`; no multipart yet).
 
-`oddk checklist` reports whether snapshots are scheduled and how stale the newest
-one is. Once snapshots are scheduled, it stops flagging instances for having no
-per-instance backup schedule — the snapshot covers them.
+`oddk checklist` reports whether snapshots are scheduled, how stale the newest one
+is, and — per instance — whether that instance's data is actually in the newest
+snapshot: an instance captured configuration-only (e.g. stopped during a logical
+capture) is flagged rather than counted as protected, and an instance created
+after the newest snapshot reads "not yet captured" until the next run. Per-instance
+backups are legacy and no longer appear in the audit, except as a warning when an
+instance still has an un-migrated backup schedule.
 
 #### Moving an existing deployment onto snapshots
 

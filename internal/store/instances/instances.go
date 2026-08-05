@@ -37,6 +37,20 @@ func (s *InstanceStore) Create(name string, port int, version, password, contain
 	return s.Get(name)
 }
 
+// BackdateCreatedAt rewrites an instance's created_at to when its data was
+// CAPTURED rather than when the row was inserted. Only the restore-from-
+// snapshot path uses it, for an instance restored under a name that no longer
+// had a row: the checklist decides snapshot coverage by comparing the newest
+// snapshot's creation time against the instance's created_at, and a freshly
+// stamped "now" would make the audit report the just-restored instance —
+// whose every byte came from that snapshot — as never captured.
+func (s *InstanceStore) BackdateCreatedAt(name string, createdAt rfc3339time.Time) error {
+	if _, err := s.db.Exec(`UPDATE rdbms_instances SET created_at = ? WHERE name = ?`, createdAt, name); err != nil {
+		return fmt.Errorf("backdate instance created_at: %w", err)
+	}
+	return nil
+}
+
 func (s *InstanceStore) Get(name string) (*RDBMSInstance, error) {
 	var instance RDBMSInstance
 	err := s.db.Get(&instance, "SELECT * FROM rdbms_instances WHERE name = ?", name)
