@@ -9,7 +9,7 @@
 
 ODDK is a single Go binary that manages PostgreSQL the way a cloud provider's
 managed database does — create an instance, get a connection string, take
-scheduled backups, ship them offsite to S3, watch health, restore on demand,
+scheduled snapshots, ship them offsite to S3, watch health, restore on demand,
 upgrade major versions — except it all runs locally against Docker, on hardware
 you control. Think "a small, self-hosted RDS for Postgres."
 
@@ -29,10 +29,10 @@ oddk instance get-postgres-password app --conn
   shared memory, networking, and tuning — plus AWS-style *parameter groups* when
   you want to override them.
 - **Operationally complete.** Whole-deployment *snapshots* — scheduled, shipped
-  to S3, and able to rebuild a single instance or an entire host — plus
-  per-instance backups with retention and single-database restore, health
+  to S3, and able to rebuild a single instance or an entire host — plus health
   monitoring with Email/Slack/Telegram/Webhook alerts, password and user
-  management, minor-version image switches, and dump/restore major upgrades.
+  management, minor-version image switches, dump/restore major upgrades, and
+  legacy per-instance backups (still the way to restore a single database).
 - **Actually recoverable.** A snapshot carries every instance's data *and* ODDK's
   own configuration, so a dead host can be rebuilt from one archive plus the
   master key — not reassembled by hand from per-database dumps.
@@ -72,8 +72,8 @@ script, ODDK is that, as one tool with one mental model.
 | You want… | ODDK gives you… |
 |---|---|
 | A new database, fast | `oddk create` → ready-to-use Postgres with a connection string |
-| Confidence it's backed up | `backup make`, scheduled cron backups, S3 offsite with retention |
-| To not lose data | `backup restore` from any local or downloaded archive |
+| Confidence it's backed up | `snapshot make`, one scheduled snapshot covering everything, S3 offsite with retention |
+| To not lose data | `snapshot restore-instance` (one instance) or `snapshot apply` (a whole host) |
 | To know when it breaks | Health checks + degraded/restored notifications |
 | To tune Postgres safely | AWS-style parameter groups with expression evaluation |
 | To move to a new major | `instance major-upgrade` via dump/restore |
@@ -96,8 +96,8 @@ that runs Docker — never inside a container.**
 
 The whole point of ODDK is to *manage and monitor* Docker: it creates and
 destroys PostgreSQL containers, attaches them to a host bridge network, reads
-host disk/CPU/memory for health checks, and writes state and backups to host
-paths. That is the opposite of being a containerized workload itself. Running
+host disk/CPU/memory for health checks, and writes state and snapshot/backup
+archives to host paths. That is the opposite of being a containerized workload itself. Running
 ODDK inside Docker inverts the relationship and breaks its assumptions —
 host-level resource metrics, the `10.88.0.0/16` bridge and `10.88.0.1` gateway
 binding, data/backup paths, and the systemd service lifecycle all expect a host
@@ -199,7 +199,7 @@ extra_hosts:
 ## Common usage
 
 `oddk` is organized into subcommands. Everything below has `--help`
-(`oddk instance --help`, `oddk backup --help`, …).
+(`oddk instance --help`, `oddk snapshot --help`, …).
 
 ### Instances
 
@@ -370,16 +370,33 @@ to run across a fleet. Add `--dry-run` to preview, `--yes` to skip the prompt, a
 > cleanup only ever runs from a backup schedule, so removing the schedule ends it
 > permanently. The command reports how many archives and how much disk this
 > leaves behind. They stay restorable with `oddk backup restore`; remove them
-> with `oddk backup remove-local` once you trust the snapshot schedule.
+> with `oddk backup remove-local` once you trust the snapshot schedule — or all
+> at once with `oddk backup dangerously-drop-all` (below).
 
 This is a transitional command. Per-instance `backup` itself is unaffected — it
 is still the only way to restore or clone a **single database**.
 
-### Backups (per-instance)
+### Offsite storage (S3)
 
-> **Snapshots are now the recommended way to protect a deployment** — see above.
-> Per-instance backups remain fully supported, and are still the way to restore
-> or clone a **single database**, which snapshots cannot yet do.
+One S3 configuration serves the whole deployment — snapshot uploads and legacy
+backup uploads alike:
+
+```bash
+oddk offsite apply --file offsite.json   # see `oddk offsite get` for the template
+oddk offsite test
+```
+
+When offsite is configured, each scheduled snapshot run uploads the new
+snapshot, retries earlier failed uploads, and then applies retention — and
+local retention never deletes an archive whose only copy is local.
+
+### Legacy: per-instance backups
+
+> **Snapshots are the recommended way to protect a deployment**, and the only
+> protection the `oddk checklist` audit reports. Per-instance backups keep
+> working — and are still the only way to restore or clone a **single
+> database**, which snapshots cannot yet do — but don't build new automation
+> on them; move schedules over with `oddk snapshot migrate-from-backups`.
 
 ```bash
 oddk backup make app --comment "before deploy"
@@ -387,6 +404,12 @@ oddk backup list --instance app
 oddk backup restore --instance app --id 42 --database analytics
 oddk backup restore --instance app --id 42 --database analytics --restore-as analytics_copy
 oddk backup restore --instance app --file /path/to/backup.tar.zst --database analytics
+
+# Scheduling and offsite copies (superseded by `oddk snapshot setup-cron`)
+oddk backup setup-cron --instance app --utc-hour 3   # daily at 03:00 UTC
+oddk backup list-cron
+oddk backup upload app <backup-id>
+oddk backup download app <backup-id>
 ```
 
 Backups record roles with database-level `CREATE` access, and both restore and
@@ -395,25 +418,19 @@ the target instance to receive its grant; missing roles are reported and skipped
 without failing the operation. Older archives without this metadata retain the
 previous behavior.
 
-### Scheduled & offsite backups
+Done with per-instance backups? Once the snapshot schedule has proven itself,
+delete every leftover backup in one sweep — local archives, S3 copies, and the
+whole backup history, including backups of instances that no longer exist.
+Snapshots are untouched:
 
 ```bash
-# Configure S3 offsite (see `oddk offsite get` for the config template)
-oddk offsite apply --file offsite.json
-oddk offsite test
-
-# Schedule a daily backup at 03:00 UTC; uploads offsite when configured
-oddk backup setup-cron --instance app --utc-hour 3
-oddk backup list-cron
-
-# Move copies around
-oddk backup upload app <backup-id>
-oddk backup download app <backup-id>
+oddk backup dangerously-drop-all           # preview — changes nothing
+oddk backup dangerously-drop-all --apply   # delete (asks for confirmation)
 ```
 
-When offsite is configured, failed uploads are retried on later cron runs, and
-local retention never deletes a backup whose only copy is local. The same offsite
-configuration serves snapshots.
+The preview warns if any instance still has a backup schedule (migrate it
+first — the next cron run would just create new backups) and if no snapshot
+exists yet, in which case these backups are the only thing a restore could use.
 
 ### Custom images (pgvector, postgis, …)
 
@@ -474,11 +491,12 @@ events are delivered automatically with configurable thresholds.
 - **Sequential operations layer.** All state-changing work runs one-at-a-time
   through an executor, preventing races and half-applied changes. Operations are
   uninterruptible by design — a dropped CLI connection never aborts an in-flight
-  backup or restore.
+  snapshot, backup, or restore.
 - **Docker-native.** Instances are PostgreSQL containers on a dedicated bridge
   network (`10.88.0.0/16`), each bound to the host-local gateway `10.88.0.1`.
-- **SQLite state.** Instance config, backups, schedules, health history, and
-  encrypted secrets live in a local SQLite database under the data dir.
+- **SQLite state.** Instance config, the snapshot and backup catalogues,
+  schedules, health history, and encrypted secrets live in a local SQLite
+  database under the data dir.
 - **Self-healing startup.** On boot the daemon reconciles stored instance state
   against actual container state and sweeps orphaned temp artifacts from any
   interrupted operation.

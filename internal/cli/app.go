@@ -746,7 +746,7 @@ func snapshotCommands(client *Client) *cli.Command {
 func backupCommands(client *Client) *cli.Command {
 	return &cli.Command{
 		Name:  "backup",
-		Usage: "Manage backups",
+		Usage: "Manage per-instance backups (legacy — prefer 'oddk snapshot'; still the way to restore a single database)",
 		Commands: []*cli.Command{
 			{
 				Name:      "make",
@@ -830,6 +830,25 @@ func backupCommands(client *Client) *cli.Command {
 				Usage:     "Remove remote (S3) copy of a backup",
 				ArgsUsage: "<instance-name> <backup-id>",
 				Action:    client.backupRemoveRemoteAction,
+			},
+			{
+				Name:  "dangerously-drop-all",
+				Usage: "Delete EVERY backup — local archives, S3 copies, and the whole history (legacy decommissioning; snapshots are untouched)",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:  "apply",
+						Usage: "Actually delete (without it, the run is a preview that changes nothing)",
+					},
+					&cli.BoolFlag{
+						Name:  "yes",
+						Usage: "Skip the confirmation prompt (requires --apply)",
+					},
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "Machine-readable report (with --apply requires --yes)",
+					},
+				},
+				Action: client.backupDangerouslyDropAllAction,
 			},
 			{
 				Name:  "restore",

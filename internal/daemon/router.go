@@ -43,6 +43,8 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/rdbms/{name}/backup/{id}/local", s.withAuth(s.handleRemoveLocalBackup))
 	mux.HandleFunc("DELETE /api/rdbms/{name}/backup/{id}/remote", s.withAuth(s.handleRemoveRemoteBackup))
 	mux.HandleFunc("GET /api/backups", s.withAuth(s.handleListAllBackups))
+	// Bulk legacy-backup decommissioning ('backup dangerously-drop-all').
+	mux.HandleFunc("DELETE /api/backups", s.withAuth(s.handleDropAllBackups))
 	mux.HandleFunc("POST /api/rdbms/{name}/restore", s.withAuth(s.handleRDBMSRestore))
 
 	// Whole-deployment snapshot (design: internal-docs/snapshots.done.md, internal

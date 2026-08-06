@@ -117,6 +117,38 @@ func (s *BackupStore) ListAllBackups() ([]BackupRecord, error) {
 	return validBackups, nil
 }
 
+// AllRecordsRaw returns every backup_history row with no filesystem
+// validation and no orphan cleanup — unlike ListAllBackups, whose side
+// effects would race with a caller that is about to delete the records
+// itself (dangerously-drop-all).
+func (s *BackupStore) AllRecordsRaw() ([]BackupRecord, error) {
+	var backups []BackupRecord
+	err := s.db.Select(&backups, `SELECT * FROM backup_history ORDER BY instance_name, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list all backup records: %w", err)
+	}
+	return backups, nil
+}
+
+// DeleteRecord removes one backup_history row unconditionally. The caller is
+// responsible for having dealt with the copies the row referenced.
+func (s *BackupStore) DeleteRecord(backupID int) error {
+	_, err := s.db.Exec(`DELETE FROM backup_history WHERE id = ?`, backupID)
+	if err != nil {
+		return fmt.Errorf("delete backup record %d: %w", backupID, err)
+	}
+	return nil
+}
+
+// AbsoluteLocalPath resolves a stored local_location the same way
+// validateBackupFile does: relative paths are anchored at the data dir.
+func (s *BackupStore) AbsoluteLocalPath(localLocation string) string {
+	if filepath.IsAbs(localLocation) {
+		return localLocation
+	}
+	return filepath.Join(s.dataDir, localLocation)
+}
+
 func (s *BackupStore) ListBackups(instanceName string) ([]BackupRecord, error) {
 	var backups []BackupRecord
 	query := `SELECT * FROM backup_history WHERE instance_name = ? ORDER BY timestamp DESC`

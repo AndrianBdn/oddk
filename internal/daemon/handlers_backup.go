@@ -298,6 +298,53 @@ func (s *Server) handleRemoveRemoteBackup(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(result)
 }
 
+// handleDropAllBackups handles DELETE /api/backups — the bulk decommissioning
+// sweep behind 'oddk backup dangerously-drop-all'. Server-side (rather than a
+// client loop over the per-ID endpoints) because the per-ID removes refuse
+// when the instance no longer exists, and destroyed instances' leftover
+// records are precisely what this must clear.
+func (s *Server) handleDropAllBackups(w http.ResponseWriter, r *http.Request) {
+	// Deleting many S3 objects can outlive the server's WriteTimeout.
+	s.clearWriteDeadline(w, "drop all backups")
+
+	var result *operations.DropAllBackupsResult
+	op := &dropAllBackupsOp{
+		deps:   s.opDeps,
+		result: &result,
+	}
+
+	if err := s.executor.Execute(context.Background(), op); err != nil {
+		s.writeOpError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// dropAllBackupsOp implements the Operation interface for the bulk sweep
+type dropAllBackupsOp struct {
+	deps   *operations.Dependencies
+	result **operations.DropAllBackupsResult
+}
+
+func (op *dropAllBackupsOp) Name() string {
+	return "DropAllBackups"
+}
+
+func (op *dropAllBackupsOp) Type() operations.OpType {
+	return operations.OpTypeWrite
+}
+
+func (op *dropAllBackupsOp) Execute(ctx context.Context) error {
+	result, err := operations.DropAllBackups(ctx, op.deps)
+	if err != nil {
+		return err
+	}
+	*op.result = result
+	return nil
+}
+
 // listBackupsOp implements the Operation interface for listing backups
 type listBackupsOp struct {
 	params operations.ListBackupsParams
