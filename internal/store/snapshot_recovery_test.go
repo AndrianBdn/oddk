@@ -19,13 +19,9 @@ import (
 // next — hard-deletes every local-only record whose file is missing, silently
 // destroying the backup catalogue of a deployment with no offsite.
 func TestReconcileLocalLocations(t *testing.T) {
-	dataDir := t.TempDir()
+	st, dataDir := newTestStoreDir(t)
 	backupDir := filepath.Join(dataDir, "backups")
 	if err := os.MkdirAll(backupDir, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.NewStore(filepath.Join(dataDir, "oddk.db"), dataDir)
-	if err != nil {
 		t.Fatal(err)
 	}
 

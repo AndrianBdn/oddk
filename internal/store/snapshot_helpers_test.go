@@ -8,11 +8,7 @@ import (
 )
 
 func TestVacuumIntoProducesUsableCopy(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st, dir := newTestStoreDir(t)
 	if err := st.KV.SetInt("health.degraded_threshold.int", 9); err != nil {
 		t.Fatal(err)
 	}
@@ -43,11 +39,7 @@ func TestVacuumIntoProducesUsableCopy(t *testing.T) {
 }
 
 func TestAppliedMigrationsOrdered(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := newTestStore(t)
 
 	names, err := st.AppliedMigrations()
 	if err != nil {

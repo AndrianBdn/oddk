@@ -189,7 +189,7 @@ func (c *Client) createAction(ctx context.Context, cmd *cli.Command) error {
 	_, _ = fmt.Fprintf(c.out, "Status: %s\n", instance.Status)
 	_, _ = fmt.Fprintf(c.out, "Password: %s\n", instance.Password)
 	_, _ = fmt.Fprintf(c.out, "\nConnection string:\n")
-	_, _ = fmt.Fprintf(c.out, "postgresql://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable\n", instance.Password, instance.Port)
+	_, _ = fmt.Fprintf(c.out, "postgresql://postgres:%s@%s:%d/postgres?sslmode=disable\n", instance.Password, util.GatewayIP, instance.Port)
 
 	return nil
 }
@@ -472,11 +472,11 @@ func (c *Client) getPasswordAction(ctx context.Context, cmd *cli.Command) error 
 	case plain:
 		_, _ = fmt.Fprintln(c.out, result.Password)
 	case conn:
-		connStr := fmt.Sprintf("postgresql://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable",
-			result.Password, instance.Port)
+		connStr := fmt.Sprintf("postgresql://postgres:%s@%s:%d/postgres?sslmode=disable",
+			result.Password, util.GatewayIP, instance.Port)
 		_, _ = fmt.Fprintln(c.out, connStr)
 	case envs:
-		_, _ = fmt.Fprintf(c.out, "export PGHOST=10.88.0.1\n")
+		_, _ = fmt.Fprintf(c.out, "export PGHOST=%s\n", util.GatewayIP)
 		_, _ = fmt.Fprintf(c.out, "export PGPORT=%d\n", instance.Port)
 		_, _ = fmt.Fprintf(c.out, "export PGUSER=postgres\n")
 		_, _ = fmt.Fprintf(c.out, "export PGPASSWORD=%s\n", result.Password)
@@ -484,12 +484,12 @@ func (c *Client) getPasswordAction(ctx context.Context, cmd *cli.Command) error 
 	default:
 		// Default format with structured output
 		_, _ = fmt.Fprintf(c.out, "Instance: %s\n", instance.Name)
-		_, _ = fmt.Fprintf(c.out, "Host: 10.88.0.1\n")
+		_, _ = fmt.Fprintf(c.out, "Host: %s\n", util.GatewayIP)
 		_, _ = fmt.Fprintf(c.out, "Port: %d\n", instance.Port)
 		_, _ = fmt.Fprintf(c.out, "Username: postgres\n")
 		_, _ = fmt.Fprintf(c.out, "Password: %s\n", result.Password)
-		_, _ = fmt.Fprintf(c.out, "Connection String: postgresql://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable\n",
-			result.Password, instance.Port)
+		_, _ = fmt.Fprintf(c.out, "Connection String: postgresql://postgres:%s@%s:%d/postgres?sslmode=disable\n",
+			result.Password, util.GatewayIP, instance.Port)
 	}
 
 	return nil
@@ -625,11 +625,11 @@ func (c *Client) psqlAction(ctx context.Context, cmd *cli.Command) error {
 		"run",
 		"--rm",
 		"-it",
-		"--network", "oddk-bridge",
+		"--network", util.OddkNetworkName,
 		"-e", "PGPASSWORD",
 		fmt.Sprintf("postgres:%s", instance.Version),
 		"psql",
-		"-h", "10.88.0.1",
+		"-h", util.GatewayIP,
 		"-p", fmt.Sprintf("%d", instance.Port),
 		"-U", "postgres",
 		"-d", "postgres",
@@ -728,8 +728,8 @@ func (c *Client) printDBUserCredentials(instanceName, username, password, databa
 		}
 		if json.Unmarshal(instResp, &instance) == nil {
 			_, _ = fmt.Fprintf(c.out, "\nConnection string:\n")
-			_, _ = fmt.Fprintf(c.out, "postgresql://%s:%s@10.88.0.1:%d/%s?sslmode=disable\n",
-				username, password, instance.Port, database)
+			_, _ = fmt.Fprintf(c.out, "postgresql://%s:%s@%s:%d/%s?sslmode=disable\n",
+				username, password, util.GatewayIP, instance.Port, database)
 		}
 	}
 
@@ -813,8 +813,8 @@ func (c *Client) resetDatabaseUserPasswordAction(ctx context.Context, cmd *cli.C
 		}
 		if json.Unmarshal(instResp, &instance) == nil {
 			_, _ = fmt.Fprintf(c.out, "\nConnection string:\n")
-			_, _ = fmt.Fprintf(c.out, "postgresql://%s:%s@10.88.0.1:%d/<database>?sslmode=disable\n",
-				result.Username, result.Password, instance.Port)
+			_, _ = fmt.Fprintf(c.out, "postgresql://%s:%s@%s:%d/<database>?sslmode=disable\n",
+				result.Username, result.Password, util.GatewayIP, instance.Port)
 		}
 	}
 

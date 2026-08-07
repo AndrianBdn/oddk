@@ -8,7 +8,7 @@ import (
 
 // Version is the semantic version of ODDK
 // During development (0.1.x), PATCH increments for any change regardless of type
-const Version = "0.1.63"
+const Version = "0.1.65"
 
 // BuildInfo contains version and build information
 type BuildInfo struct {

@@ -675,7 +675,13 @@ func snapshotCommands(client *Client) *cli.Command {
 			{
 				Name:  "restore-instance",
 				Usage: "Restore ONE instance out of a snapshot into this live deployment",
-				Description: "Goes through the daemon, so --file is a path on the DAEMON's filesystem.\n" +
+				Description: "The snapshot comes from exactly one of --file (a path on the DAEMON's\n" +
+					"filesystem), --id (this host's catalogue; downloaded from S3 first if the\n" +
+					"local copy is gone), or --s3-uri (any snapshot archive in S3, incl. another\n" +
+					"deployment's — needs that deployment's --master-key). With --s3-uri the\n" +
+					"daemon authenticates with, in order: its offsite settings (same bucket),\n" +
+					"credentials resolved from THIS shell's AWS environment, or its own EC2\n" +
+					"instance role.\n" +
 					"If the instance exists its cluster is destroyed and rebuilt from the snapshot;\n" +
 					"otherwise it is created. Other instances are untouched.\n" +
 					"Use 'snapshot apply' instead to rebuild a whole host.",
@@ -686,9 +692,28 @@ func snapshotCommands(client *Client) *cli.Command {
 						Required: true,
 					},
 					&cli.StringFlag{
-						Name:     "file",
-						Usage:    "Path to the snapshot .tar.zst (on the daemon's filesystem)",
-						Required: true,
+						Name:  "file",
+						Usage: "Path to the snapshot .tar.zst (on the daemon's filesystem)",
+					},
+					&cli.IntFlag{
+						Name:  "id",
+						Usage: "Catalogue ID of the snapshot ('oddk snapshot list'); auto-downloaded from S3 if the local copy is gone",
+					},
+					&cli.StringFlag{
+						Name:  "s3-uri",
+						Usage: "s3://bucket/key of a snapshot archive ('oddk snapshot list-remote'); downloaded to the daemon's managed downloads area",
+					},
+					&cli.StringFlag{
+						Name:  "region",
+						Usage: "AWS region for --s3-uri (default: this shell's AWS config, then us-east-1)",
+					},
+					&cli.StringFlag{
+						Name:  "endpoint",
+						Usage: "Custom S3 endpoint URL for --s3-uri (S3-compatible storage)",
+					},
+					&cli.StringFlag{
+						Name:  "aws-profile",
+						Usage: "AWS shared-config profile to resolve credentials from for --s3-uri",
 					},
 					&cli.StringFlag{
 						Name:  "master-key",
@@ -706,16 +731,68 @@ func snapshotCommands(client *Client) *cli.Command {
 				Action: client.snapshotRestoreInstanceAction,
 			},
 			{
+				Name:      "list-remote",
+				Usage:     "List snapshot archives in S3 (the bucket's truth, not this host's catalogue)",
+				ArgsUsage: "[s3://bucket[/path]]",
+				Description: "With no argument, asks the daemon to list the configured offsite bucket.\n" +
+					"With an s3:// URI, lists that bucket DIRECTLY using this shell's ambient AWS\n" +
+					"credentials (AWS_* env vars, ~/.aws profile, EC2 instance role) — no daemon,\n" +
+					"no token, which is exactly what a disaster-recovery host has. ODDK uploads\n" +
+					"snapshots under <path>/*snapshots*/, and that segment is appended for you\n" +
+					"unless --all is given.",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "region",
+						Usage: "AWS region (default: this shell's AWS config, then us-east-1)",
+					},
+					&cli.StringFlag{
+						Name:  "endpoint",
+						Usage: "Custom S3 endpoint URL (S3-compatible storage)",
+					},
+					&cli.StringFlag{
+						Name:  "aws-profile",
+						Usage: "AWS shared-config profile to resolve credentials from",
+					},
+					&cli.BoolFlag{
+						Name:  "all",
+						Usage: "List the given path as-is instead of appending the *snapshots*/ layout segment",
+					},
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "Output as JSON",
+					},
+				},
+				Action: client.snapshotListRemoteAction,
+			},
+			{
 				Name:  "apply",
 				Usage: "Rebuild THIS host from a snapshot (replaces oddk.db, master.key and all instance data)",
 				Description: "Runs locally against the data directory, not the daemon, so it works when the\n" +
 					"daemon cannot start. Stop the daemon first and run as the data-dir owner,\n" +
-					"e.g. sudo -u oddk. The target deployment must have no instances.",
+					"e.g. sudo -u oddk. The target deployment must have no instances.\n" +
+					"The snapshot comes from --file, or straight from S3 with --s3-uri using this\n" +
+					"process's ambient AWS credentials — an EC2 instance role works under\n" +
+					"sudo -u oddk with no flags; env vars need sudo --preserve-env=AWS_...",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
-						Name:     "file",
-						Usage:    "Path to the snapshot .tar.zst",
-						Required: true,
+						Name:  "file",
+						Usage: "Path to the snapshot .tar.zst",
+					},
+					&cli.StringFlag{
+						Name:  "s3-uri",
+						Usage: "s3://bucket/key of the snapshot ('oddk snapshot list-remote'); downloaded with this process's AWS credentials",
+					},
+					&cli.StringFlag{
+						Name:  "region",
+						Usage: "AWS region for --s3-uri (default: ambient AWS config, then us-east-1)",
+					},
+					&cli.StringFlag{
+						Name:  "endpoint",
+						Usage: "Custom S3 endpoint URL for --s3-uri (S3-compatible storage)",
+					},
+					&cli.StringFlag{
+						Name:  "aws-profile",
+						Usage: "AWS shared-config profile to resolve credentials from for --s3-uri",
 					},
 					&cli.StringFlag{
 						Name:     "master-key",

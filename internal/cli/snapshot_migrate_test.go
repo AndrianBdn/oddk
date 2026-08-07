@@ -1,17 +1,12 @@
 package cli_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
-
-	"github.com/andrianbdn/oddk/internal/cli"
 )
 
 // fakeMigrateDaemon serves the four endpoints `snapshot migrate-from-backups`
@@ -19,8 +14,7 @@ import (
 // effect — scheduling snapshots before retiring the backup schedules is the
 // property that keeps an interrupted run safe.
 type fakeMigrateDaemon struct {
-	mu             sync.Mutex
-	calls          []string
+	fakeDaemon
 	backupPlansRaw string
 	snapshotPlan   string // JSON for {"plan": ...}; "null" when unconfigured
 	checklistRaw   string
@@ -28,57 +22,8 @@ type fakeMigrateDaemon struct {
 	failDeleteFor  string
 }
 
-func (f *fakeMigrateDaemon) record(method, path string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, method+" "+path)
-}
-
-func (f *fakeMigrateDaemon) recorded() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.calls...)
-}
-
-func (f *fakeMigrateDaemon) start(t *testing.T) []string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.record(r.Method, r.URL.Path)
-		w.Header().Set("Content-Type", "application/json")
-
-		switch {
-		case r.Method == "GET" && r.URL.Path == "/api/cron/backup":
-			_, _ = w.Write([]byte(f.backupPlansRaw))
-		case r.Method == "GET" && r.URL.Path == "/api/cron/snapshot":
-			_, _ = w.Write([]byte(`{"plan": ` + f.snapshotPlan + `}`))
-		case r.Method == "GET" && r.URL.Path == "/api/checklist":
-			_, _ = w.Write([]byte(f.checklistRaw))
-		case r.Method == "GET" && r.URL.Path == "/api/backups":
-			_, _ = w.Write([]byte(f.backupsRaw))
-		case r.Method == "POST" && r.URL.Path == "/api/cron/snapshot":
-			body := map[string]int{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			_, _ = fmt.Fprintf(w,
-				`{"utcHour": %d, "intervalHours": %d, "cleanupLocalDays": %d, "cleanupRemoteDays": %d}`,
-				body["utcHour"], body["intervalHours"], body["cleanupLocalDays"], body["cleanupRemoteDays"])
-		case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/api/cron/backup/"):
-			if f.failDeleteFor != "" && strings.HasSuffix(r.URL.Path, "/"+f.failDeleteFor) {
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"error": "boom"}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"status": "ok"}`))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error": "not found"}`))
-		}
-	}))
-	t.Cleanup(srv.Close)
-	return []string{fmt.Sprintf("ODDK_CLI_CONFIG=%s", writeTestConfig(t, srv.URL))}
-}
-
 func defaultMigrateDaemon() *fakeMigrateDaemon {
-	return &fakeMigrateDaemon{
+	f := &fakeMigrateDaemon{
 		// Hours disagree (3, 3, 7) and retention windows differ.
 		backupPlansRaw: `[
 			{"instanceName": "app",     "utcHour": 3, "cleanupLocalDays": 7,  "cleanupRemoteDays": 14},
@@ -107,13 +52,40 @@ func defaultMigrateDaemon() *fakeMigrateDaemon {
 			{"id": 5, "instanceName": "ghost",   "timestamp": "2026-07-09T03:00:00Z", "size": 999999999999, "status": "completed", "remoteLocation": "s3://x/5"}
 		]`,
 	}
+	f.handle = func(w http.ResponseWriter, r *http.Request) bool {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/cron/backup":
+			_, _ = w.Write([]byte(f.backupPlansRaw))
+		case r.Method == "GET" && r.URL.Path == "/api/cron/snapshot":
+			_, _ = w.Write([]byte(`{"plan": ` + f.snapshotPlan + `}`))
+		case r.Method == "GET" && r.URL.Path == "/api/checklist":
+			_, _ = w.Write([]byte(f.checklistRaw))
+		case r.Method == "GET" && r.URL.Path == "/api/backups":
+			_, _ = w.Write([]byte(f.backupsRaw))
+		case r.Method == "POST" && r.URL.Path == "/api/cron/snapshot":
+			body := map[string]int{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			_, _ = fmt.Fprintf(w,
+				`{"utcHour": %d, "intervalHours": %d, "cleanupLocalDays": %d, "cleanupRemoteDays": %d}`,
+				body["utcHour"], body["intervalHours"], body["cleanupLocalDays"], body["cleanupRemoteDays"])
+		case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/api/cron/backup/"):
+			if f.failDeleteFor != "" && strings.HasSuffix(r.URL.Path, "/"+f.failDeleteFor) {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error": "boom"}`))
+				return true
+			}
+			_, _ = w.Write([]byte(`{"status": "ok"}`))
+		default:
+			return false
+		}
+		return true
+	}
+	return f
 }
 
 func runMigrate(t *testing.T, env []string, args ...string) (string, error) {
 	t.Helper()
-	var buf bytes.Buffer
-	err := cli.Run(append([]string{"oddk", "snapshot", "migrate-from-backups"}, args...), env, &buf)
-	return buf.String(), err
+	return runCLI(t, env, append([]string{"snapshot", "migrate-from-backups"}, args...)...)
 }
 
 func TestMigrateFromBackups_DerivesPlanAndOrdersCalls(t *testing.T) {

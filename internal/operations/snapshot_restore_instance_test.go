@@ -7,7 +7,6 @@ import (
 
 	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/operr"
-	"github.com/andrianbdn/oddk/internal/store"
 )
 
 // TestSnapshotInstancePassword covers the invariant the whole restore rests on:
@@ -16,13 +15,8 @@ import (
 // embedded oddk.db is the only way to get it, and the wrong key must refuse
 // rather than hand back garbage that would brick the rebuilt instance.
 func TestSnapshotInstancePassword(t *testing.T) {
-	dir := t.TempDir()
+	st, dir := newTestStore(t)
 	dbPath := filepath.Join(dir, "oddk.db")
-
-	st, err := store.NewStore(dbPath, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	rightKey := make([]byte, 32)
 	for i := range rightKey {
@@ -111,12 +105,7 @@ func TestSnapshotEntryLookup(t *testing.T) {
 // do after destroying a broken one, always failed. If this contract ever changes
 // to (nil, nil), this test fails and the branch must be revisited.
 func TestInstanceGetSignalsAbsenceAsError(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = st.Sqlx.Close() }()
+	st, _ := newTestStore(t)
 
 	inst, err := st.Instances.Get("definitely-absent")
 	if inst != nil {

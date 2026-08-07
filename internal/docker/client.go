@@ -25,6 +25,7 @@ import (
 	"github.com/docker/go-connections/nat"
 
 	"github.com/andrianbdn/oddk/internal/store/parameters"
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 type Client struct {
@@ -88,19 +89,19 @@ func (c *Client) ensureNetwork() error {
 	}
 
 	for _, net := range networks {
-		if net.Name == "oddk-bridge" {
+		if net.Name == util.OddkNetworkName {
 			log.Println("Network oddk-bridge already exists")
 			return nil
 		}
 	}
 
-	_, err = c.cli.NetworkCreate(c.ctx, "oddk-bridge", network.CreateOptions{
+	_, err = c.cli.NetworkCreate(c.ctx, util.OddkNetworkName, network.CreateOptions{
 		Driver: "bridge",
 		IPAM: &network.IPAM{
 			Config: []network.IPAMConfig{
 				{
-					Subnet:  "10.88.0.0/16",
-					Gateway: "10.88.0.1",
+					Subnet:  util.OddkSubnet,
+					Gateway: util.GatewayIP,
 				},
 			},
 		},
@@ -128,12 +129,12 @@ func (c *Client) EnsureContainerOnNetwork(containerID string) (bool, error) {
 	}
 
 	if inspect.NetworkSettings != nil {
-		if _, attached := inspect.NetworkSettings.Networks["oddk-bridge"]; attached {
+		if _, attached := inspect.NetworkSettings.Networks[util.OddkNetworkName]; attached {
 			return false, nil
 		}
 	}
 
-	if err := c.cli.NetworkConnect(c.ctx, "oddk-bridge", containerID, nil); err != nil {
+	if err := c.cli.NetworkConnect(c.ctx, util.OddkNetworkName, containerID, nil); err != nil {
 		return false, fmt.Errorf("connect container to oddk-bridge: %w", err)
 	}
 	return true, nil
@@ -259,7 +260,7 @@ func (c *Client) CreateContainer(name, version, image string, port int, password
 	portBindings := nat.PortMap{
 		"5432/tcp": []nat.PortBinding{
 			{
-				HostIP:   "10.88.0.1",
+				HostIP:   util.GatewayIP,
 				HostPort: fmt.Sprintf("%d", port),
 			},
 		},
@@ -314,7 +315,7 @@ func (c *Client) CreateContainer(name, version, image string, port int, password
 
 	networkConfig := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
-			"oddk-bridge": {},
+			util.OddkNetworkName: {},
 		},
 	}
 
@@ -397,7 +398,7 @@ func (c *Client) RecreateContainer(name, version, image string, port int, passwo
 	portBindings := nat.PortMap{
 		"5432/tcp": []nat.PortBinding{
 			{
-				HostIP:   "10.88.0.1",
+				HostIP:   util.GatewayIP,
 				HostPort: fmt.Sprintf("%d", port),
 			},
 		},
@@ -452,7 +453,7 @@ func (c *Client) RecreateContainer(name, version, image string, port int, passwo
 
 	networkConfig := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
-			"oddk-bridge": {},
+			util.OddkNetworkName: {},
 		},
 	}
 

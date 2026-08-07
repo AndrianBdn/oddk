@@ -4,23 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/andrianbdn/oddk/internal/rfc3339time"
-	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/backup"
 )
 
 func TestSweepBackupDir(t *testing.T) {
-	dataDir := t.TempDir()
-	backupDir := filepath.Join(dataDir, "backups")
-	if err := os.MkdirAll(backupDir, 0o750); err != nil {
-		t.Fatal(err)
-	}
-
-	st, err := store.NewStore(filepath.Join(dataDir, "oddk.db"), dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st, backupDir := newTestStore(t)
 
 	// Orphaned temp artifacts from interrupted operations — must be removed.
 	staleDirs := []string{".tmp-backup-x-1", ".pgpass-123", ".restore-456", ".upgrade-789"}
@@ -88,6 +79,54 @@ func TestSweepBackupDir(t *testing.T) {
 	}
 }
 
+// TestSweepBackupDirDownloadsArea pins the managed downloads area's contract
+// with the startup sweep:
+//
+//   - The `downloads` directory itself must never be treated as a stale
+//     artifact (it is deliberately not dot-prefixed) and its contents must
+//     never trigger the unreferenced-archive warning path (the whole point of
+//     a subdirectory is that uncatalogued foreign archives live there without
+//     a warning on every boot).
+//   - Aged entries and orphaned .tmp-* partials inside it ARE pruned — that is
+//     the TTL sweep the startup path runs.
+func TestSweepBackupDirDownloadsArea(t *testing.T) {
+	st, backupDir := newTestStore(t)
+
+	downloadsDir := filepath.Join(backupDir, "downloads")
+	if err := os.MkdirAll(downloadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	mkAged := func(name string, age time.Duration) string {
+		p := filepath.Join(downloadsDir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		when := time.Now().Add(-age)
+		if err := os.Chtimes(p, when, when); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	fresh := mkAged("snapshot-otherhost-20260806000000.tar.zst", time.Hour)
+	aged := mkAged("snapshot-otherhost-20260701000000.tar.zst", 8*24*time.Hour)
+	agedTmp := mkAged(".tmp-snapshot-otherhost-x.tar.zst", 2*time.Hour)
+
+	sweepBackupDir(st, backupDir)
+
+	if _, err := os.Stat(downloadsDir); err != nil {
+		t.Fatalf("downloads dir must survive the sweep: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh downloaded archive must survive the sweep: %v", err)
+	}
+	if _, err := os.Stat(aged); !os.IsNotExist(err) {
+		t.Error("aged downloaded archive should have been pruned")
+	}
+	if _, err := os.Stat(agedTmp); !os.IsNotExist(err) {
+		t.Error("orphaned .tmp- partial should have been pruned")
+	}
+}
+
 // TestSweepBackupDirSnapshotArtifacts covers the two ways snapshots interact
 // with the startup sweep, which differ from per-instance backups:
 //
@@ -99,15 +138,7 @@ func TestSweepBackupDir(t *testing.T) {
 //     survive AND must not be reported as a stray archive, or every startup
 //     would log a warning that trains operators to ignore the real ones.
 func TestSweepBackupDirSnapshotArtifacts(t *testing.T) {
-	dataDir := t.TempDir()
-	backupDir := filepath.Join(dataDir, "backups")
-	if err := os.MkdirAll(backupDir, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.NewStore(filepath.Join(dataDir, "oddk.db"), dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st, backupDir := newTestStore(t)
 
 	stagingDir := filepath.Join(backupDir, ".snapshot-20260101000000")
 	if err := os.MkdirAll(filepath.Join(stagingDir, "instances", "app", "databases"), 0o750); err != nil {

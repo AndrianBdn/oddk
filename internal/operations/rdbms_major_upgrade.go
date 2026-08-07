@@ -10,9 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrianbdn/oddk/internal/compression"
@@ -21,6 +19,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/operr"
 	"github.com/andrianbdn/oddk/internal/store/instances"
 	"github.com/andrianbdn/oddk/internal/store/parameters"
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 // UpgradeRDBMSOp performs a major-version PostgreSQL upgrade of an instance
@@ -385,7 +384,7 @@ func resolveTargetImage(currentImage, targetVersion, providedImage string) (stri
 // connectDirect opens a PostgreSQL connection by port+password without checking
 // instance status (used during an upgrade when status is "upgrading").
 func connectDirect(ctx context.Context, port int, password, database string) (*pgx.Conn, error) {
-	connStr := fmt.Sprintf("postgres://postgres:%s@10.88.0.1:%d/%s?sslmode=disable", password, port, database)
+	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/%s?sslmode=disable", password, util.GatewayIP, port, database)
 	return pgx.Connect(ctx, connStr)
 }
 
@@ -494,110 +493,48 @@ func verifyRolesPresent(ctx context.Context, port int, password string, expected
 // passwords) into the fresh cluster. ON_ERROR_STOP=0 tolerates statements that
 // collide with initdb defaults (e.g. the bootstrap postgres role).
 func restoreGlobals(ctx context.Context, deps *Dependencies, instanceName, image string, port int, password, extractedDir string) error {
-	containerName := fmt.Sprintf("oddk-upgrade-globals-%s-%d", instanceName, time.Now().UnixNano())
-	cmd := []string{
-		"psql",
-		"-h", "10.88.0.1",
-		"-p", strconv.Itoa(port),
-		"-U", "postgres",
-		"-d", "postgres",
-		"-v", "ON_ERROR_STOP=0",
-		"-f", "/restore/globals.sql",
-	}
-	mounts := []mount.Mount{
-		{Type: mount.TypeBind, Source: extractedDir, Target: "/restore", ReadOnly: true},
-	}
-	return runHelperContainer(ctx, deps, containerName, image, cmd, password, mounts, true)
+	return runHelperContainer(ctx, deps, helperContainerSpec{
+		ContainerName: fmt.Sprintf("oddk-upgrade-globals-%s-%d", instanceName, time.Now().UnixNano()),
+		Image:         image,
+		Cmd: []string{
+			"psql",
+			"-h", util.GatewayIP,
+			"-p", strconv.Itoa(port),
+			"-U", "postgres",
+			"-d", "postgres",
+			"-v", "ON_ERROR_STOP=0",
+			"-f", "/restore/globals.sql",
+		},
+		Password: password,
+		Mounts: []mount.Mount{
+			{Type: mount.TypeBind, Source: extractedDir, Target: "/restore", ReadOnly: true},
+		},
+		Tool:               "psql",
+		LogOutputOnSuccess: true,
+	})
 }
 
 // restoreDatabaseWithOwner restores a single database, preserving object
 // ownership and privileges (no --no-owner / --no-privileges). Roles must
 // already exist (restoreGlobals runs first).
 func restoreDatabaseWithOwner(ctx context.Context, deps *Dependencies, instanceName, image string, port int, password, dbDir, dbName string, jobs int) error {
-	containerName := fmt.Sprintf("oddk-upgrade-restore-%s-%s-%d", instanceName, dbName, time.Now().UnixNano())
-	cmd := []string{
-		"pg_restore",
-		"-Fd",
-		"-d", dbName,
-		"-h", "10.88.0.1",
-		"-p", strconv.Itoa(port),
-		"-U", "postgres",
-		"-j", strconv.Itoa(jobs),
-		"/backup",
-	}
-	mounts := []mount.Mount{
-		{Type: mount.TypeBind, Source: dbDir, Target: "/backup", ReadOnly: true},
-	}
-	return runHelperContainer(ctx, deps, containerName, image, cmd, password, mounts, false)
-}
-
-// runHelperContainer creates, starts, and waits on an ephemeral helper
-// container (labeled oddk.helper=true, attached to oddk-bridge, run as the
-// daemon's uid/gid). It returns an error if the container exits non-zero,
-// including its logs. When logOutput is true the container's output is logged
-// even on success — used for the globals psql run, which exits 0 under
-// ON_ERROR_STOP=0 even when individual statements error, so the detail is
-// preserved for diagnosis. Cleanup uses a detached context so a cancelled op
-// ctx doesn't leave the helper running; the daemon-startup sweep is the backstop.
-func runHelperContainer(ctx context.Context, deps *Dependencies, containerName, image string, cmd []string, password string, mounts []mount.Mount, logOutput bool) error {
-	uid := os.Getuid()
-	gid := os.Getgid()
-
-	pgPassMount, pgPassEnv, cleanup, err := newPgPassMount(deps.BackupDir, password)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	config := &container.Config{
-		Image:  image,
-		User:   fmt.Sprintf("%d:%d", uid, gid),
-		Cmd:    cmd,
-		Env:    []string{pgPassEnv},
-		Labels: map[string]string{"oddk.helper": "true"},
-	}
-	hostConfig := &container.HostConfig{Mounts: append(mounts, pgPassMount)}
-	networkConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			"oddk-bridge": {},
+	return runHelperContainer(ctx, deps, helperContainerSpec{
+		ContainerName: fmt.Sprintf("oddk-upgrade-restore-%s-%s-%d", instanceName, dbName, time.Now().UnixNano()),
+		Image:         image,
+		Cmd: []string{
+			"pg_restore",
+			"-Fd",
+			"-d", dbName,
+			"-h", util.GatewayIP,
+			"-p", strconv.Itoa(port),
+			"-U", "postgres",
+			"-j", strconv.Itoa(jobs),
+			"/backup",
 		},
-	}
-
-	cli := deps.Docker.GetDockerClient()
-	resp, err := cli.ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
-	if err != nil {
-		return fmt.Errorf("create container: %w", err)
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
-	}()
-
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("start container: %w", err)
-	}
-
-	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("wait for container: %w", err)
-		}
-	case status := <-statusCh:
-		if status.StatusCode != 0 {
-			logs, logErr := getContainerLogs(ctx, deps, resp.ID)
-			if logErr != nil {
-				logs = fmt.Sprintf("<logs unavailable: %v>", logErr)
-			}
-			return fmt.Errorf("helper exited with status %d: %s", status.StatusCode, logs)
-		}
-	}
-
-	if logOutput {
-		if logs, lerr := getContainerLogs(ctx, deps, resp.ID); lerr == nil && strings.TrimSpace(logs) != "" {
-			log.Printf("[%s] output:\n%s", containerName, logs)
-		}
-	}
-	return nil
+		Password: password,
+		Mounts: []mount.Mount{
+			{Type: mount.TypeBind, Source: dbDir, Target: "/backup", ReadOnly: true},
+		},
+		Tool: "pg_restore",
+	})
 }

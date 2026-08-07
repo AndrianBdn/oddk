@@ -148,6 +148,23 @@ func (s *SnapshotStore) Get(id int) (*Record, error) {
 	return &rec, nil
 }
 
+// FindByRemoteLocation returns the record whose remote copy IS the given
+// s3:// location, or nil. Restore-by-URI uses it to recognise "that is this
+// host's own snapshot" and reuse the catalogue-managed copy instead of
+// downloading a duplicate into the unmanaged downloads area.
+func (s *SnapshotStore) FindByRemoteLocation(location string) (*Record, error) {
+	var rec Record
+	err := s.db.Get(&rec, `SELECT * FROM snapshot_history WHERE remote_location = ? ORDER BY id DESC LIMIT 1`, location)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find snapshot by remote location: %w", err)
+	}
+	flatten(&rec)
+	return &rec, nil
+}
+
 // SetRemoteLocation records an offsite copy.
 func (s *SnapshotStore) SetRemoteLocation(id int, remote string) error {
 	_, err := s.db.Exec(`UPDATE snapshot_history SET remote_location = ? WHERE id = ?`, remote, id)

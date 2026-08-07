@@ -17,6 +17,7 @@ import (
 
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operations"
+	s3service "github.com/andrianbdn/oddk/internal/services/s3"
 )
 
 type snapshotInstanceEntry struct {
@@ -426,20 +427,28 @@ func (c *Client) snapshotRemoveCopy(cmd *cli.Command, which string) error {
 	return nil
 }
 
+type snapshotArchiveOrigin struct {
+	Kind             string `json:"kind"`
+	Path             string `json:"path"`
+	DownloadedBytes  int64  `json:"downloadedBytes"`
+	CredentialSource string `json:"credentialSource"`
+}
+
 type snapshotRestoreInstanceResult struct {
-	Instance        string `json:"instance"`
-	Created         bool   `json:"created"`
-	Replaced        bool   `json:"replaced"`
-	Databases       int    `json:"databases"`
-	SourceHost      string `json:"sourceHost"`
-	SnapshotAt      string `json:"snapshotAt"`
-	Port            int    `json:"port"`
-	CPUCores        int    `json:"cpuCores"`
-	RAMMB           int    `json:"ramMb"`
-	Image           string `json:"image"`
-	PasswordChanged bool   `json:"passwordChanged"`
-	Format          string `json:"format"`
-	FinalStatus     string `json:"finalStatus"`
+	Instance        string                 `json:"instance"`
+	Created         bool                   `json:"created"`
+	Replaced        bool                   `json:"replaced"`
+	Databases       int                    `json:"databases"`
+	SourceHost      string                 `json:"sourceHost"`
+	SnapshotAt      string                 `json:"snapshotAt"`
+	Port            int                    `json:"port"`
+	CPUCores        int                    `json:"cpuCores"`
+	RAMMB           int                    `json:"ramMb"`
+	Image           string                 `json:"image"`
+	PasswordChanged bool                   `json:"passwordChanged"`
+	Format          string                 `json:"format"`
+	FinalStatus     string                 `json:"finalStatus"`
+	ArchiveOrigin   *snapshotArchiveOrigin `json:"archiveOrigin"`
 }
 
 // snapshotRestoreInstanceAction restores ONE instance out of a snapshot into
@@ -448,19 +457,39 @@ type snapshotRestoreInstanceResult struct {
 // Unlike `snapshot apply` this goes through the daemon, so --file names a path
 // on the DAEMON's filesystem (as `backup restore --file` already does). The
 // client therefore cannot preflight the archive itself; the daemon validates and
-// refuses before touching anything.
+// refuses before touching anything. The --id and --s3-uri forms skip the
+// filesystem question entirely: the daemon fetches the archive itself.
 func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Command) error {
 	instance := cmd.String("instance")
 	archivePath := cmd.String("file")
+	snapshotID := cmd.Int("id")
+	s3URI := cmd.String("s3-uri")
 	if instance == "" {
 		return fmt.Errorf("--instance is required (which instance to restore out of the snapshot)")
 	}
-	if archivePath == "" {
-		return fmt.Errorf("--file is required (path to the snapshot .tar.zst, on the daemon's filesystem)")
+	sources := 0
+	for _, set := range []bool{archivePath != "", snapshotID != 0, s3URI != ""} {
+		if set {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return fmt.Errorf("exactly one of --file, --id or --s3-uri is required (the snapshot to restore from)")
+	}
+	if s3URI == "" && (cmd.String("region") != "" || cmd.String("endpoint") != "" || cmd.String("aws-profile") != "") {
+		return fmt.Errorf("--region, --endpoint and --aws-profile are only meaningful with --s3-uri")
+	}
+
+	sourceDesc := archivePath
+	switch {
+	case snapshotID != 0:
+		sourceDesc = fmt.Sprintf("snapshot id %d (this host's catalogue)", snapshotID)
+	case s3URI != "":
+		sourceDesc = s3URI
 	}
 
 	if !cmd.Bool("yes") {
-		_, _ = fmt.Fprintf(c.out, "About to restore instance %q from %s\n\n", instance, archivePath)
+		_, _ = fmt.Fprintf(c.out, "About to restore instance %q from %s\n\n", instance, sourceDesc)
 		_, _ = fmt.Fprintln(c.out, "  - If the instance exists here, its container and DATA VOLUME are destroyed and")
 		_, _ = fmt.Fprintln(c.out, "    rebuilt from the snapshot. Data written since the snapshot is lost.")
 		_, _ = fmt.Fprintln(c.out, "  - Its port, resources, image and parameter group are set to the SNAPSHOT's,")
@@ -480,15 +509,46 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 		}
 	}
 
-	body := map[string]string{
-		"instance": instance,
-		"filePath": archivePath,
+	body := map[string]any{"instance": instance}
+	switch {
+	case archivePath != "":
+		body["filePath"] = archivePath
+	case snapshotID != 0:
+		body["snapshotId"] = snapshotID
+	default:
+		body["s3Uri"] = s3URI
+		// Best-effort: attach this shell's resolved ambient credentials so the
+		// daemon can reach a bucket its offsite settings do not cover. An empty
+		// shell attaches nothing — the daemon's rung order (offsite settings →
+		// request → its own instance role) decides what authenticates.
+		creds, resolvedRegion, err := c.resolveAmbientAWSCredentials(ctx, cmd.String("aws-profile"))
+		if err != nil {
+			return err
+		}
+		if creds != nil {
+			body["credentials"] = creds
+			c.warnIfRemoteDaemonCreds()
+		}
+		region := cmd.String("region")
+		if region == "" {
+			region = resolvedRegion
+		}
+		if region != "" {
+			body["region"] = region
+		}
+		if endpoint := cmd.String("endpoint"); endpoint != "" {
+			body["endpoint"] = endpoint
+		}
 	}
 	if key := cmd.String("master-key"); key != "" {
 		body["masterKeyPath"] = key
 	}
 
-	_, _ = fmt.Fprintf(c.out, "\nRestoring %s (this may take a while)...\n", instance)
+	if archivePath == "" {
+		_, _ = fmt.Fprintf(c.out, "\nFetching the snapshot archive if needed, then restoring %s (this may take a while)...\n", instance)
+	} else {
+		_, _ = fmt.Fprintf(c.out, "\nRestoring %s (this may take a while)...\n", instance)
+	}
 	resp, err := c.request("POST", "/api/snapshot/restore-instance", body)
 	if err != nil {
 		return err
@@ -518,6 +578,20 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 	if result.SourceHost != "" {
 		_, _ = fmt.Fprintf(c.out, "  Source:    %s (snapshot taken %s)\n", result.SourceHost, result.SnapshotAt)
 	}
+	if o := result.ArchiveOrigin; o != nil {
+		switch o.Kind {
+		case "catalogue-downloaded":
+			_, _ = fmt.Fprintf(c.out, "  Archive:   downloaded from S3 (%s) to %s — now the snapshot's local copy\n",
+				humanSize(o.DownloadedBytes), o.Path)
+		case "s3-download":
+			_, _ = fmt.Fprintf(c.out, "  Archive:   downloaded from S3 (%s) to %s\n"+
+				"             (kept for further restores; the daemon prunes it after 7 days)\n",
+				humanSize(o.DownloadedBytes), o.Path)
+		case "s3-cached":
+			_, _ = fmt.Fprintf(c.out, "  Archive:   reused previously downloaded copy at %s\n"+
+				"             (kept for further restores; the daemon prunes it after 7 days)\n", o.Path)
+		}
+	}
 	if result.FinalStatus == "stopped" {
 		// A cold-captured instance comes back the way it was captured. Saying
 		// nothing would read as a restore that failed to start the instance.
@@ -546,9 +620,13 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 // data dir directly, and so must run as the data-dir owner.
 func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) error {
 	archivePath := cmd.String("file")
+	s3URI := cmd.String("s3-uri")
 	masterKeyPath := cmd.String("master-key")
-	if archivePath == "" {
-		return fmt.Errorf("--file is required (path to the snapshot .tar.zst)")
+	if (archivePath == "") == (s3URI == "") {
+		return fmt.Errorf("exactly one of --file or --s3-uri is required (the snapshot to apply)")
+	}
+	if s3URI == "" && (cmd.String("region") != "" || cmd.String("endpoint") != "" || cmd.String("aws-profile") != "") {
+		return fmt.Errorf("--region, --endpoint and --aws-profile are only meaningful with --s3-uri")
 	}
 	if masterKeyPath == "" {
 		return fmt.Errorf("--master-key is required: without the source host's master.key, the restored clusters would have a postgres password ODDK cannot recover")
@@ -566,9 +644,34 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 		return fmt.Errorf("create backup dir: %w", err)
 	}
 
+	// Fetch from S3 before anything else: this process's ambient AWS
+	// credential chain (env vars, profile, EC2 instance role) is the authority
+	// — a DR host has no daemon, no offsite settings and no catalogue, which is
+	// exactly why the download lives here. The archive lands in the managed
+	// downloads area, additively; a matching previous download is reused.
+	var fetched *operations.FetchResult
+	if s3URI != "" {
+		fetch, err := operations.FetchSnapshotForApply(ctx, &operations.RemoteSnapshotSpec{
+			URI:      s3URI,
+			Region:   cmd.String("region"),
+			Endpoint: cmd.String("endpoint"),
+			Profile:  cmd.String("aws-profile"),
+		}, backupDir, c.out)
+		if err != nil {
+			return err
+		}
+		fetched = fetch
+		archivePath = fetch.Path
+		if fetch.Reused {
+			_, _ = fmt.Fprintf(c.out, "Reusing previously downloaded archive at %s (size matches S3)\n", fetch.Path)
+		} else {
+			_, _ = fmt.Fprintf(c.out, "Downloaded %s (%s) to %s\n", s3URI, humanSize(fetch.Size), fetch.Path)
+		}
+	}
+
 	dockerClient, err := docker.NewClient()
 	if err != nil {
-		return fmt.Errorf("connect to Docker: %w", err)
+		return wrapApplyS3Retry(fmt.Errorf("connect to Docker: %w", err), fetched)
 	}
 
 	// Image pulls happen in preflight and can take minutes on a DR host, so
@@ -613,7 +716,7 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 		}
 	}
 	if preflightErr != nil {
-		return preflightErr
+		return wrapApplyS3Retry(preflightErr, fetched)
 	}
 
 	if !cmd.Bool("yes") {
@@ -625,6 +728,9 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 			_, _ = fmt.Fprintf(c.out, "  - No ODDK state has been modified yet. (%d Docker image(s) were pulled\n    above; that is additive and safe to leave behind.)\n", len(plan.PulledImages))
 		} else {
 			_, _ = fmt.Fprintln(c.out, "  - Nothing has been modified yet; everything above was read-only.")
+		}
+		if fetched != nil {
+			_, _ = fmt.Fprintf(c.out, "  - The downloaded archive at %s is additive too;\n    it is kept for retries and pruned after 7 days.\n", fetched.Path)
 		}
 		_, _ = fmt.Fprintln(c.out)
 
@@ -641,7 +747,7 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 	_, _ = fmt.Fprintln(c.out, "\nInstalling configuration...")
 	result, err := operations.ExecuteSnapshotApply(ctx, plan, c.out)
 	if err != nil {
-		return err
+		return wrapApplyS3Retry(err, fetched)
 	}
 
 	_, _ = fmt.Fprintln(c.out, "\nSnapshot applied.")
@@ -696,6 +802,119 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 	}
 
 	return nil
+}
+
+// wrapApplyS3Retry appends the retry story to an apply failure when the
+// archive was fetched from S3: the download survives the failure, so the
+// retry must not pay for it again — and the operator should know that.
+func wrapApplyS3Retry(err error, fetched *operations.FetchResult) error {
+	if err == nil || fetched == nil {
+		return err
+	}
+	return fmt.Errorf("%w\n\nThe downloaded archive remains at %s;\nre-running with the same --s3-uri reuses it, or pass it directly with --file", err, fetched.Path)
+}
+
+// snapshotListRemoteAction lists snapshot archives in S3 — the BUCKET's truth,
+// as opposed to `snapshot list`, which is this host's catalogue.
+//
+// Zero-arg: the daemon lists its configured offsite bucket (it holds the
+// credentials). With an s3:// URI: fully local, using this shell's ambient
+// AWS credentials — no daemon and no token, which is exactly what a
+// disaster-recovery host has before `snapshot apply`.
+func (c *Client) snapshotListRemoteAction(ctx context.Context, cmd *cli.Command) error {
+	if cmd.Args().Len() > 1 {
+		return fmt.Errorf("usage: oddk snapshot list-remote [s3://bucket[/path]]")
+	}
+
+	if cmd.Args().Len() == 0 {
+		if cmd.String("region") != "" || cmd.String("endpoint") != "" || cmd.String("aws-profile") != "" || cmd.Bool("all") {
+			return fmt.Errorf("--region, --endpoint, --aws-profile and --all apply to the direct s3:// form; without a URI the daemon lists its configured offsite bucket")
+		}
+		resp, err := c.request("GET", "/api/snapshots/remote", nil)
+		if err != nil {
+			return err
+		}
+		if cmd.Bool("json") {
+			_, _ = fmt.Fprintf(c.out, "%s\n", resp)
+			return nil
+		}
+		var listing struct {
+			Bucket    string                            `json:"bucket"`
+			Prefix    string                            `json:"prefix"`
+			Objects   []operations.RemoteSnapshotObject `json:"objects"`
+			Truncated bool                              `json:"truncated"`
+		}
+		if err := json.Unmarshal(resp, &listing); err != nil {
+			return fmt.Errorf("parse response: %w", err)
+		}
+		c.printRemoteSnapshots(listing.Bucket, listing.Prefix, listing.Objects, listing.Truncated)
+		return nil
+	}
+
+	uri := cmd.Args().First()
+	bucket, prefix, err := s3service.ParseS3BucketURI(uri)
+	if err != nil {
+		return err
+	}
+	// ODDK uploads snapshots under <bucketPath>*snapshots*/<date>/<file>; the
+	// layout segment is ODDK's own invariant, so append it rather than making
+	// every operator remember it. --all lists the given path as-is.
+	if !cmd.Bool("all") && !strings.Contains(prefix, operations.SnapshotS3Prefix) {
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+		prefix += operations.SnapshotS3Prefix + "/"
+	}
+
+	client, err := s3service.NewClientAmbient(ctx, s3service.Target{
+		Bucket:   bucket,
+		Region:   cmd.String("region"),
+		Endpoint: cmd.String("endpoint"),
+	}, cmd.String("aws-profile"))
+	if err != nil {
+		return fmt.Errorf("%w\nSet AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, configure a profile (--aws-profile or AWS_PROFILE), or run on a host with an EC2 instance role", err)
+	}
+
+	objects, truncated, err := operations.ListRemoteSnapshots(ctx, client, bucket, prefix)
+	if err != nil {
+		return err
+	}
+
+	if cmd.Bool("json") {
+		data, err := json.Marshal(map[string]any{
+			"bucket": bucket, "prefix": prefix, "objects": objects, "truncated": truncated,
+		})
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(c.out, "%s\n", data)
+		return nil
+	}
+	c.printRemoteSnapshots(bucket, prefix, objects, truncated)
+	return nil
+}
+
+func (c *Client) printRemoteSnapshots(bucket, prefix string, objects []operations.RemoteSnapshotObject, truncated bool) {
+	if len(objects) == 0 {
+		_, _ = fmt.Fprintf(c.out, "No snapshot objects under s3://%s/%s\n", bucket, prefix)
+		return
+	}
+
+	w := tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "LAST MODIFIED\tSIZE\tURI")
+	for _, o := range objects {
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n",
+			o.LastModified.UTC().Format("2006-01-02 15:04"), humanSize(o.Size), o.URI)
+	}
+	_ = w.Flush()
+	if truncated {
+		_, _ = fmt.Fprintf(c.out, "(listing truncated at %d objects; narrow the path)\n", operations.MaxRemoteSnapshotListing)
+	}
+
+	// The listing exists to be acted on; hand over the exact next commands.
+	_, _ = fmt.Fprintln(c.out)
+	_, _ = fmt.Fprintln(c.out, "Restore one instance:  oddk snapshot restore-instance --instance <name> --s3-uri <uri>")
+	_, _ = fmt.Fprintln(c.out, "Rebuild a whole host:  oddk snapshot apply --s3-uri <uri> --master-key <path>")
 }
 
 // describeSnapshotInstances renders the manifest's instance inventory,

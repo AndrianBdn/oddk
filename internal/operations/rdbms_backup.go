@@ -5,16 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/pkg/stdcopy"
 
 	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/crypto"
@@ -197,95 +193,37 @@ func recordBackup(deps *Dependencies, params *BackupRDBMSParams, archivePath str
 }
 
 func backupGlobals(ctx context.Context, deps *Dependencies, instance *instances.RDBMSInstance, password, outputPath string) error {
-	containerName := fmt.Sprintf("oddk-backup-globals-%s-%d", instance.Name, time.Now().Unix())
-
 	image := instance.Image
 	if image == "" {
 		image = fmt.Sprintf("postgres:%s", instance.Version)
 	}
 
-	pgPassMount, pgPassEnv, cleanup, err := newPgPassMount(deps.BackupDir, password)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	config := &container.Config{
-		Image: image,
+	// pg_dumpall writes SQL to stdout; capture it and write the file only
+	// after the helper has succeeded.
+	var buf bytes.Buffer
+	err := runHelperContainer(ctx, deps, helperContainerSpec{
+		ContainerName: fmt.Sprintf("oddk-backup-globals-%s-%d", instance.Name, time.Now().Unix()),
+		Image:         image,
 		Cmd: []string{
 			"pg_dumpall",
 			"-g", // Globals only
-			"-h", "10.88.0.1",
+			"-h", util.GatewayIP,
 			"-p", fmt.Sprintf("%d", instance.Port),
 			"-U", "postgres",
 		},
-		Env:    []string{pgPassEnv},
-		Labels: map[string]string{"oddk.helper": "true"},
-	}
-
-	hostConfig := &container.HostConfig{
-		Mounts: []mount.Mount{pgPassMount},
-	}
-
-	networkConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			"oddk-bridge": {},
-		},
-	}
-
-	resp, err := deps.Docker.GetDockerClient().ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
-	if err != nil {
-		return fmt.Errorf("create container: %w", err)
-	}
-	defer func() {
-		// Use a detached context for cleanup so a cancelled op ctx doesn't
-		// leave the helper running. Daemon-startup sweep is the backstop.
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = deps.Docker.GetDockerClient().ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
-	}()
-
-	if err := deps.Docker.GetDockerClient().ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("start container: %w", err)
-	}
-
-	// Wait for container to complete
-	statusCh, errCh := deps.Docker.GetDockerClient().ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("wait for container: %w", err)
-		}
-	case status := <-statusCh:
-		if status.StatusCode != 0 {
-			logs, logErr := getContainerLogs(ctx, deps, resp.ID)
-			if logErr != nil {
-				logs = fmt.Sprintf("<logs unavailable: %v>", logErr)
-			}
-			return fmt.Errorf("pg_dumpall failed with status %d: %s", status.StatusCode, logs)
-		}
-	}
-
-	reader, err := deps.Docker.GetDockerClient().ContainerLogs(ctx, resp.ID, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: false,
+		Password:      password,
+		Tool:          "pg_dumpall",
+		CaptureStdout: &buf,
 	})
 	if err != nil {
-		return fmt.Errorf("get container logs: %w", err)
+		return err
 	}
-	defer func() { _ = reader.Close() }()
 
 	file, err := os.Create(outputPath) // #nosec G304 - outputPath is controlled by backup operation
 	if err != nil {
 		return fmt.Errorf("create globals file: %w", err)
 	}
 	defer func() { _ = file.Close() }()
-
-	// Copy stdout only (pg_dumpall writes SQL to stdout)
-	var buf bytes.Buffer
-	if _, err := stdcopy.StdCopy(&buf, io.Discard, reader); err != nil {
-		return fmt.Errorf("read container output: %w", err)
-	}
 
 	if _, err := file.Write(buf.Bytes()); err != nil {
 		return fmt.Errorf("write globals file: %w", err)
@@ -295,38 +233,9 @@ func backupGlobals(ctx context.Context, deps *Dependencies, instance *instances.
 }
 
 func backupDatabase(ctx context.Context, deps *Dependencies, instance *instances.RDBMSInstance, password, dbName, outputDir string) error {
-	containerName := fmt.Sprintf("oddk-backup-db-%s-%s-%d", instance.Name, dbName, time.Now().Unix())
-
-	uid := os.Getuid()
-	gid := os.Getgid()
-
 	image := instance.Image
 	if image == "" {
 		image = fmt.Sprintf("postgres:%s", instance.Version)
-	}
-
-	pgPassMount, pgPassEnv, cleanup, err := newPgPassMount(deps.BackupDir, password)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	config := &container.Config{
-		Image: image,
-		User:  fmt.Sprintf("%d:%d", uid, gid),
-		Cmd: []string{
-			"pg_dump",
-			"-Fd",     // Directory format
-			"-j", "4", // Parallel jobs
-			"-Z0", // No compression (we'll use zstd later)
-			"-h", "10.88.0.1",
-			"-p", fmt.Sprintf("%d", instance.Port),
-			"-U", "postgres",
-			"--file", "/backup",
-			dbName,
-		},
-		Env:    []string{pgPassEnv},
-		Labels: map[string]string{"oddk.helper": "true"},
 	}
 
 	// Verify output directory exists
@@ -334,73 +243,30 @@ func backupDatabase(ctx context.Context, deps *Dependencies, instance *instances
 		return fmt.Errorf("output directory does not exist: %s", outputDir)
 	}
 
-	hostConfig := &container.HostConfig{
+	return runHelperContainer(ctx, deps, helperContainerSpec{
+		ContainerName: fmt.Sprintf("oddk-backup-db-%s-%s-%d", instance.Name, dbName, time.Now().Unix()),
+		Image:         image,
+		Cmd: []string{
+			"pg_dump",
+			"-Fd",     // Directory format
+			"-j", "4", // Parallel jobs
+			"-Z0", // No compression (we'll use zstd later)
+			"-h", util.GatewayIP,
+			"-p", fmt.Sprintf("%d", instance.Port),
+			"-U", "postgres",
+			"--file", "/backup",
+			dbName,
+		},
+		Password: password,
 		Mounts: []mount.Mount{
 			{
 				Type:   mount.TypeBind,
 				Source: outputDir,
 				Target: "/backup",
 			},
-			pgPassMount,
 		},
-	}
-
-	networkConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			"oddk-bridge": {},
-		},
-	}
-
-	resp, err := deps.Docker.GetDockerClient().ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
-	if err != nil {
-		return fmt.Errorf("create container: %w", err)
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = deps.Docker.GetDockerClient().ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
-	}()
-
-	if err := deps.Docker.GetDockerClient().ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("start container: %w", err)
-	}
-
-	// Wait for completion
-	statusCh, errCh := deps.Docker.GetDockerClient().ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("wait for container: %w", err)
-		}
-	case status := <-statusCh:
-		if status.StatusCode != 0 {
-			logs, logErr := getContainerLogs(ctx, deps, resp.ID)
-			if logErr != nil {
-				logs = fmt.Sprintf("<logs unavailable: %v>", logErr)
-			}
-			return fmt.Errorf("pg_dump failed with status %d: %s", status.StatusCode, logs)
-		}
-	}
-
-	return nil
-}
-
-func getContainerLogs(ctx context.Context, deps *Dependencies, containerID string) (string, error) {
-	reader, err := deps.Docker.GetDockerClient().ContainerLogs(ctx, containerID, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
+		Tool: "pg_dump",
 	})
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = reader.Close() }()
-
-	var stdout, stderr bytes.Buffer
-	if _, err := stdcopy.StdCopy(&stdout, &stderr, reader); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("stdout: %s\nstderr: %s", stdout.String(), stderr.String()), nil
 }
 
 // validatePortableDBName rejects database names that are unsafe to use as a

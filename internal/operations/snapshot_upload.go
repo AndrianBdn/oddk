@@ -22,11 +22,11 @@ import (
 // SDK failure at the end of a long upload into an actionable refusal.
 const maxPutObjectBytes int64 = 5 * 1024 * 1024 * 1024
 
-// snapshotS3Prefix is the first key segment for snapshots, mirroring how a
+// SnapshotS3Prefix is the first key segment for snapshots, mirroring how a
 // backup's key starts with its instance name. Snapshots belong to no single
 // instance, and "*" cannot collide with a real one because instance names are
 // restricted to letters, digits, '-' and '_'.
-const snapshotS3Prefix = "*snapshots*"
+const SnapshotS3Prefix = "*snapshots*"
 
 // UploadSnapshotResult describes a completed offsite upload.
 type UploadSnapshotResult struct {
@@ -96,7 +96,7 @@ func UploadSnapshot(ctx context.Context, deps *Dependencies, id int) (*UploadSna
 	// S3 forever, invisible to ODDK and to remote retention (which works off the
 	// recorded location). Deriving the key from CreatedAt makes upload
 	// idempotent — a retry targets the same key and overwrites it.
-	s3Key := fmt.Sprintf("%s/%s/%s", snapshotS3Prefix, record.CreatedAt.Format("2006-01-02"), filename)
+	s3Key := fmt.Sprintf("%s/%s/%s", SnapshotS3Prefix, record.CreatedAt.Format("2006-01-02"), filename)
 
 	exists, err := s3Client.FileExists(ctx, s3Key)
 	if err != nil {

@@ -10,17 +10,12 @@ import (
 	"testing"
 
 	"github.com/andrianbdn/oddk/internal/rfc3339time"
-	"github.com/andrianbdn/oddk/internal/store"
 	backupstore "github.com/andrianbdn/oddk/internal/store/backup"
 )
 
 func dropAllFixture(t *testing.T) (*Dependencies, string) {
 	t.Helper()
-	dataDir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dataDir, "oddk.db"), dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st, dataDir := newTestStore(t)
 	deps := &Dependencies{
 		Store:   st,
 		DataDir: dataDir,

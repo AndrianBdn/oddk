@@ -10,13 +10,9 @@ import (
 // Simulates an existing deployment upgrading: open the store (applies 001-017),
 // close, reopen (must be a no-op), and confirm 017 is recorded exactly once.
 func TestMigration017UpgradePath(t *testing.T) {
-	dir := t.TempDir()
+	st, dir := newTestStoreDir(t)
 	dbPath := filepath.Join(dir, "oddk.db")
 
-	st, err := store.NewStore(dbPath, dir)
-	if err != nil {
-		t.Fatalf("first open: %v", err)
-	}
 	// Pre-existing data must survive the new migration.
 	if _, err := st.Instances.Create("legacy", 5432, "17", "enc", "", 1, 512, "default", "postgres:17"); err != nil {
 		t.Fatal(err)

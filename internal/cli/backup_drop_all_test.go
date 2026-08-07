@@ -1,25 +1,18 @@
 package cli_test
 
 import (
-	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
-
-	"github.com/andrianbdn/oddk/internal/cli"
 )
 
 // fakeDropAllDaemon serves the endpoints 'backup dangerously-drop-all'
 // composes. The one that matters is DELETE /api/backups: a preview run must
 // never issue it.
 type fakeDropAllDaemon struct {
-	mu           sync.Mutex
-	calls        []string
+	fakeDaemon
 	backupsRaw   string
 	plansRaw     string
 	checklistRaw string
@@ -27,45 +20,8 @@ type fakeDropAllDaemon struct {
 	deleteRaw    string
 }
 
-func (f *fakeDropAllDaemon) record(method, path string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, method+" "+path)
-}
-
-func (f *fakeDropAllDaemon) recorded() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.calls...)
-}
-
-func (f *fakeDropAllDaemon) start(t *testing.T) []string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.record(r.Method, r.URL.Path)
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.Method == "GET" && r.URL.Path == "/api/backups":
-			_, _ = w.Write([]byte(f.backupsRaw))
-		case r.Method == "GET" && r.URL.Path == "/api/cron/backup":
-			_, _ = w.Write([]byte(f.plansRaw))
-		case r.Method == "GET" && r.URL.Path == "/api/checklist":
-			_, _ = w.Write([]byte(f.checklistRaw))
-		case r.Method == "GET" && r.URL.Path == "/api/offsite":
-			_, _ = w.Write([]byte(f.offsiteRaw))
-		case r.Method == "DELETE" && r.URL.Path == "/api/backups":
-			_, _ = w.Write([]byte(f.deleteRaw))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error": "not found"}`))
-		}
-	}))
-	t.Cleanup(srv.Close)
-	return []string{fmt.Sprintf("ODDK_CLI_CONFIG=%s", writeTestConfig(t, srv.URL))}
-}
-
 func defaultDropAllDaemon() *fakeDropAllDaemon {
-	return &fakeDropAllDaemon{
+	f := &fakeDropAllDaemon{
 		// "ghost" is destroyed (absent from the checklist) — its records are
 		// the reason the sweep is a daemon endpoint at all.
 		backupsRaw: `[
@@ -81,13 +37,29 @@ func defaultDropAllDaemon() *fakeDropAllDaemon {
 			"remoteObjectsDeleted": 0, "remoteRefsDroppedNoOffsite": 2,
 			"errors": [], "message": "Dropped 3 of 3 backup record(s)"}`,
 	}
+	f.handle = func(w http.ResponseWriter, r *http.Request) bool {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/backups":
+			_, _ = w.Write([]byte(f.backupsRaw))
+		case r.Method == "GET" && r.URL.Path == "/api/cron/backup":
+			_, _ = w.Write([]byte(f.plansRaw))
+		case r.Method == "GET" && r.URL.Path == "/api/checklist":
+			_, _ = w.Write([]byte(f.checklistRaw))
+		case r.Method == "GET" && r.URL.Path == "/api/offsite":
+			_, _ = w.Write([]byte(f.offsiteRaw))
+		case r.Method == "DELETE" && r.URL.Path == "/api/backups":
+			_, _ = w.Write([]byte(f.deleteRaw))
+		default:
+			return false
+		}
+		return true
+	}
+	return f
 }
 
 func runDropAll(t *testing.T, env []string, args ...string) (string, error) {
 	t.Helper()
-	var buf bytes.Buffer
-	err := cli.Run(append([]string{"oddk", "backup", "dangerously-drop-all"}, args...), env, &buf)
-	return buf.String(), err
+	return runCLI(t, env, append([]string{"backup", "dangerously-drop-all"}, args...)...)
 }
 
 func TestDropAll_PreviewChangesNothing(t *testing.T) {

@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/andrianbdn/oddk/internal/rfc3339time"
-	"github.com/andrianbdn/oddk/internal/store"
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
@@ -153,17 +152,6 @@ func TestSnapshotRecordLocationInvariant(t *testing.T) {
 	}
 }
 
-func newTestStore(t *testing.T) *store.Store {
-	t.Helper()
-	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Sqlx.Close() })
-	return st
-}
-
 // TestSnapshotReconcileLocalLocations covers the post-`snapshot apply` fixup.
 //
 // A restored oddk.db carries the SOURCE host's absolute paths and the archive
@@ -237,5 +225,76 @@ func TestSnapshotReconcileLocalLocations(t *testing.T) {
 	}
 	if referenced["snapshot-unmanaged-20260101000003.tar.zst"] {
 		t.Error("ReferencedFilenames claims an unmanaged archive is referenced")
+	}
+}
+
+// TestSnapshotReconcileIgnoresDownloadsDir pins a contract that used to be
+// implicit: ReconcileLocalLocations resolves records against the backup dir's
+// TOP LEVEL only. The managed downloads area (backupDir/downloads/) holds
+// deliberately uncatalogued archives, and a reconcile that descended into it
+// would re-point catalogue rows at files whose lifecycle is a 7-day TTL sweep
+// — turning managed local copies into ones that silently evaporate.
+func TestSnapshotReconcileIgnoresDownloadsDir(t *testing.T) {
+	st := newTestStore(t)
+	backupDir := t.TempDir()
+
+	name := "snapshot-oldhost-20260201000000.tar.zst"
+	if err := os.MkdirAll(filepath.Join(backupDir, "downloads"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "downloads", name), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &snapshotstore.Record{
+		Filename: name, CreatedAt: rfc3339time.Now(), Status: "completed",
+		LocalPath: "/srv/oldhost/backups/" + name,
+	}
+	if err := st.Snapshot.RecordSnapshot(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Snapshot.SetRemoteLocation(rec.ID, "s3://bucket/"+name); err != nil {
+		t.Fatal(err)
+	}
+
+	repointed, cleared, _, err := st.Snapshot.ReconcileLocalLocations(backupDir)
+	if err != nil {
+		t.Fatalf("ReconcileLocalLocations: %v", err)
+	}
+	if repointed != 0 || cleared != 1 {
+		t.Errorf("repointed/cleared = %d/%d, want 0/1 (file exists only under downloads/)", repointed, cleared)
+	}
+}
+
+// TestSnapshotFindByRemoteLocation pins the restore-by-URI shortcut: a URI
+// that IS a catalogue row's remote copy resolves to that row, so the archive
+// is materialized as the row's managed local copy instead of a second,
+// unmanaged download.
+func TestSnapshotFindByRemoteLocation(t *testing.T) {
+	st := newTestStore(t)
+
+	rec := &snapshotstore.Record{
+		Filename: "snapshot-host-20260301000000.tar.zst", CreatedAt: rfc3339time.Now(), Status: "completed",
+		LocalPath: "/backups/snapshot-host-20260301000000.tar.zst",
+	}
+	if err := st.Snapshot.RecordSnapshot(rec); err != nil {
+		t.Fatal(err)
+	}
+	loc := "s3://bucket/oddk/*snapshots*/2026-03-01/snapshot-host-20260301000000.tar.zst"
+	if err := st.Snapshot.SetRemoteLocation(rec.ID, loc); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.Snapshot.FindByRemoteLocation(loc)
+	if err != nil {
+		t.Fatalf("FindByRemoteLocation: %v", err)
+	}
+	if got == nil || got.ID != rec.ID {
+		t.Fatalf("FindByRemoteLocation = %+v, want record %d", got, rec.ID)
+	}
+
+	miss, err := st.Snapshot.FindByRemoteLocation("s3://bucket/nothing.tar.zst")
+	if err != nil || miss != nil {
+		t.Errorf("miss = (%v, %v), want (nil, nil)", miss, err)
 	}
 }

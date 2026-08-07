@@ -1,14 +1,9 @@
 package cli_test
 
 import (
-	"bytes"
-	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/andrianbdn/oddk/internal/cli"
 )
 
 // The fixture is a plausible daemon response: snapshot #7 is the newest
@@ -91,30 +86,25 @@ const checklistFixture = `{
 	}
 }`
 
-func newChecklistServer(t *testing.T, fixture string) (*httptest.Server, []string) {
+func newChecklistServer(t *testing.T, fixture string) []string {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	f := &fakeDaemon{handle: func(w http.ResponseWriter, r *http.Request) bool {
 		if r.URL.Path != "/api/checklist" {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error": "not found"}`))
-			return
+			return false
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(fixture))
-	}))
-	env := []string{fmt.Sprintf("ODDK_CLI_CONFIG=%s", writeTestConfig(t, server.URL))}
-	return server, env
+		return true
+	}}
+	return f.start(t)
 }
 
 func TestChecklistAction_BlockOutput(t *testing.T) {
-	server, env := newChecklistServer(t, checklistFixture)
-	defer server.Close()
+	env := newChecklistServer(t, checklistFixture)
 
-	var buf bytes.Buffer
-	if err := cli.Run([]string{"oddk", "checklist"}, env, &buf); err != nil {
+	out, err := runCLI(t, env, "checklist")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	out := buf.String()
 
 	for _, want := range []string{
 		"Overall health: degraded (last check 2026-07-08T11:59:00Z)",
@@ -181,14 +171,12 @@ func TestChecklistAction_NoSnapshots(t *testing.T) {
 		"snapshots": {"scheduled": false, "total": 0, "copies": {}},
 		"notifications": {"configured": []}
 	}`
-	server, env := newChecklistServer(t, fixture)
-	defer server.Close()
+	env := newChecklistServer(t, fixture)
 
-	var buf bytes.Buffer
-	if err := cli.Run([]string{"oddk", "checklist"}, env, &buf); err != nil {
+	out, err := runCLI(t, env, "checklist")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	out := buf.String()
 
 	for _, want := range []string{
 		"no completed snapshots",
@@ -202,14 +190,12 @@ func TestChecklistAction_NoSnapshots(t *testing.T) {
 }
 
 func TestChecklistAction_JSONOutput(t *testing.T) {
-	server, env := newChecklistServer(t, checklistFixture)
-	defer server.Close()
+	env := newChecklistServer(t, checklistFixture)
 
-	var buf bytes.Buffer
-	if err := cli.Run([]string{"oddk", "checklist", "--json"}, env, &buf); err != nil {
+	out, err := runCLI(t, env, "checklist", "--json")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	out := buf.String()
 
 	if !strings.Contains(out, `"generatedAt": "2026-07-08T12:00:00Z"`) {
 		t.Errorf("expected pretty-printed JSON, got:\n%s", out)
@@ -220,17 +206,14 @@ func TestChecklistAction_JSONOutput(t *testing.T) {
 }
 
 func TestChecklistAction_DaemonError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+	f := &fakeDaemon{handle: func(w http.ResponseWriter, r *http.Request) bool {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error": "failed to build checklist: boom"}`))
-	}))
-	defer server.Close()
+		return true
+	}}
+	env := f.start(t)
 
-	env := []string{fmt.Sprintf("ODDK_CLI_CONFIG=%s", writeTestConfig(t, server.URL))}
-
-	var buf bytes.Buffer
-	err := cli.Run([]string{"oddk", "checklist"}, env, &buf)
+	_, err := runCLI(t, env, "checklist")
 	if err == nil {
 		t.Fatal("expected error from daemon")
 	}

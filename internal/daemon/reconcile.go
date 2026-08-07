@@ -140,6 +140,16 @@ func sweepBackupDir(st *store.Store, backupDir string) {
 		log.Printf("Removed %d stale temp artifact(s) from backup directory (interrupted backup/restore/upgrade)", removed)
 	}
 
+	// The managed downloads area holds archives fetched from S3 that no
+	// catalogue row references; everything in it is re-fetchable, so aged
+	// entries are pruned rather than warned about. (The scheduler re-runs this
+	// daily for daemons that stay up for months.)
+	if pruned, err := operations.SweepSnapshotDownloads(backupDir); err != nil {
+		log.Printf("Warning: snapshot downloads sweep skipped: %v", err)
+	} else if pruned > 0 {
+		log.Printf("Pruned %d aged archive(s) from the snapshot downloads area (re-fetchable from S3)", pruned)
+	}
+
 	// ListAllBackups validates every record against the filesystem and deletes
 	// orphaned records as a side effect; until now that only happened when
 	// someone listed backups.

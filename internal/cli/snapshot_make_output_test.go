@@ -1,30 +1,22 @@
 package cli_test
 
 import (
-	"bytes"
-	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/andrianbdn/oddk/internal/cli"
 )
 
 func runSnapshotMake(t *testing.T, response string) string {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+	f := &fakeDaemon{handle: func(w http.ResponseWriter, r *http.Request) bool {
 		_, _ = w.Write([]byte(response))
-	}))
-	t.Cleanup(srv.Close)
-
-	env := []string{fmt.Sprintf("ODDK_CLI_CONFIG=%s", writeTestConfig(t, srv.URL))}
-	var buf bytes.Buffer
-	if err := cli.Run([]string{"oddk", "snapshot", "make"}, env, &buf); err != nil {
+		return true
+	}}
+	out, err := runCLI(t, f.start(t), "snapshot", "make")
+	if err != nil {
 		t.Fatalf("snapshot make: %v", err)
 	}
-	return buf.String()
+	return out
 }
 
 // The per-instance list already names every instance, so "N with data, 0

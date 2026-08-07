@@ -55,6 +55,9 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	// deployment stays up, so it needs the executor and the health-check pause.
 	mux.HandleFunc("POST /api/snapshot/restore-instance", s.withAuth(s.handleSnapshotRestoreInstance))
 	mux.HandleFunc("GET /api/snapshots", s.withAuth(s.handleSnapshotList))
+	// The BUCKET's inventory under the ODDK snapshot layout, as opposed to this
+	// host's catalogue — it also shows archives whose rows died with another host.
+	mux.HandleFunc("GET /api/snapshots/remote", s.withAuth(s.handleSnapshotListRemote))
 	mux.HandleFunc("POST /api/snapshot/{id}/upload", s.withAuth(s.handleSnapshotUpload))
 	mux.HandleFunc("POST /api/snapshot/{id}/download", s.withAuth(s.handleSnapshotDownload))
 	mux.HandleFunc("DELETE /api/snapshot/{id}/local", s.withAuth(s.handleSnapshotRemoveLocal))

@@ -9,15 +9,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/operr"
 	"github.com/andrianbdn/oddk/internal/store/instances"
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 // RestoreRDBMSParams contains parameters for restoring a database from backup
@@ -273,30 +272,19 @@ func listDatabasesInBackup(extractedDir string) []string {
 
 // runPgRestore executes pg_restore in an ephemeral container
 func runPgRestore(ctx context.Context, deps *Dependencies, instance *instances.RDBMSInstance, password, dbDir, targetDB string) error {
-	containerName := fmt.Sprintf("oddk-restore-%s-%d", instance.Name, time.Now().Unix())
-
-	uid := os.Getuid()
-	gid := os.Getgid()
-
 	image := instance.Image
 	if image == "" {
 		image = fmt.Sprintf("postgres:%s", instance.Version)
 	}
 
-	pgPassMount, pgPassEnv, cleanup, err := newPgPassMount(deps.BackupDir, password)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	config := &container.Config{
-		Image: image,
-		User:  fmt.Sprintf("%d:%d", uid, gid),
+	return runHelperContainer(ctx, deps, helperContainerSpec{
+		ContainerName: fmt.Sprintf("oddk-restore-%s-%d", instance.Name, time.Now().Unix()),
+		Image:         image,
 		Cmd: []string{
 			"pg_restore",
 			"-Fd",          // Directory format
 			"-d", targetDB, // Target database
-			"-h", "10.88.0.1", // Gateway IP
+			"-h", util.GatewayIP,
 			"-p", fmt.Sprintf("%d", instance.Port),
 			"-U", "postgres",
 			"--no-owner",      // Skip ownership
@@ -304,11 +292,7 @@ func runPgRestore(ctx context.Context, deps *Dependencies, instance *instances.R
 			"-j", "4",         // Parallel jobs
 			"/backup", // Mount point
 		},
-		Env:    []string{pgPassEnv},
-		Labels: map[string]string{"oddk.helper": "true"},
-	}
-
-	hostConfig := &container.HostConfig{
+		Password: password,
 		Mounts: []mount.Mount{
 			{
 				Type:     mount.TypeBind,
@@ -316,48 +300,9 @@ func runPgRestore(ctx context.Context, deps *Dependencies, instance *instances.R
 				Target:   "/backup",
 				ReadOnly: true,
 			},
-			pgPassMount,
 		},
-	}
-
-	networkConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			"oddk-bridge": {},
-		},
-	}
-
-	resp, err := deps.Docker.GetDockerClient().ContainerCreate(ctx, config, hostConfig, networkConfig, nil, containerName)
-	if err != nil {
-		return fmt.Errorf("create container: %w", err)
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = deps.Docker.GetDockerClient().ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
-	}()
-
-	if err := deps.Docker.GetDockerClient().ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("start container: %w", err)
-	}
-
-	// Wait for completion
-	statusCh, errCh := deps.Docker.GetDockerClient().ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("wait for container: %w", err)
-		}
-	case status := <-statusCh:
-		if status.StatusCode != 0 {
-			logs, logErr := getContainerLogs(ctx, deps, resp.ID)
-			if logErr != nil {
-				logs = fmt.Sprintf("<logs unavailable: %v>", logErr)
-			}
-			return fmt.Errorf("pg_restore failed with status %d: %s", status.StatusCode, logs)
-		}
-	}
-
-	return nil
+		Tool: "pg_restore",
+	})
 }
 
 // restoreDatabaseCreateGrants reapplies captured CREATE privileges to roles

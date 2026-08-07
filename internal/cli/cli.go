@@ -35,7 +35,9 @@ func Run(args, env []string, out io.Writer) error {
 	//   - --version/--help (and a bare `oddk`) are purely informational; a
 	//     missing token is irrelevant to them and the nudge is just noise.
 	if localOnlyInvocation(args) {
-		app := BuildApp(&Client{out: out})
+		// envMap must still be populated: local-only commands with confirmation
+		// prompts (snapshot apply) honour ODDK_SKIP_CONFIRM through it.
+		app := BuildApp(&Client{out: out, envMap: parseEnv(env)})
 		app.Writer = out
 		return app.Run(context.Background(), args)
 	}
@@ -46,7 +48,7 @@ func Run(args, env []string, out io.Writer) error {
 		// If it's just missing auth token, don't fail but print help
 		if strings.Contains(err.Error(), "auth token not configured") {
 			// Continue with nil client for help display
-			client = &Client{out: out}
+			client = &Client{out: out, envMap: parseEnv(env)}
 		} else {
 			return fmt.Errorf("failed to initialize client: %w", err)
 		}
@@ -75,6 +77,30 @@ func localOnlyInvocation(args []string) bool {
 		"--version", "-v",
 		"--help", "-h", "help":
 		return true
+	case "snapshot":
+		if len(args) <= 2 {
+			return false
+		}
+		// `snapshot apply` runs daemon-less by design — disaster recovery must
+		// work when the daemon cannot start — so the missing-token nudge is
+		// pure noise on the one host guaranteed not to have a token yet: a
+		// freshly installed DR host.
+		if args[2] == "apply" {
+			return true
+		}
+		// `snapshot list-remote s3://...` is equally daemon-less (only its
+		// zero-arg form talks to the daemon). Going through NewClient here
+		// would nudge on a tokenless DR host — and an invalid stale CLI config
+		// would fail outright the one command that host runs FIRST. An s3://
+		// argument is unambiguous, so sniffing argv for it is safe.
+		if args[2] == "list-remote" {
+			for _, arg := range args[3:] {
+				if strings.HasPrefix(arg, "s3://") {
+					return true
+				}
+			}
+		}
+		return false
 	}
 	return false
 }

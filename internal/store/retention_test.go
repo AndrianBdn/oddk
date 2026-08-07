@@ -18,15 +18,9 @@ import (
 func retentionFixture(t *testing.T) (*store.Store, *sqlx.DB) {
 	t.Helper()
 
-	dataDir := t.TempDir()
-	dbPath := filepath.Join(dataDir, "oddk.db")
+	st, dataDir := newTestStoreDir(t)
 
-	st, err := store.NewStore(dbPath, dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	raw, err := sqlx.Open("sqlite", dbPath)
+	raw, err := sqlx.Open("sqlite", filepath.Join(dataDir, "oddk.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

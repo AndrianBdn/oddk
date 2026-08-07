@@ -31,6 +31,11 @@ type Server struct {
 	healthScheduler *HealthScheduler
 	cancel          context.CancelFunc // Just keep cancel func to stop background processes
 
+	// lastDownloadsSweep is when the snapshot downloads area was last pruned.
+	// Touched only by the scheduler goroutine (startup counts as a sweep), so
+	// it needs no lock.
+	lastDownloadsSweep time.Time
+
 	// dirLock is the exclusive advisory lock on the data directory, held for
 	// the daemon's lifetime so 'snapshot apply' cannot run concurrently.
 	dirLock *store.DataDirLock
@@ -137,6 +142,9 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 		cronTracker:     cronTracker,
 		healthScheduler: healthScheduler,
 		dirLock:         dirLock,
+		// sweepBackupDir above just pruned the downloads area; the next sweep
+		// is due a day from now.
+		lastDownloadsSweep: time.Now(),
 	}, nil
 }
 

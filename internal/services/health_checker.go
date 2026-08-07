@@ -18,6 +18,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/instances"
 	"github.com/andrianbdn/oddk/internal/store/kvstore"
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 type connectionEntry struct {
@@ -435,8 +436,8 @@ func (hc *HealthChecker) checkInstanceHealth(ctx context.Context, instance *inst
 	}
 
 	// Build connection string using the correct pattern with sslmode=disable
-	connStr := fmt.Sprintf("postgres://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable",
-		password, instance.Port)
+	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/postgres?sslmode=disable",
+		password, util.GatewayIP, instance.Port)
 
 	// Get or create cached connection
 	// getOrCreateConnection already validates the connection with ping, so no need to ping again

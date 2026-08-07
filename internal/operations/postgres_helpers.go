@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrianbdn/oddk/internal/operr"
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 // quotePostgresLiteral wraps s in single quotes and doubles any embedded
@@ -58,8 +59,8 @@ func ConnectToRunningInstance(ctx context.Context, deps *Dependencies, instanceN
 		database = opts[0].Database
 	}
 
-	connStr := fmt.Sprintf("postgres://postgres:%s@10.88.0.1:%d/%s?sslmode=disable",
-		password, instance.Port, database)
+	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/%s?sslmode=disable",
+		password, util.GatewayIP, instance.Port, database)
 
 	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
@@ -86,8 +87,8 @@ func TestPostgreSQLConnectivity(ctx context.Context, deps *Dependencies, instanc
 	}
 
 	// Optimistically try PostgreSQL connection first
-	connStr := fmt.Sprintf("postgres://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable",
-		password, instance.Port)
+	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/postgres?sslmode=disable",
+		password, util.GatewayIP, instance.Port)
 
 	pgConn, err := pgx.Connect(checkCtx, connStr)
 	if err != nil {
@@ -101,7 +102,7 @@ func TestPostgreSQLConnectivity(ctx context.Context, deps *Dependencies, instanc
 		}
 
 		// Check if we can connect to the port (network layer)
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("10.88.0.1:%d", instance.Port), 3*time.Second)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", util.GatewayIP, instance.Port), 3*time.Second)
 		if err != nil {
 			return PostgreSQLStatusBrokenPort
 		}
@@ -128,8 +129,8 @@ func TestPostgreSQLConnectivityWithPassword(ctx context.Context, port int, passw
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	connStr := fmt.Sprintf("postgres://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable",
-		password, port)
+	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/postgres?sslmode=disable",
+		password, util.GatewayIP, port)
 
 	// Try to connect with the provided password
 	pgConn, err := pgx.Connect(checkCtx, connStr)
@@ -140,7 +141,7 @@ func TestPostgreSQLConnectivityWithPassword(ctx context.Context, port int, passw
 		}
 
 		// Check if we can connect to the port (network layer)
-		conn, netErr := net.DialTimeout("tcp", fmt.Sprintf("10.88.0.1:%d", port), 3*time.Second)
+		conn, netErr := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", util.GatewayIP, port), 3*time.Second)
 		if netErr != nil {
 			return fmt.Errorf("PostgreSQL port %d is not accessible", port)
 		}

@@ -296,20 +296,35 @@ oddk snapshot remove-local <id>
 oddk snapshot remove-remote <id>
 ```
 
-Restoring comes in two shapes:
+Restoring comes in three shapes:
 
 ```bash
-# Rebuild ONE instance into a deployment that stays up.
-# Creates it if it is gone; replaces its data if it is still there.
+# 1. Rebuild ONE instance into a deployment that stays up, from a local file.
+#    Creates it if it is gone; replaces its data if it is still there.
 oddk snapshot restore-instance --instance app --file snapshot-db01-20260729140312.tar.zst
 
-# Rebuild a WHOLE HOST — migration or disaster recovery.
-# Runs locally, not through the daemon, so it works when the daemon cannot start.
+# 2. The same, straight from S3 — no manual download step.
+oddk snapshot restore-instance --instance app --id 7   # this host's catalogue; downloads
+                                                       # from S3 if the local copy is gone
+oddk snapshot restore-instance --instance app \
+      --s3-uri 's3://bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst' \
+      --master-key /mnt/restore/master.key             # another deployment's snapshot
+# Find URIs with `oddk snapshot list-remote` — it lists what is actually in the
+# bucket, including snapshots whose records died with another host.
+
+# 3. Rebuild a WHOLE HOST — migration or disaster recovery.
+#    Runs locally, not through the daemon, so it works when the daemon cannot start.
 systemctl stop oddk
 sudo -u oddk oddk snapshot apply \
       --file /mnt/restore/snapshot-db01-20260729140312.tar.zst \
       --master-key /mnt/restore/master.key
 systemctl start oddk
+
+# apply can also fetch the archive itself, using this shell's AWS credentials —
+# see "Disaster recovery from S3" below for the full walkthrough.
+sudo -u oddk oddk snapshot apply \
+      --s3-uri 's3://bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst' \
+      --master-key /mnt/restore/master.key
 ```
 
 What you need to know:
@@ -376,6 +391,72 @@ to run across a fleet. Add `--dry-run` to preview, `--yes` to skip the prompt, a
 This is a transitional command. Per-instance `backup` itself is unaffected — it
 is still the only way to restore or clone a **single database**.
 
+#### Disaster recovery from S3
+
+A dead host's snapshots live in the bucket; the replacement host starts with
+nothing — no ODDK state, no CLI token, no AWS tooling. `snapshot list-remote`
+and `snapshot apply --s3-uri` are built for exactly that: both run without a
+daemon and without a token, using the plain AWS credentials of the shell they
+run in, so you never have to install and configure a second S3 tool mid-outage.
+
+**1. Install ODDK** on the new host (the same curl installer as above). It
+starts a fresh empty daemon — that's fine, `apply` handles the fresh-install
+collision itself.
+
+**2. Get AWS credentials to the `oddk` user**, who runs the apply. Three
+options, best first:
+
+- **EC2 instance role** — zero configuration. If the host's role can read the
+  bucket, `sudo -u oddk oddk snapshot apply ...` just works.
+- **Environment variables** — `sudo` strips `AWS_*` from the environment, so
+  pass them through explicitly (never put secrets on the command line itself —
+  they would be visible in the process list):
+
+  ```bash
+  sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION \
+       -u oddk oddk snapshot apply --s3-uri '...' --master-key /mnt/restore/master.key
+  ```
+
+- **A credentials file for the `oddk` user** — write a standard
+  `[default]` credentials file with your editor, install it, and destroy both
+  copies when done:
+
+  ```bash
+  sudo install -d -o oddk -m 700 ~oddk/.aws
+  sudo install -o oddk -m 600 /tmp/creds ~oddk/.aws/credentials && shred -u /tmp/creds
+  # ... run the restore ...
+  sudo shred -u ~oddk/.aws/credentials
+  ```
+
+**3. Find the snapshot.** With an explicit URI, `list-remote` lists the bucket
+directly — newest first, with ready-to-paste URIs:
+
+```bash
+oddk snapshot list-remote s3://my-backup-bucket/oddk-backups/
+```
+
+**4. Apply it, start, audit:**
+
+```bash
+systemctl stop oddk
+sudo -u oddk oddk snapshot apply \
+      --s3-uri 's3://my-backup-bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst' \
+      --master-key /mnt/restore/master.key
+systemctl start oddk
+oddk checklist
+```
+
+The archive is downloaded into a managed `downloads/` area under the backup
+directory before anything is touched — a failed apply keeps it there for the
+retry (re-running with the same `--s3-uri` reuses it), and it is pruned
+automatically after 7 days.
+
+> **You still need `master.key`, and it is deliberately *not* in the bucket** —
+> an archive and its key stored together would defeat the encryption of the
+> secrets inside. And remember that **snapshots themselves are not encrypted**:
+> they hold database contents and role password hashes in plaintext, so guard
+> bucket access accordingly.
+
 ### Offsite storage (S3)
 
 One S3 configuration serves the whole deployment — snapshot uploads and legacy
@@ -386,9 +467,57 @@ oddk offsite apply --file offsite.json   # see `oddk offsite get` for the templa
 oddk offsite test
 ```
 
+The configuration JSON (`oddk offsite get` prints a template when none is
+configured):
+
+```json
+{
+  "type": "s3",
+  "bucket": "my-backup-bucket",
+  "region": "us-east-1",
+  "accessKeyId": "YOUR_ACCESS_KEY_ID",
+  "secretAccessKey": "YOUR_SECRET_ACCESS_KEY",
+  "bucketPath": "oddk-backups/",
+  "ec2IamRole": false
+}
+```
+
+- **`type`** — only `"s3"` is supported.
+- **`bucket`** — required.
+- **`region` / `endpoint`** — at least one must be set, so requests are never
+  signed for a guessed location. Set `endpoint` (an `http(s)` URL) for
+  S3-compatible storage; it also switches the client to path-style addressing,
+  which most compatible services require.
+- **`accessKeyId` / `secretAccessKey`** — required unless `ec2IamRole` is
+  `true`. The secret is encrypted at rest with the master key; on later
+  `offsite get` calls it is shown as a placeholder, never echoed back.
+- **`ec2IamRole`** — set `true` (and leave both keys empty) to authenticate
+  with the host's EC2 instance role instead, so no long-lived secret exists on
+  disk at all.
+- **`bucketPath`** — optional key prefix. It must end with `/` (e.g.
+  `oddk-backups/`), must not start with `/`, and may not contain `//` or
+  `.`/`..` segments — so a malformed prefix can't scatter uploads across the
+  bucket root. Empty means the bucket root.
+
 When offsite is configured, each scheduled snapshot run uploads the new
 snapshot, retries earlier failed uploads, and then applies retention — and
 local retention never deletes an archive whose only copy is local.
+
+**Stored settings and ambient credentials are two separate paths.** Everything
+the *daemon* does offsite — scheduled uploads, `snapshot upload`/`download`,
+the zero-argument `snapshot list-remote`, and `restore-instance --id` — uses
+the stored configuration above. The *daemon-less* commands
+(`snapshot list-remote s3://...` and `snapshot apply --s3-uri`) instead use
+whatever AWS credentials their shell has (env vars, an `~/.aws` profile, an EC2
+instance role), because a disaster-recovery host has no stored settings yet —
+they live inside the snapshot it is trying to restore.
+`snapshot restore-instance --s3-uri` bridges the two: the CLI resolves your
+shell's credentials and passes them along, and the daemon prefers its own
+offsite settings whenever the bucket matches.
+
+Archives fetched by URI land in a managed `downloads/` area under the backup
+directory and are pruned after 7 days; everything there is re-fetchable from
+S3, so deleting it never loses data.
 
 ### Legacy: per-instance backups
 

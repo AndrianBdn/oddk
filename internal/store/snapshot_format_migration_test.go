@@ -14,12 +14,7 @@ import (
 // COLUMN backfill IS the default, so inserting rows without the column proves
 // exactly what upgraded rows will report.
 func TestMigration018FormatDefaults(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = st.Sqlx.Close() }()
+	st := newTestStore(t)
 
 	st.Sqlx.MustExec(`
 		INSERT INTO snapshot_plans (id, utc_hour, interval_hours, cleanup_local_days, cleanup_remote_days, created_at, updated_at)
@@ -57,13 +52,9 @@ func TestMigration018FormatDefaults(t *testing.T) {
 // Same shape as TestMigration017UpgradePath: reopening must be a no-op and 018
 // must be recorded exactly once.
 func TestMigration018UpgradePath(t *testing.T) {
-	dir := t.TempDir()
+	st, dir := newTestStoreDir(t)
 	dbPath := filepath.Join(dir, "oddk.db")
 
-	st, err := store.NewStore(dbPath, dir)
-	if err != nil {
-		t.Fatalf("first open: %v", err)
-	}
 	if err := st.Snapshot.SetPlan(4, 12, 9, 30, "logical"); err != nil {
 		t.Fatal(err)
 	}

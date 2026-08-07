@@ -28,10 +28,6 @@ import (
 	"github.com/andrianbdn/oddk/internal/version"
 )
 
-// gatewayIP is the oddk-bridge gateway that every instance binds to. It is
-// host-local, so an answer on it means that port is genuinely taken here.
-const gatewayIP = "10.88.0.1"
-
 // SnapshotApplyParams configures a whole-deployment restore.
 type SnapshotApplyParams struct {
 	ArchivePath   string
@@ -494,7 +490,7 @@ func checkPortsAvailable(instances []*InstanceMeta) error {
 		// Instances bind the bridge gateway, which is host-local. If the bridge
 		// does not exist yet the dial simply fails, which is the correct answer:
 		// nothing can be listening there.
-		addr := net.JoinHostPort(gatewayIP, strconv.Itoa(meta.Port))
+		addr := net.JoinHostPort(util.GatewayIP, strconv.Itoa(meta.Port))
 		conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()

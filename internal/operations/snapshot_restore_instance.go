@@ -40,6 +40,15 @@ type RestoreInstanceParams struct {
 	// instance from a snapshot this same host took.
 	MasterKeyPath string
 
+	// ForeignSource marks an archive that did NOT come from this host's own
+	// snapshot catalogue (an s3Uri fetch with no matching catalogue row). Such
+	// a restore must never backdate created_at for checklist coverage — this
+	// host's snapshots do not hold that data, so "not yet captured" is the
+	// truthful verdict. MasterKeyPath already implies foreignness, but a
+	// cloned-master-key fleet (or a deleted catalogue row) can be foreign
+	// without needing a key, which is the hole this flag closes.
+	ForeignSource bool
+
 	BackupDir string
 
 	// Progress receives human-readable lines. Nil is fine (emitLine no-ops).
@@ -73,6 +82,12 @@ type RestoreInstanceResult struct {
 	// the snapshot was taken, and the restore reproduces that (after starting
 	// once to verify the cluster actually recovers).
 	FinalStatus string `json:"finalStatus"`
+
+	// ArchiveOrigin reports where the archive came from (a daemon-side path,
+	// the catalogue, or an S3 fetch). Set by the caller that resolved the
+	// source, not by RestoreInstanceFromSnapshot, which only ever sees a local
+	// path.
+	ArchiveOrigin *ArchiveOrigin `json:"archiveOrigin,omitempty"`
 }
 
 // RestoreInstanceFromSnapshot rebuilds one instance from a snapshot archive.
@@ -327,9 +342,10 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	// the archive it came from instead of reporting it "not yet captured".
 	//
 	// Two deliberate exclusions: an older row is never forward-dated, and a
-	// FOREIGN deployment's archive (MasterKeyPath set) never backdates — this
-	// host's own snapshots do not hold the foreign data, so "not yet captured"
-	// is the truthful verdict until the next local capture.
+	// FOREIGN archive (MasterKeyPath set, or ForeignSource — an s3Uri fetch
+	// with no matching catalogue row) never backdates — this host's own
+	// snapshots do not hold the foreign data, so "not yet captured" is the
+	// truthful verdict until the next local capture.
 	//
 	// Runs in a success-only defer: a failed restore may have destroyed a
 	// younger cluster whose data the archive does NOT hold, so it must not
@@ -338,7 +354,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	// RecordSnapshot's catalogue write).
 	rowYoungerThanArchive := existing == nil || existing.CreatedAt.After(manifest.CreatedAt)
 	defer func() {
-		if err != nil || params.MasterKeyPath != "" || !rowYoungerThanArchive {
+		if err != nil || params.MasterKeyPath != "" || params.ForeignSource || !rowYoungerThanArchive {
 			return
 		}
 		if backdateErr := deps.Store.Instances.BackdateCreatedAt(

@@ -5,12 +5,10 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/andrianbdn/oddk/internal/crypto"
-	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/offsite"
 )
 
@@ -34,11 +32,7 @@ func legacyEncrypt(t *testing.T, plaintext string, key []byte) string {
 }
 
 func TestReencryptLegacySecrets(t *testing.T) {
-	dataDir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dataDir, "oddk.db"), dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st, _ := newTestStore(t)
 
 	masterKey := make([]byte, 32)
 	if _, err := rand.Read(masterKey); err != nil {

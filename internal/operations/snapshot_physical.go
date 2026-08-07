@@ -95,12 +95,6 @@ func stagePhysicalBasebackup(
 		image = fmt.Sprintf("postgres:%s", instance.Version)
 	}
 
-	pgPassMount, pgPassEnv, cleanup, err := newPgPassMount(deps.BackupDir, password)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
 	// The helper connects inside the instance's own network namespace, where
 	// PostgreSQL always listens on 5432 regardless of the instance's host port.
 	cmd := []string{
@@ -128,63 +122,24 @@ func stagePhysicalBasebackup(
 		cmd = append(cmd, "--checkpoint=fast")
 	}
 
-	containerName := fmt.Sprintf("oddk-snapshot-bb-%s-%d", instance.Name, time.Now().UnixNano())
-	uid := os.Getuid()
-	gid := os.Getgid()
-
-	config := &container.Config{
-		Image: image,
-		// The daemon's uid, so the staged files are readable and deletable by
-		// the daemon without a chown pass (same pattern as pg_dump helpers).
-		User:   fmt.Sprintf("%d:%d", uid, gid),
-		Cmd:    cmd,
-		Env:    []string{pgPassEnv},
-		Labels: map[string]string{"oddk.helper": "true"},
-	}
-	hostConfig := &container.HostConfig{
-		NetworkMode: container.NetworkMode("container:" + instance.ContainerID),
+	err := runHelperContainer(ctx, deps, helperContainerSpec{
+		ContainerName: fmt.Sprintf("oddk-snapshot-bb-%s-%d", instance.Name, time.Now().UnixNano()),
+		Image:         image,
+		Cmd:           cmd,
+		Password:      password,
 		Mounts: []mount.Mount{
 			{
 				Type:   mount.TypeBind,
 				Source: bbDir,
 				Target: helperMountBasebackup,
 			},
-			pgPassMount,
 		},
-	}
-
-	cli := deps.Docker.GetDockerClient()
-	// NetworkingConfig must stay nil: a container sharing another's network
-	// namespace cannot also be attached to networks.
-	resp, err := cli.ContainerCreate(ctx, config, hostConfig, nil, nil, containerName)
+		JoinNetNSContainer: instance.ContainerID,
+		Tool:               "pg_basebackup",
+		FailureHint:        basebackupFailureHint,
+	})
 	if err != nil {
-		return fmt.Errorf("create pg_basebackup helper: %w", err)
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
-	}()
-
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("start pg_basebackup helper: %w", err)
-	}
-
-	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("wait for pg_basebackup helper: %w", err)
-		}
-	case status := <-statusCh:
-		if status.StatusCode != 0 {
-			logs, logErr := getContainerLogs(ctx, deps, resp.ID)
-			if logErr != nil {
-				logs = fmt.Sprintf("<logs unavailable: %v>", logErr)
-			}
-			return fmt.Errorf("pg_basebackup failed with status %d: %s%s",
-				status.StatusCode, logs, basebackupFailureHint(logs))
-		}
+		return err
 	}
 
 	if _, ok := physicalBasePath(bbDir); !ok {

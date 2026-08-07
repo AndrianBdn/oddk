@@ -125,6 +125,24 @@ func snapshotRunProbability(currentMinute int, forceRun bool) float64 {
 	}
 }
 
+// maybeSweepSnapshotDownloads prunes the managed downloads area once a day.
+// Startup covers restarted daemons; this covers ones that run for months. It
+// runs on the scheduler goroutine only, so the timestamp needs no lock — and
+// the sweep itself is safe against the executor because in-flight downloads
+// keep their temp files' mtimes fresh (SweepSnapshotDownloads only reaps aged
+// entries).
+func (s *Server) maybeSweepSnapshotDownloads() {
+	if time.Since(s.lastDownloadsSweep) < 24*time.Hour {
+		return
+	}
+	s.lastDownloadsSweep = time.Now()
+	if pruned, err := operations.SweepSnapshotDownloads(s.opDeps.BackupDir); err != nil {
+		log.Printf("Warning: snapshot downloads sweep skipped: %v", err)
+	} else if pruned > 0 {
+		log.Printf("Pruned %d aged archive(s) from the snapshot downloads area (re-fetchable from S3)", pruned)
+	}
+}
+
 // checkAndRunCronTasks checks if any cron tasks should be run at the current time
 func (s *Server) checkAndRunCronTasks(ctx context.Context) {
 	now := time.Now().UTC()
@@ -165,6 +183,12 @@ func (s *Server) checkAndRunCronTasks(ctx context.Context) {
 	// where no instance plan matched.
 	s.checkSnapshotPlan(ctx, now, currentMinute, forceRun)
 
+	// Prune the snapshot downloads area daily. This lives on the scheduler
+	// tick — not the snapshot cron task — because a host that only ever
+	// restores foreign archives may have no snapshot plan at all, and its
+	// downloads would otherwise only age out across daemon restarts.
+	s.maybeSweepSnapshotDownloads()
+
 	if len(plans) == 0 {
 		return // No tasks scheduled
 	}
@@ -184,28 +208,16 @@ func (s *Server) checkAndRunCronTasks(ctx context.Context) {
 
 		// Jittered start within the scheduled hour: a plan is pinned to a UTC
 		// hour, but rather than firing every instance's backup at :00 we roll a
-		// die each minute with escalating probability (5% at min 1-9, 10% at
-		// 10-20, then 100% after min 30 so the task is guaranteed to run before
-		// the hour ends). This spreads backup load across the hour. The
-		// HasRunInLastHour check above is the once-per-hour dedup guard that
-		// makes the probabilistic retry safe: a plan that wins an early roll is
-		// not triggered again later in the same hour. (forceRun / the debug
-		// ticker collapse this to deterministic runs for tests.)
-		var probability float64
-		if forceRun {
-			probability = 1.0 // Always run in force mode
-		} else {
-			// Normal probability based on current minute
-			switch {
-			case currentMinute >= 1 && currentMinute <= 9:
-				probability = 0.05 // 5% chance
-			case currentMinute >= 10 && currentMinute <= 20:
-				probability = 0.10 // 10% chance
-			case currentMinute > 30:
-				probability = 1.0 // 100% chance
-			default:
-				continue // Don't run in minute 0 or 21-30
-			}
+		// die each minute with the escalating snapshotRunProbability ladder
+		// (guaranteed to run before the hour ends). This spreads backup load
+		// across the hour. The HasRunInLastHour check above is the
+		// once-per-hour dedup guard that makes the probabilistic retry safe: a
+		// plan that wins an early roll is not triggered again later in the same
+		// hour. (forceRun / the debug ticker collapse this to deterministic
+		// runs for tests.)
+		probability := snapshotRunProbability(currentMinute, forceRun)
+		if probability == 0 {
+			continue // Don't run in minute 0 or 21-30
 		}
 
 		// Roll the dice

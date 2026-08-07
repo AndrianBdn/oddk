@@ -2,12 +2,10 @@ package store_test
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/andrianbdn/oddk/internal/rfc3339time"
-	"github.com/andrianbdn/oddk/internal/store"
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
@@ -16,12 +14,7 @@ import (
 // distinction between "no list recorded" (pre-019 row: unknown, reads nil) and
 // "a recorded list" (authoritative, even when empty).
 func TestSnapshotInstancesRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = st.Sqlx.Close() }()
+	st := newTestStore(t)
 
 	rec := &snapshotstore.Record{
 		Filename:          "snapshot-a.tar.zst",

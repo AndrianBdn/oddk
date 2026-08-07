@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"time"
 
 	"github.com/andrianbdn/oddk/internal/operations"
+	s3service "github.com/andrianbdn/oddk/internal/services/s3"
 )
 
 // handleSnapshotMake handles POST /api/snapshot
@@ -96,10 +98,47 @@ func (op *snapshotMakeOp) Execute(ctx context.Context) error {
 	return nil
 }
 
+// AWSCredentialsBody carries CLIENT-resolved static AWS credentials for a
+// one-shot S3 fetch. Precedent for secrets in a request body:
+// PUT /api/offsite/config has always carried secretAccessKey the same way,
+// over the same loopback-by-default channel.
+//
+// NEVER log this struct, its enclosing request, or a resolved aws.Credentials
+// value. The daemon uses the triple only to build an in-memory S3 client;
+// nothing persists it.
+type AWSCredentialsBody struct {
+	AccessKeyID     string `json:"accessKeyId"`
+	SecretAccessKey string `json:"secretAccessKey"`
+
+	// SessionToken is required for STS/SSO-derived credentials (an instance
+	// role resolved on the client, an assumed role, an SSO session) — they do
+	// not authenticate without it.
+	SessionToken string `json:"sessionToken,omitempty"`
+
+	// Source is the chain rung that produced the triple (e.g.
+	// "EnvConfigCredentials"), for the daemon's log line only.
+	Source string `json:"source,omitempty"`
+}
+
 // SnapshotRestoreInstanceRequest is the body of POST /api/snapshot/restore-instance.
+// Exactly one of FilePath, SnapshotID or S3URI selects the archive.
 type SnapshotRestoreInstanceRequest struct {
 	Instance string `json:"instance"`
-	FilePath string `json:"filePath"`
+
+	// FilePath is a path on the DAEMON's filesystem (the original form).
+	FilePath string `json:"filePath,omitempty"`
+
+	// SnapshotID names a row in this host's snapshot catalogue; the daemon
+	// downloads it from S3 first (via offsite settings) if the local copy is
+	// gone.
+	SnapshotID int `json:"snapshotId,omitempty"`
+
+	// S3URI names an s3://bucket/key archive, possibly from another
+	// deployment. Region, Endpoint and Credentials apply only to this mode.
+	S3URI       string              `json:"s3Uri,omitempty"`
+	Region      string              `json:"region,omitempty"`
+	Endpoint    string              `json:"endpoint,omitempty"`
+	Credentials *AWSCredentialsBody `json:"credentials,omitempty"`
 
 	// MasterKeyPath is the SOURCE host's master.key, needed only when the
 	// snapshot came from a different deployment. Empty means this host's key.
@@ -122,13 +161,51 @@ func (s *Server) handleSnapshotRestoreInstance(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusBadRequest, "instance is required")
 		return
 	}
-	if req.FilePath == "" {
-		s.writeError(w, http.StatusBadRequest, "filePath is required")
+	sources := 0
+	if req.FilePath != "" {
+		sources++
+	}
+	if req.SnapshotID != 0 {
+		sources++
+	}
+	if req.S3URI != "" {
+		sources++
+	}
+	if sources != 1 {
+		s.writeError(w, http.StatusBadRequest, "exactly one of filePath, snapshotId or s3Uri is required")
+		return
+	}
+	if req.SnapshotID < 0 {
+		s.writeError(w, http.StatusBadRequest, "invalid snapshot id")
+		return
+	}
+	if req.S3URI == "" && (req.Region != "" || req.Endpoint != "" || req.Credentials != nil) {
+		s.writeError(w, http.StatusBadRequest, "region, endpoint and credentials are only meaningful with s3Uri")
 		return
 	}
 
+	src := &operations.RestoreArchiveSource{
+		ArchivePath: req.FilePath,
+		SnapshotID:  req.SnapshotID,
+	}
+	if req.S3URI != "" {
+		spec := &operations.RemoteSnapshotSpec{
+			URI:      req.S3URI,
+			Region:   req.Region,
+			Endpoint: req.Endpoint,
+		}
+		if req.Credentials != nil {
+			spec.Credentials = &s3service.StaticCredentials{
+				AccessKeyID:     req.Credentials.AccessKeyID,
+				SecretAccessKey: req.Credentials.SecretAccessKey,
+				SessionToken:    req.Credentials.SessionToken,
+			}
+		}
+		src.Remote = spec
+	}
+
 	// Extracting an archive and replaying every database in an instance runs far
-	// past the 30s WriteTimeout.
+	// past the 30s WriteTimeout — and an S3 fetch may come first.
 	s.clearWriteDeadline(w, fmt.Sprintf("snapshot restore-instance %s", req.Instance))
 
 	// The cluster is torn down and rebuilt underneath the health checker, and
@@ -138,8 +215,8 @@ func (s *Server) handleSnapshotRestoreInstance(w http.ResponseWriter, r *http.Re
 
 	var result *operations.RestoreInstanceResult
 	op := &snapshotRestoreInstanceOp{
+		src: src,
 		params: &operations.RestoreInstanceParams{
-			ArchivePath:   req.FilePath,
 			InstanceName:  req.Instance,
 			MasterKeyPath: req.MasterKeyPath,
 			BackupDir:     s.backupDir,
@@ -159,8 +236,11 @@ func (s *Server) handleSnapshotRestoreInstance(w http.ResponseWriter, r *http.Re
 }
 
 // snapshotRestoreInstanceOp implements the Operation interface for restoring a
-// single instance out of a snapshot.
+// single instance out of a snapshot. Resolving the archive source (which may
+// download from S3) runs INSIDE the executor, so a fetch serializes with other
+// operations exactly like download-by-id always has.
 type snapshotRestoreInstanceOp struct {
+	src    *operations.RestoreArchiveSource
 	params *operations.RestoreInstanceParams
 	deps   *operations.Dependencies
 	result **operations.RestoreInstanceResult
@@ -175,12 +255,64 @@ func (op *snapshotRestoreInstanceOp) Type() operations.OpType {
 }
 
 func (op *snapshotRestoreInstanceOp) Execute(ctx context.Context) error {
+	archivePath, foreign, origin, err := operations.ResolveRestoreInstanceArchive(
+		ctx, op.deps, op.src, op.params.BackupDir, op.params.Progress)
+	if err != nil {
+		return err
+	}
+	op.params.ArchivePath = archivePath
+	op.params.ForeignSource = foreign
+
 	result, err := operations.RestoreInstanceFromSnapshot(ctx, op.deps, op.params)
 	if err != nil {
 		return err
 	}
+	result.ArchiveOrigin = origin
 	*op.result = result
 	return nil
+}
+
+// handleSnapshotListRemote handles GET /api/snapshots/remote
+//
+// It reports the BUCKET's truth under the ODDK snapshot layout — including
+// archives whose catalogue rows this host no longer has (another host's
+// snapshots in a shared bucket, rows lost with a dead host) — which is exactly
+// what `snapshot list` cannot show. Read-only, so it skips the executor like
+// the catalogue list does.
+func (s *Server) handleSnapshotListRemote(w http.ResponseWriter, r *http.Request) {
+	settings, err := operations.GetActiveOffsiteSettingsDecrypted(s.opDeps)
+	if err != nil {
+		s.writeOpError(w, err)
+		return
+	}
+	if settings == nil {
+		s.writeError(w, http.StatusBadRequest,
+			"offsite backup not configured; pass an explicit s3:// URI to list a bucket with your own AWS credentials")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	client, err := s3service.NewClient(ctx, settings)
+	if err != nil {
+		s.writeOpError(w, fmt.Errorf("create S3 client: %w", err))
+		return
+	}
+
+	prefix := operations.SnapshotS3Prefix + "/"
+	objects, truncated, err := operations.ListRemoteSnapshots(ctx, client, settings.Bucket, prefix)
+	if err != nil {
+		s.writeOpError(w, err)
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"bucket":    settings.Bucket,
+		"prefix":    client.GetBucketPath() + prefix,
+		"objects":   objects,
+		"truncated": truncated,
+	})
 }
 
 // SnapshotCronRequest is the body of POST /api/cron/snapshot.

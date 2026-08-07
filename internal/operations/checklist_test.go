@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/andrianbdn/oddk/internal/rfc3339time"
-	"github.com/andrianbdn/oddk/internal/store"
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
@@ -101,12 +100,7 @@ func TestSnapshotCoverage(t *testing.T) {
 // "covered" verdict or a green last-snapshot line naming an archive with zero
 // copies would describe a restore that cannot happen.
 func TestCollectSnapshotsSkipsCopylessNewest(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = st.Sqlx.Close() }()
+	st, dir := newTestStore(t)
 
 	// Older snapshot: file actually on disk.
 	surviving := filepath.Join(dir, "snapshot-old.tar.zst")
