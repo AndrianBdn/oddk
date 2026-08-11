@@ -89,9 +89,12 @@ type ChecklistInstance struct {
 //
 //   - "covered":      the newest snapshot holds this instance's data.
 //   - "config-only":  the newest snapshot holds only this instance's
-//     configuration (it was stopped during a logical capture, or its container
-//     was missing/unsafe during a physical one) — a restore from it would
-//     produce no database contents, so this must NOT read as protection.
+//     configuration — it was stopped during a logical capture, its container was
+//     missing/unsafe during a physical one, or its capture was ATTEMPTED AND
+//     FAILED (since 0.1.71 that degrades the entry instead of aborting the whole
+//     snapshot, and this verdict is one of the signals that keeps it from being
+//     silent). A restore from it would produce no database contents, so this must
+//     NOT read as protection.
 //   - "not-captured": the instance post-dates the newest snapshot (also the
 //     case for an instance destroyed and re-created under the same name — the
 //     archive holds the predecessor's data, not this incarnation's).
@@ -226,7 +229,7 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 		row := ChecklistInstance{
 			Name:             inst.Name,
 			Version:          inst.Version,
-			Status:           inst.Status,
+			Status:           string(inst.Status),
 			Health:           health,
 			ParameterGroup:   inst.ParameterGroup,
 			LegacyBackupCron: legacyCronByInstance[inst.Name],

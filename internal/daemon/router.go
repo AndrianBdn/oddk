@@ -87,6 +87,12 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /api/cron/backup", s.withAuth(s.handleCronBackupList))
 	mux.HandleFunc("DELETE /api/cron/backup/{instance}", s.withAuth(s.handleCronBackupDelete))
 
+	// Scheduled-run history, covering BOTH per-instance backups and the
+	// whole-deployment snapshot (recorded under the SnapshotCronInstance
+	// sentinel). Read-only and executor-free, so "why did last night fail" stays
+	// answerable while a long operation holds the lock.
+	mux.HandleFunc("GET /api/cron/logs", s.withAuth(s.handleCronLogs))
+
 	// Parameter groups
 	mux.HandleFunc("GET /api/parameters", s.withAuth(s.handleParameterGroupList))
 	mux.HandleFunc("GET /api/parameters/{name}", s.withAuth(s.handleParameterGroupGet))

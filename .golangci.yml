@@ -44,6 +44,22 @@ linters:
       - path: internal/operations/.*_test\.go
         linters:
           - testpackage
+      # reconcile_test.go pins the startup status matrix by calling the
+      # unexported decideReconcile directly. The exported entry point takes a
+      # *docker.Client, which cannot be faked, so an external test package could
+      # not reach the matrix at all — and an untested matrix is precisely how it
+      # came to handle four of its ~forty cases.
+      - path: internal/daemon/reconcile_test\.go
+        linters:
+          - testpackage
+      # migration020_test.go calls the unexported migration function directly.
+      # Going through the exported Store would run every migration at once, so
+      # the test could not set up the PRE-020 schema it needs to migrate FROM —
+      # and this migration rebuilds the one table holding every instance's
+      # encrypted password, so it is the last one to leave untested.
+      - path: internal/store/migration020_test\.go
+        linters:
+          - testpackage
 
 # Formatters are a separate subsystem from linters in golangci-lint v2: they are
 # applied by `golangci-lint fmt`, NOT `golangci-lint run` (and `run --fix` does

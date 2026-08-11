@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operations"
 	"github.com/andrianbdn/oddk/internal/store"
+	"github.com/andrianbdn/oddk/internal/store/instances"
 )
 
 // reconcileInstances aligns each instance's stored status with the actual
@@ -24,79 +26,122 @@ import (
 // it isn't attached (see the inline comment for why that matters beyond the
 // single instance).
 func reconcileInstances(st *store.Store, dockerClient *docker.Client) {
-	instances, err := st.Instances.List()
+	list, err := st.Instances.List()
 	if err != nil {
 		log.Printf("Warning: startup reconciliation skipped: list instances: %v", err)
 		return
 	}
 
-	for _, inst := range instances {
-		// "creating" can only mean a create operation died mid-flight.
-		if inst.Status == "creating" {
-			log.Printf("Reconcile: instance %s is stuck in 'creating' (interrupted create) - marking 'error'; destroy and re-create it", inst.Name)
-			reconcileSetStatus(st, inst.Name, "error")
-			continue
-		}
-
-		// "restoring" means 'snapshot apply' died mid-flight. The container may
-		// well be up and accepting connections, which is exactly why this must
-		// not be left alone: its databases are only partially restored, and the
-		// health check (a bare connect+ping) would report it healthy.
-		if inst.Status == "restoring" {
-			log.Printf("Reconcile: instance %s is stuck in 'restoring' (interrupted snapshot apply) - marking 'error'; its data is incomplete, re-apply the snapshot or restore it from a backup", inst.Name)
-			reconcileSetStatus(st, inst.Name, "error")
-			continue
-		}
-
-		if inst.ContainerID == "" {
-			if inst.Status != "error" {
-				log.Printf("Reconcile: instance %s (status %q) has no container ID - marking 'error'", inst.Name, inst.Status)
-				reconcileSetStatus(st, inst.Name, "error")
-			}
-			continue
-		}
-
-		containerState, err := dockerClient.GetContainerStatus(inst.ContainerID)
-		if err != nil {
-			log.Printf("Warning: reconcile: inspect container of instance %s: %v", inst.Name, err)
-			continue
-		}
-
-		// A container recreated outside ODDK (e.g. manual disaster recovery)
-		// can end up on the default bridge only. Besides breaking 10.88.0.1
-		// routing for that instance, it leaves oddk-bridge with zero attached
-		// containers — which makes the network eligible for 'docker network
-		// prune' and takes down every instance at once. Re-attaching here
-		// restores the invariant: Docker never prunes a network that has a
-		// container attached, running or stopped.
-		if containerState != "not found" {
-			connected, err := dockerClient.EnsureContainerOnNetwork(inst.ContainerID)
+	for _, inst := range list {
+		containerState := ""
+		if inst.ContainerID != "" {
+			state, err := dockerClient.GetContainerStatus(inst.ContainerID)
 			if err != nil {
-				log.Printf("Warning: reconcile: ensure oddk-bridge attachment of instance %s: %v", inst.Name, err)
-			} else if connected {
-				log.Printf("Warning: reconcile: container of instance %s was not attached to oddk-bridge (recreated outside ODDK?) - reconnected it", inst.Name)
+				log.Printf("Warning: reconcile: inspect container of instance %s: %v", inst.Name, err)
+				continue
+			}
+			containerState = state
+
+			// A container recreated outside ODDK (e.g. manual disaster
+			// recovery) can end up on the default bridge only. Besides breaking
+			// 10.88.0.1 routing for that instance, it leaves oddk-bridge with
+			// zero attached containers — which makes the network eligible for
+			// 'docker network prune' and takes down every instance at once.
+			// Re-attaching here restores the invariant: Docker never prunes a
+			// network that has a container attached, running or stopped.
+			//
+			// This runs for EVERY container, whatever the stored status says.
+			// The invariant is about the network, not about one instance's
+			// health, so an instance stuck mid-operation must not be skipped.
+			if containerState != "not found" {
+				connected, err := dockerClient.EnsureContainerOnNetwork(inst.ContainerID)
+				if err != nil {
+					log.Printf("Warning: reconcile: ensure oddk-bridge attachment of instance %s: %v", inst.Name, err)
+				} else if connected {
+					log.Printf("Warning: reconcile: container of instance %s was not attached to oddk-bridge (recreated outside ODDK?) - reconnected it", inst.Name)
+				}
 			}
 		}
 
-		switch {
-		case containerState == "not found":
-			if inst.Status != "error" {
-				log.Printf("Reconcile: container of instance %s (status %q) no longer exists - marking 'error'", inst.Name, inst.Status)
-				reconcileSetStatus(st, inst.Name, "error")
-			}
-		case containerState == "running" && inst.Status == "stopped":
-			log.Printf("Reconcile: instance %s is recorded 'stopped' but its container is running - marking 'running'", inst.Name)
-			reconcileSetStatus(st, inst.Name, "running")
-		case containerState == "stopped" && inst.Status == "running":
-			log.Printf("Reconcile: instance %s is recorded 'running' but its container is stopped - marking 'stopped'; use 'instance start' to bring it back", inst.Name)
-			reconcileSetStatus(st, inst.Name, "stopped")
-		case containerState == "paused" || containerState == "restarting":
-			log.Printf("Warning: reconcile: container of instance %s is %s (status %q) - leaving status unchanged", inst.Name, containerState, inst.Status)
+		newStatus, message := decideReconcile(inst.Status, inst.ContainerID, containerState)
+		if message != "" {
+			log.Printf("Reconcile: instance %s: %s", inst.Name, message)
+		}
+		if newStatus != "" && newStatus != inst.Status {
+			reconcileSetStatus(st, inst.Name, newStatus)
 		}
 	}
 }
 
-func reconcileSetStatus(st *store.Store, name, status string) {
+// decideReconcile is the whole startup status matrix, as a pure function of the
+// stored status and what Docker reports about the container. An empty
+// newStatus means "leave the row alone"; message is what to tell the operator
+// ("" = nothing worth saying).
+//
+// containerState is "" when the instance has no container ID, and otherwise one
+// of the closed set GetContainerStatus returns: "running", "stopped", "paused",
+// "restarting", "not found".
+//
+// It is a separate function purely so the matrix can be tested. reconcile takes
+// a *docker.Client, which cannot be faked, so before this split the matrix had
+// zero coverage — which is how it came to handle four pairs out of the ~forty
+// that exist.
+func decideReconcile(storedStatus instances.InstanceStatus, containerID, containerState string) (newStatus instances.InstanceStatus, message string) {
+	// An interrupted status can only mean the operation that set it died
+	// mid-flight: this pass runs before the executor accepts any work, so none
+	// of them can be live.
+	if remedy, interrupted := storedStatus.IsInterrupted(); interrupted {
+		return instances.StatusError, fmt.Sprintf("stuck in %q (interrupted operation) - marking 'error'; %s", storedStatus, remedy)
+	}
+
+	// Anything unclassified is a status someone added without classifying it in
+	// internal/store/instances/status.go. Fail loudly rather than leaving the row
+	// alone — leaving it alone is exactly how "switching"/"upgrading"/
+	// "reconfiguring" survived every restart forever.
+	if !storedStatus.Valid() {
+		return instances.StatusError, fmt.Sprintf("UNRECOGNISED status %q - marking 'error'. "+
+			"If this is a new status, classify it in internal/store/instances/status.go", storedStatus)
+	}
+
+	if containerID == "" {
+		if storedStatus != instances.StatusError {
+			return instances.StatusError, fmt.Sprintf("status %q but no container ID - marking 'error'", storedStatus)
+		}
+		return "", ""
+	}
+
+	switch {
+	case containerState == "not found":
+		if storedStatus != instances.StatusError {
+			return instances.StatusError, fmt.Sprintf("container (status %q) no longer exists - marking 'error'", storedStatus)
+		}
+		return "", ""
+
+	case containerState == "paused" || containerState == "restarting":
+		return "", fmt.Sprintf("container is %s (status %q) - leaving status unchanged", containerState, storedStatus)
+
+	case storedStatus == instances.StatusError:
+		// Never auto-cleared: by convention only an explicit operation promotes
+		// out of 'error'. A container that happens to be up does not prove the
+		// instance is well — 'restoring' becomes 'error' precisely because its
+		// data may be incomplete while its server answers.
+		return "", ""
+
+	case containerState == "running" && storedStatus != instances.StatusRunning:
+		return instances.StatusRunning, fmt.Sprintf("recorded %q but its container is running - marking 'running'", storedStatus)
+
+	case containerState == "stopped" && storedStatus != instances.StatusStopped:
+		return instances.StatusStopped, fmt.Sprintf("recorded %q but its container is stopped - marking 'stopped'; use 'instance start' to bring it back", storedStatus)
+
+	case containerState == "running" || containerState == "stopped":
+		return "", "" // store and Docker already agree
+
+	default:
+		return "", fmt.Sprintf("container reported an unexpected state %q (status %q) - leaving status unchanged", containerState, storedStatus)
+	}
+}
+
+func reconcileSetStatus(st *store.Store, name string, status instances.InstanceStatus) {
 	if err := st.Instances.UpdateStatus(name, status); err != nil {
 		log.Printf("Error: reconcile: update status of instance %s to %q: %v", name, status, err)
 	}

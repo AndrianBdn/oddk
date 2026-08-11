@@ -28,7 +28,7 @@ func recreateInstanceOnImage(ctx context.Context, deps *Dependencies, instance *
 		return nil, fmt.Errorf("get parameter group %s: %w", instance.ParameterGroup, err)
 	}
 
-	if err := deps.Store.Instances.UpdateStatus(instance.Name, "switching"); err != nil {
+	if err := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusSwitching); err != nil {
 		log.Printf("Error updating status to switching: %v", err)
 	}
 
@@ -45,7 +45,7 @@ func recreateInstanceOnImage(ctx context.Context, deps *Dependencies, instance *
 		instance.ContainerID,
 	)
 	if err != nil {
-		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, "error"); statusErr != nil {
+		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusError); statusErr != nil {
 			log.Printf("Error updating status to error: %v", statusErr)
 		}
 		return nil, fmt.Errorf("recreate container: %w", err)
@@ -59,7 +59,7 @@ func recreateInstanceOnImage(ctx context.Context, deps *Dependencies, instance *
 	}
 
 	if err := deps.Docker.StartContainer(newContainerID); err != nil {
-		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, "error"); statusErr != nil {
+		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusError); statusErr != nil {
 			log.Printf("Error updating status to error: %v", statusErr)
 		}
 		return nil, fmt.Errorf("start container: %w", err)
@@ -68,13 +68,13 @@ func recreateInstanceOnImage(ctx context.Context, deps *Dependencies, instance *
 	// Docker reporting the container as started does not mean PostgreSQL is
 	// ready to accept connections; wait for it before reporting "running".
 	if err := waitForPostgresReady(ctx, instance.Port, password); err != nil {
-		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, "error"); statusErr != nil {
+		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusError); statusErr != nil {
 			log.Printf("Error updating status to error: %v", statusErr)
 		}
 		return nil, fmt.Errorf("wait for PostgreSQL readiness: %w", err)
 	}
 
-	if err := deps.Store.Instances.UpdateStatus(instance.Name, "running"); err != nil {
+	if err := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusRunning); err != nil {
 		log.Printf("Error updating status to running: %v", err)
 	}
 

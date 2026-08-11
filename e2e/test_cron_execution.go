@@ -1,3 +1,5 @@
+//go:build oddk_debug
+
 package main
 
 import (
@@ -72,6 +74,31 @@ func testCronExecution(h *TestHarness) error {
 	// The backup should show "Local" location
 	if !strings.Contains(afterBackups, "Local") {
 		return fmt.Errorf("expected backup to show Local location, got: %s", afterBackups)
+	}
+
+	// The run must be visible through 'oddk cron logs'. cron_logs is the evidence
+	// that scheduled protection actually ran — and the whole table had no reader
+	// in the API or the CLI until this command existed, so a failed run's reason
+	// was reachable only via journalctl or sqlite3.
+	cronLogs, err := h.runCLI("cron", "logs", "--instance", instanceName)
+	if err != nil {
+		return fmt.Errorf("cron logs: %w", err)
+	}
+	if !strings.Contains(cronLogs, instanceName) {
+		return fmt.Errorf("expected 'cron logs' to show the run for %s, got: %s", instanceName, cronLogs)
+	}
+	if !strings.Contains(cronLogs, "CAPTURE") {
+		return fmt.Errorf("expected 'cron logs' to show per-phase columns, got: %s", cronLogs)
+	}
+
+	// The run succeeded, so the failures-only view must NOT list it — otherwise
+	// the filter that an operator relies on to find real problems is useless.
+	failuresOnly, err := h.runCLI("cron", "logs", "--instance", instanceName, "--failures")
+	if err != nil {
+		return fmt.Errorf("cron logs --failures: %w", err)
+	}
+	if strings.Contains(failuresOnly, instanceName) {
+		return fmt.Errorf("a successful run must not appear under --failures, got: %s", failuresOnly)
 	}
 
 	if _, err := h.cronRemoveBackupCLI(instanceName); err != nil {

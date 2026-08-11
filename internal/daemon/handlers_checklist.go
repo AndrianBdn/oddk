@@ -18,7 +18,7 @@ func (s *Server) handleChecklist(w http.ResponseWriter, r *http.Request) {
 
 	op := operations.NewChecklistOp(s.opDeps)
 
-	if err := s.executor.Execute(context.Background(), op); err != nil {
+	if err := s.executor.ExecuteRead(context.Background(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to build checklist: %v", err))
 		return
 	}

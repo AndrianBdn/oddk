@@ -6,13 +6,18 @@ import (
 	"testing"
 )
 
-func runSnapshotMake(t *testing.T, response string) string {
+func snapshotMake(t *testing.T, response string, args ...string) (string, error) {
 	t.Helper()
 	f := &fakeDaemon{handle: func(w http.ResponseWriter, r *http.Request) bool {
 		_, _ = w.Write([]byte(response))
 		return true
 	}}
-	out, err := runCLI(t, f.start(t), "snapshot", "make")
+	return runCLI(t, f.start(t), append([]string{"snapshot", "make"}, args...)...)
+}
+
+func runSnapshotMake(t *testing.T, response string) string {
+	t.Helper()
+	out, err := snapshotMake(t, response)
 	if err != nil {
 		t.Fatalf("snapshot make: %v", err)
 	}
@@ -96,5 +101,62 @@ func TestSnapshotMakeOutput_ConfigOnlyReported(t *testing.T) {
 	}
 	if !strings.Contains(out, "Size: 5.0 GiB") {
 		t.Errorf("expected a human-readable size, got:\n%s", out)
+	}
+}
+
+// An instance that could not be captured is a different problem from one that
+// was not running, and must not be reported with the same shrug. The archive is
+// real and was kept, but the command was asked to capture the deployment and did
+// not — so it exits non-zero.
+func TestSnapshotMakeOutput_CaptureFailureIsReportedAndFails(t *testing.T) {
+	const response = `{
+		"id": 11, "path": "/var/lib/oddk/backups/snapshot-db01-20260811090000.tar.zst",
+		"size": 2097152, "timestamp": "2026-08-11T09:00:00Z",
+		"format": "physical",
+		"instances": [
+			{"name": "app", "version": "17", "image": "postgres:17", "hasData": true, "format": "physical", "captureMode": "basebackup"},
+			{"name": "billing", "version": "17", "image": "postgres:17", "hasData": false, "format": "physical",
+			 "skipReason": "base backup FAILED (wal senders exhausted); databases not captured — this instance would restore EMPTY"},
+			{"name": "old", "version": "16", "image": "postgres:16", "hasData": false,
+			 "skipReason": "container is \"paused\", which is neither serving nor cleanly stopped; databases not captured"}
+		],
+		"instancesWithData": 1, "configOnly": 2,
+		"captureFailures": [{"instance": "billing", "stage": "base backup", "error": "wal senders exhausted"}]
+	}`
+
+	out, err := snapshotMake(t, response)
+	if err == nil {
+		t.Fatal("a snapshot missing an instance's data exited zero — a script would read it as a complete capture")
+	}
+	if !strings.Contains(err.Error(), "billing") {
+		t.Errorf("the error does not name the instance that failed: %v", err)
+	}
+
+	if !strings.Contains(out, "FAILED to be captured") || !strings.Contains(out, "wal senders exhausted") {
+		t.Errorf("the capture failure and its cause must both be shown, got:\n%s", out)
+	}
+	// The two reasons an instance holds no data must not be conflated: one
+	// instance was merely paused, one is broken.
+	if !strings.Contains(out, "1 instance(s) were not running") {
+		t.Errorf("the not-running count must exclude failed captures, got:\n%s", out)
+	}
+	if strings.Contains(out, "2 instance(s) were not running") {
+		t.Errorf("a failed capture was counted as merely 'not running', got:\n%s", out)
+	}
+}
+
+// --json is what a fleet script parses, so stdout must stay valid JSON while the
+// exit code carries the failure.
+func TestSnapshotMakeOutput_CaptureFailureFailsInJSONMode(t *testing.T) {
+	const response = `{"id": 12, "path": "/x.tar.zst", "size": 10, "timestamp": "2026-08-11T09:00:00Z",
+		"instances": [{"name": "billing", "hasData": false}], "instancesWithData": 0, "configOnly": 1,
+		"captureFailures": [{"instance": "billing", "stage": "dump", "error": "connection refused"}]}`
+
+	out, err := snapshotMake(t, response, "--json")
+	if err == nil {
+		t.Fatal("--json mode exited zero on an incomplete capture")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(out), "{") {
+		t.Errorf("stdout is not the JSON body a script expects, got:\n%s", out)
 	}
 }

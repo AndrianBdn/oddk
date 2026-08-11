@@ -1,3 +1,5 @@
+//go:build oddk_debug
+
 package main
 
 import (
@@ -115,6 +117,7 @@ func main() {
 		{Name: "SnapshotApplyFromS3", Fn: testSnapshotApplyFromS3, RunFakeS3: true},
 		{Name: "SnapshotRestoreForeignFromS3", Fn: testSnapshotRestoreForeignFromS3, RunFakeS3: true},
 		{Name: "SnapshotPhysicalMake", Fn: testSnapshotPhysicalMake},
+		{Name: "SnapshotDegradedCapture", Fn: testSnapshotDegradedCapture},
 		{Name: "SnapshotLogicalRoundTrip", Fn: testSnapshotLogicalRoundTrip},
 		{Name: "SnapshotMigrateFromBackups", Fn: testSnapshotMigrateFromBackups},
 		{Name: "MajorUpgrade", Fn: testMajorUpgrade},

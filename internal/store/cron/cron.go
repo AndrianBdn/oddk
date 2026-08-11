@@ -94,6 +94,16 @@ func (s *CronStore) CreateLog(instanceName string) (*CronLog, error) {
 	}, nil
 }
 
+// UpdateLog sets arbitrary columns on a cron log row.
+//
+// Any time.Time is normalized to rfc3339time.Time first. The map[string]any
+// signature means callers hand the driver a bare time.Time, which bypasses
+// rfc3339time's driver.Valuer and stores Go's default String() layout
+// ("2026-08-11 04:53:54.122388675 +0000 UTC") into a TEXT column the scanner
+// expects to be RFC3339 — so the row could be written but never read back.
+// Every *_finished_at column was written that way; nobody noticed because
+// nothing read cron_logs until 'oddk cron logs' existed. Normalizing here rather
+// than at the call sites means a future caller cannot reintroduce it.
 func (s *CronStore) UpdateLog(logID int, updates map[string]any) error {
 	setClause := ""
 	values := []any{}
@@ -103,6 +113,9 @@ func (s *CronStore) UpdateLog(logID int, updates map[string]any) error {
 			setClause += ", "
 		}
 		setClause += fmt.Sprintf("%s = ?", key)
+		if t, ok := value.(time.Time); ok {
+			value = rfc3339time.Time{Time: t}
+		}
 		values = append(values, value)
 	}
 
@@ -141,6 +154,30 @@ func (s *CronStore) ListLogs(instanceName string, limit int) ([]*CronLog, error)
 	err := s.db.Select(&logs, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list cron logs: %w", err)
+	}
+
+	return logs, nil
+}
+
+// ListAllLogs returns cron logs across every instance, newest first — including
+// the whole-deployment snapshot runs, which are recorded under the
+// SnapshotCronInstance sentinel rather than a real instance name.
+//
+// ListLogs requires an instance name, which is why the evidence that scheduled
+// work ran (or failed) had no reader outside a manual sqlite3 session.
+func (s *CronStore) ListAllLogs(limit int) ([]*CronLog, error) {
+	var logs []*CronLog
+	query := `SELECT * FROM cron_logs ORDER BY started_at DESC`
+	var args []any
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	err := s.db.Select(&logs, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list all cron logs: %w", err)
 	}
 
 	return logs, nil

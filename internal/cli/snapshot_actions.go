@@ -29,19 +29,30 @@ type snapshotInstanceEntry struct {
 	SkipReason  string `json:"skipReason,omitempty"`
 }
 
+type snapshotCaptureFailure struct {
+	Instance string `json:"instance"`
+	Stage    string `json:"stage"`
+	Error    string `json:"error"`
+}
+
 type snapshotMakeResult struct {
-	ID                int                     `json:"id"`
-	Path              string                  `json:"path"`
-	Size              int64                   `json:"size"`
-	Timestamp         string                  `json:"timestamp"`
-	Format            string                  `json:"format"`
-	Instances         []snapshotInstanceEntry `json:"instances"`
-	InstancesWithData int                     `json:"instancesWithData"`
-	ConfigOnly        int                     `json:"configOnly"`
+	ID                int                      `json:"id"`
+	Path              string                   `json:"path"`
+	Size              int64                    `json:"size"`
+	Timestamp         string                   `json:"timestamp"`
+	Format            string                   `json:"format"`
+	Instances         []snapshotInstanceEntry  `json:"instances"`
+	InstancesWithData int                      `json:"instancesWithData"`
+	ConfigOnly        int                      `json:"configOnly"`
+	CaptureFailures   []snapshotCaptureFailure `json:"captureFailures,omitempty"`
 }
 
 func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error {
-	_, _ = fmt.Fprintln(c.out, "Snapshotting deployment (this may take a while)...")
+	// Not in --json mode: the whole point of --json is that stdout can be piped
+	// into a parser, and a human progress line ahead of the body breaks that.
+	if !cmd.Bool("json") {
+		_, _ = fmt.Fprintln(c.out, "Snapshotting deployment (this may take a while)...")
+	}
 
 	body := map[string]string{}
 	if comment := cmd.String("comment"); comment != "" {
@@ -55,14 +66,15 @@ func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error
 		return err
 	}
 
-	if cmd.Bool("json") {
-		_, _ = fmt.Fprintf(c.out, "%s\n", resp)
-		return nil
-	}
-
 	var result snapshotMakeResult
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if cmd.Bool("json") {
+		_, _ = fmt.Fprintf(c.out, "%s\n", resp)
+		// stdout stays valid JSON; the non-zero exit is what a script reads.
+		return snapshotCaptureError(result.CaptureFailures)
 	}
 
 	if len(result.Instances) > 0 {
@@ -109,10 +121,23 @@ func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error
 		_, _ = fmt.Fprintf(c.out, "Instances: %d\n", len(result.Instances))
 	}
 
-	if result.ConfigOnly > 0 {
+	// Two different reasons an instance can hold no data, and they need different
+	// reactions: one is a deployment that was not running, the other is broken.
+	if skipped := result.ConfigOnly - len(result.CaptureFailures); skipped > 0 {
 		_, _ = fmt.Fprintf(c.out,
 			"\n⚠️  %d instance(s) were not running and hold NO database contents in this snapshot.\n",
-			result.ConfigOnly)
+			skipped)
+	}
+	if len(result.CaptureFailures) > 0 {
+		_, _ = fmt.Fprintf(c.out,
+			"\n❌ %d instance(s) FAILED to be captured and hold NO database contents in this snapshot:\n",
+			len(result.CaptureFailures))
+		for _, f := range result.CaptureFailures {
+			_, _ = fmt.Fprintf(c.out, "   %s — %s: %s\n", f.Instance, f.Stage, f.Error)
+		}
+		_, _ = fmt.Fprintf(c.out,
+			"   The archive was kept: it is still the newest restore point for every other\n"+
+				"   instance. Fix the cause and take another snapshot.\n")
 	}
 
 	// Both of these are load-bearing and easy to get wrong, so they are shown
@@ -123,7 +148,23 @@ func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error
 	_, _ = fmt.Fprintf(c.out,
 		"⚠️  Restoring it requires the master.key from this host. Back that key up separately.\n")
 
-	return nil
+	return snapshotCaptureError(result.CaptureFailures)
+}
+
+// snapshotCaptureError turns a degraded capture into a non-zero exit. The
+// archive is real and was kept, but `oddk snapshot make` was asked to capture
+// the deployment and did not — a script that checks the exit code must not read
+// this as a complete snapshot.
+func snapshotCaptureError(failures []snapshotCaptureFailure) error {
+	if len(failures) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(failures))
+	for _, f := range failures {
+		names = append(names, f.Instance)
+	}
+	return fmt.Errorf("snapshot is incomplete: %d instance(s) could not be captured (%s)",
+		len(failures), strings.Join(names, ", "))
 }
 
 type snapshotPlan struct {

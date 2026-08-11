@@ -66,6 +66,8 @@ func (s *Server) handleRDBMSRestore(w http.ResponseWriter, r *http.Request) {
 		result: &restoreResult,
 	}
 
+	s.clearWriteDeadline(w, fmt.Sprintf("restore %s", name))
+
 	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeOpError(w, err)
 		return

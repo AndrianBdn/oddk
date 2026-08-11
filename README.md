@@ -294,7 +294,23 @@ oddk snapshot upload <id>
 oddk snapshot download <id>
 oddk snapshot remove-local <id>
 oddk snapshot remove-remote <id>
+
+# Did last night's scheduled work actually run?
+oddk cron logs                # last 20 runs: backups and snapshots, one row each
+oddk cron logs --failures     # only runs with a failed phase
+oddk cron logs --instance app
 ```
+
+**One instance failing does not cost the others their archive.** If an instance
+cannot be captured — its server is unreachable, its stored password no longer
+authenticates, PostgreSQL is out of WAL senders — that instance is recorded in
+the snapshot as configuration-only and everything else is captured normally. The
+archive is kept, uploaded and catalogued, because it is still the newest restore
+point for every other instance. But the run *reports failure*: `snapshot make`
+exits non-zero and names the instance, a scheduled run's capture phase is marked
+failed and notifies, and `oddk checklist` shows that instance as `✗ config-only`
+rather than covered. An archive that is empty for somebody must never read as
+protection.
 
 Restoring comes in three shapes:
 
@@ -346,9 +362,14 @@ What you need to know:
   and a snapshot cannot be applied without it.
 - **Snapshots are not encrypted.** They contain database contents and role
   password hashes in plaintext. Store them accordingly.
-- **A stopped instance is captured as a cold copy** of its data directory (and
-  restored back to a stopped instance). Only with `--logical` — which needs a
-  live server to dump — is it reduced to configuration-only; that is reported,
+- **What gets captured is decided by the container, not by recorded state.** A
+  snapshot asks Docker what each container is actually doing at capture time, so
+  an instance whose recorded status has drifted is still captured correctly. A
+  stopped container is captured as a cold copy of its data directory (and
+  restored back to a stopped instance); only with `--logical` — which needs a
+  live server to dump — is it reduced to configuration-only. An instance with no
+  container, or one paused or restarting, is captured configuration-only with a
+  specific reason recorded in the manifest and printed on stdout — reported,
   never silent.
 - Restoring an instance sets its postgres password to the snapshot's, because the
   archive carries only the hash. Re-read it with `instance get-postgres-password`.
@@ -503,6 +524,11 @@ When offsite is configured, each scheduled snapshot run uploads the new
 snapshot, retries earlier failed uploads, and then applies retention — and
 local retention never deletes an archive whose only copy is local.
 
+The same two safeguards apply to scheduled **backups**: a local backup with no
+remote copy is never aged out while offsite is configured, and retention (local
+and offsite) always keeps the newest two regardless of age, so a job that has
+been failing longer than its retention window cannot expire everything you have.
+
 **Stored settings and ambient credentials are two separate paths.** Everything
 the *daemon* does offsite — scheduled uploads, `snapshot upload`/`download`,
 the zero-argument `snapshot list-remote`, and `restore-instance --id` — uses
@@ -610,6 +636,19 @@ oddk notify logs --limit 50
 Supported channels: Email, Slack, Telegram, Webhook. Health degraded/restored
 events are delivered automatically with configurable thresholds.
 
+**Scheduled runs notify on failure.** A scheduled backup or snapshot that ends
+with any failed phase sends one message to every configured channel, naming what
+failed and why — and distinguishing "no new archive was produced" from "an
+archive was produced but does not hold every instance's data" and from "the
+archive exists but could not be uploaded or pruned", because those need
+different responses. A run that succeeds after a failure sends a short
+"Recovered" notice; a clean run after a clean run says nothing. One message per
+run, never one per phase.
+
+Without a channel configured, failures are still recorded — `oddk cron logs`
+shows every run and its per-phase outcome — but nothing will reach you until you
+go looking.
+
 ---
 
 ## How it works
@@ -628,7 +667,15 @@ events are delivered automatically with configurable thresholds.
   database under the data dir.
 - **Self-healing startup.** On boot the daemon reconciles stored instance state
   against actual container state and sweeps orphaned temp artifacts from any
-  interrupted operation.
+  interrupted operation. An instance left mid-operation by a crash is marked
+  `error` with the remedy in the log, rather than being left in a transient
+  state that health checks would skip.
+- **Graceful shutdown.** On `SIGTERM` (i.e. `systemctl stop oddk`) the daemon
+  stops accepting new work and waits for the operation in flight to finish —
+  operations are uninterruptible by design, so a snapshot, restore or major
+  upgrade is allowed to complete rather than being killed part-way. Send the
+  signal a second time to stop waiting. The systemd unit allows 30 minutes for
+  this; adjust `TimeoutStopSec` if your operations run longer.
 
 ## Security
 

@@ -655,14 +655,21 @@ func (c *Client) GetContainerStatus(containerID string) (string, error) {
 		return "", fmt.Errorf("inspect container: %w", err)
 	}
 
-	if inspect.State.Running {
-		return "running", nil
-	}
+	// ORDER MATTERS: Docker reports State.Running == true for a PAUSED container
+	// (verified: a paused container inspects as Running=true, Paused=true,
+	// Status="paused"). Testing Running first therefore made "paused"
+	// unreachable and reported a frozen container as healthy — so callers that
+	// branch on "paused" (snapshot capture, startup reconciliation) never saw
+	// it, and a base backup against a paused server would hang rather than
+	// degrade. Check the more specific states first.
 	if inspect.State.Paused {
 		return "paused", nil
 	}
 	if inspect.State.Restarting {
 		return "restarting", nil
+	}
+	if inspect.State.Running {
+		return "running", nil
 	}
 
 	return "stopped", nil

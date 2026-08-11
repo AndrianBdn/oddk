@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/andrianbdn/oddk/internal/operations"
 )
@@ -62,12 +63,38 @@ func (s *Server) handleCronBackupCreate(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleCronBackupList(w http.ResponseWriter, r *http.Request) {
 	op := operations.NewCronBackupListOp(s.opDeps)
 
-	if err := s.executor.Execute(r.Context(), op); err != nil {
+	if err := s.executor.ExecuteRead(r.Context(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list cron backups: %v", err))
 		return
 	}
 
 	s.writeJSON(w, http.StatusOK, op.GetResult())
+}
+
+// handleCronLogs serves GET /api/cron/logs?limit=N&instance=NAME.
+//
+// Deliberately does NOT go through the executor: this is a plain read of
+// cron_logs, and the whole point of the endpoint is to answer "why did last
+// night's snapshot fail" — which must stay answerable while a long operation
+// holds the executor lock. (/api/snapshots/remote skips it for the same reason.)
+func (s *Server) handleCronLogs(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil {
+			limit = parsed
+		}
+	}
+
+	result, err := operations.CronLogs(s.opDeps, operations.CronLogsParams{
+		Instance: r.URL.Query().Get("instance"),
+		Limit:    limit,
+	})
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleCronBackupDelete(w http.ResponseWriter, r *http.Request) {

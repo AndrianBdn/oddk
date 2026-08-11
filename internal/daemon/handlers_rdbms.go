@@ -56,7 +56,7 @@ type ReconfigureRequest struct {
 func (s *Server) handleListRDBMS(w http.ResponseWriter, r *http.Request) {
 	op := operations.NewListRDBMSOp(s.opDeps)
 
-	if err := s.executor.Execute(context.Background(), op); err != nil {
+	if err := s.executor.ExecuteRead(context.Background(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list instances: %v", err))
 		return
 	}
@@ -73,7 +73,7 @@ func (s *Server) handleGetRDBMS(w http.ResponseWriter, r *http.Request) {
 
 	op := operations.NewGetRDBMSOp(s.opDeps, name)
 
-	if err := s.executor.Execute(context.Background(), op); err != nil {
+	if err := s.executor.ExecuteRead(context.Background(), op); err != nil {
 		s.writeError(w, http.StatusNotFound, fmt.Sprintf("instance not found: %s", name))
 		return
 	}

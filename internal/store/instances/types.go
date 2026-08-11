@@ -7,7 +7,7 @@ type RDBMSInstance struct {
 	Name           string           `db:"name" json:"name"`
 	Port           int              `db:"port" json:"port"`
 	Version        string           `db:"version" json:"version"`
-	Status         string           `db:"status" json:"status"`
+	Status         InstanceStatus   `db:"status" json:"status"`
 	ContainerID    string           `db:"container_id" json:"containerId,omitempty"`
 	Password       string           `db:"password" json:"password,omitempty"`
 	CPUCores       int              `db:"cpu_cores" json:"cpuCores"`

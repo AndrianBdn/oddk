@@ -1,3 +1,5 @@
+//go:build oddk_debug
+
 package main
 
 import (
@@ -17,19 +19,21 @@ import (
 
 // snapshotManifest mirrors operations.SnapshotManifest for assertions.
 type snapshotManifest struct {
-	FormatVersion int      `json:"formatVersion"`
-	OddkVersion   string   `json:"oddkVersion"`
-	SourceHost    string   `json:"sourceHost"`
-	SourceArch    string   `json:"sourceArch"`
-	Migrations    []string `json:"migrations"`
-	Instances     []struct {
-		Name        string `json:"name"`
-		Version     string `json:"version"`
-		HasData     bool   `json:"hasData"`
-		Format      string `json:"format"`
-		CaptureMode string `json:"captureMode"`
-		SkipReason  string `json:"skipReason"`
-	} `json:"instances"`
+	FormatVersion int                        `json:"formatVersion"`
+	OddkVersion   string                     `json:"oddkVersion"`
+	SourceHost    string                     `json:"sourceHost"`
+	SourceArch    string                     `json:"sourceArch"`
+	Migrations    []string                   `json:"migrations"`
+	Instances     []snapshotManifestInstance `json:"instances"`
+}
+
+type snapshotManifestInstance struct {
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	HasData     bool   `json:"hasData"`
+	Format      string `json:"format"`
+	CaptureMode string `json:"captureMode"`
+	SkipReason  string `json:"skipReason"`
 }
 
 // tarEntryNames returns the archive member names in the order they physically

@@ -188,23 +188,53 @@ func (s *Server) MintToken() (string, error) {
 	return s.store.Auth.CreateToken()
 }
 
-// Shutdown gracefully shuts down the server
+// Shutdown gracefully shuts down the server.
+//
+// ORDER MATTERS, and it is not the obvious one. Scheduled operations inherit
+// the background context cancelled by s.cancel, so cancelling first would abort
+// the very operation this is supposed to protect — a half-aborted pg_restore or
+// container-create is precisely the debris the uninterruptible-operations
+// design exists to prevent. So: stop accepting work, wait for what is running,
+// and only then cancel.
+//
+// If ctx expires first, the in-flight operation is abandoned and the caller
+// gets ctx.Err(); the next daemon start reconciles whatever it left behind.
 func (s *Server) Shutdown(ctx context.Context) error {
-	// Cancel background processes
-	if s.cancel != nil {
-		s.cancel()
-	}
-
 	// Release the data-dir lock so a 'snapshot apply' can proceed once the
 	// daemon is down. (The kernel would drop it at process exit anyway, but the
 	// daemon is also constructed in-process by tests.)
 	defer s.dirLock.Release()
 
-	// Shutdown HTTP server with provided context
-	if s.httpServer != nil {
-		return s.httpServer.Shutdown(ctx)
+	// 1. Refuse new operations. In-flight ones are untouched.
+	if s.executor != nil {
+		s.executor.Close()
 	}
-	return nil
+
+	// 2. Stop accepting HTTP requests and wait for active handlers. Handlers
+	//    run their operations under context.Background(), so they are bounded
+	//    only by ctx here.
+	var httpErr error
+	if s.httpServer != nil {
+		httpErr = s.httpServer.Shutdown(ctx)
+	}
+
+	// 3. Wait for any operation started by the schedulers, which run in their
+	//    own goroutines and so are invisible to http.Server.Shutdown.
+	if s.executor != nil {
+		if err := s.executor.Drain(ctx); err != nil {
+			log.Printf("WARNING: shutdown: an operation was still running and has been abandoned: %v", err)
+			if httpErr == nil {
+				httpErr = err
+			}
+		}
+	}
+
+	// 4. Only now stop the background processes.
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	return httpErr
 }
 
 // pauseHealthChecksAndCleanupConnections pauses health checks and closes connections for an instance

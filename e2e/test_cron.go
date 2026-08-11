@@ -1,3 +1,5 @@
+//go:build oddk_debug
+
 package main
 
 import (

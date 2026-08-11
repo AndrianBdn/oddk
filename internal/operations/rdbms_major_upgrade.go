@@ -101,7 +101,7 @@ func (op *UpgradeRDBMSOp) Execute(ctx context.Context) error {
 // markError records "error" status — used by every failure past the first
 // destructive step (the instance can no longer be left "running" honestly).
 func (op *UpgradeRDBMSOp) markError() {
-	if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, "error"); statusErr != nil {
+	if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
 		log.Printf("Error updating status to error: %v", statusErr)
 	}
 }
@@ -250,7 +250,7 @@ func (op *UpgradeRDBMSOp) replaceCluster(ctx context.Context, plan *upgradePlan,
 
 	// Mark the instance as upgrading. From here, DB access uses direct
 	// connections (ConnectToRunningInstance rejects non-"running" status).
-	if err := op.deps.Store.Instances.UpdateStatus(name, "upgrading"); err != nil {
+	if err := op.deps.Store.Instances.UpdateStatus(name, instances.StatusUpgrading); err != nil {
 		log.Printf("Error updating status to upgrading: %v", err)
 	}
 
@@ -340,7 +340,7 @@ func (op *UpgradeRDBMSOp) finalize(plan *upgradePlan, backupResult *BackupRDBMSR
 		op.markError()
 		return fmt.Errorf("update instance image/version: %w", err)
 	}
-	if err := op.deps.Store.Instances.UpdateStatus(name, "running"); err != nil {
+	if err := op.deps.Store.Instances.UpdateStatus(name, instances.StatusRunning); err != nil {
 		log.Printf("Error updating status to running: %v", err)
 	}
 

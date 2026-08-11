@@ -80,6 +80,17 @@ func (t *Time) parse(s string) error {
 		t.Time = tt.UTC()
 		return nil
 	}
+	// Go's default time.Time.String() layout, e.g.
+	// "2026-08-11 04:53:54.122388675 +0000 UTC". Rows in this format exist in
+	// the wild: CronStore.UpdateLog took a map[string]any and callers passed a
+	// bare time.Time, which bypassed Value() above and wrote String() into a
+	// TEXT column. The write path is fixed, but a legacy row must still READ —
+	// one unparseable row fails the whole SELECT, which would make 'oddk cron
+	// logs' useless on exactly the long-lived deployments that need it most.
+	if tt, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", s); err == nil {
+		t.Time = tt.UTC()
+		return nil
+	}
 	return fmt.Errorf("cannot parse time %q", s)
 }
 

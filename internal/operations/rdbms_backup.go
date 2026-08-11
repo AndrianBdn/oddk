@@ -76,9 +76,11 @@ func BackupRDBMS(ctx context.Context, deps *Dependencies, params *BackupRDBMSPar
 		return nil, err
 	}
 
-	// 2. Create tar archive with zstd compression
+	// 2. Create tar archive with zstd compression. The archive is read back and
+	// checked before it is published; on failure nothing appears at archivePath
+	// and no catalogue row is written.
 	archivePath := backupPath + ".tar.zst"
-	size, err := compression.NewCompressor().CreateTarZstd(ctx, tempDir, archivePath)
+	size, err := compression.NewCompressor().CreateTarZstd(ctx, tempDir, archivePath, assertBackupMembers)
 	if err != nil {
 		return nil, fmt.Errorf("create archive: %w", err)
 	}
@@ -219,13 +221,20 @@ func backupGlobals(ctx context.Context, deps *Dependencies, instance *instances.
 		return err
 	}
 
+	// The Close error is CHECKED, not deferred-and-dropped. globals.sql carries
+	// every role and its hashed password; a write error surfaced at close would
+	// otherwise produce a silently truncated file that the archive's member
+	// assertion still accepts (it can only see that the member is non-empty),
+	// and the loss would appear at restore time as missing roles.
 	file, err := os.Create(outputPath) // #nosec G304 - outputPath is controlled by backup operation
 	if err != nil {
 		return fmt.Errorf("create globals file: %w", err)
 	}
-	defer func() { _ = file.Close() }()
-
-	if _, err := file.Write(buf.Bytes()); err != nil {
+	_, err = file.Write(buf.Bytes())
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		return fmt.Errorf("write globals file: %w", err)
 	}
 
@@ -325,4 +334,41 @@ func escapePgPassField(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `:`, `\:`)
 	return s
+}
+
+// assertBackupMembers checks that a freshly written per-instance backup archive
+// holds the members a restore will look for.
+//
+// A backup archive that verifies as a byte stream can still be useless — an
+// empty globals.sql, or a databases/ tree that never got written. The restore
+// path finds out at the worst possible moment, so the write path checks here.
+func assertBackupMembers(members []compression.Member) error {
+	if len(members) == 0 {
+		return fmt.Errorf("archive contains no members")
+	}
+
+	byName := make(map[string]compression.Member, len(members))
+	for _, m := range members {
+		byName[m.Name] = m
+	}
+
+	// globals.sql carries the roles and their hashed passwords; without it a
+	// restore silently produces a cluster nobody can log into.
+	for _, required := range []string{"globals.sql", instanceMetadataFile} {
+		m, ok := byName[required]
+		if !ok {
+			return fmt.Errorf("archive is missing %s", required)
+		}
+		if m.Size == 0 {
+			return fmt.Errorf("archive member %s is empty", required)
+		}
+	}
+
+	// databases.json is absent in archives written before it existed, so its
+	// presence is not required — but if it is there it must not be empty.
+	if m, ok := byName[databaseMetadataFile]; ok && m.Size == 0 {
+		return fmt.Errorf("archive member %s is empty", databaseMetadataFile)
+	}
+
+	return nil
 }

@@ -44,6 +44,7 @@ type SnapshotCronTaskOp struct {
 	backupDir  string
 	cronLogID  int
 	snapshotID int
+	reporter   *cronRunReporter
 }
 
 func NewSnapshotCronTaskOp(deps *Dependencies, backupDir string) *SnapshotCronTaskOp {
@@ -58,6 +59,10 @@ func (op *SnapshotCronTaskOp) Type() OpType { return OpTypeWrite }
 // phase failure — retention must still run on a night the capture failed, or a
 // broken snapshot job would also silently stop pruning.
 func (op *SnapshotCronTaskOp) Execute(ctx context.Context) error {
+	// Sample the previous run BEFORE creating this run's row, or the "previous
+	// run" the reporter finds is this one.
+	op.reporter = newCronRunReporter(op.deps, SnapshotCronInstance, "the whole deployment", "Snapshot")
+
 	cronLog, err := op.deps.Store.Cron.CreateLog(SnapshotCronInstance)
 	if err != nil {
 		return fmt.Errorf("creating snapshot cron log: %w", err)
@@ -70,7 +75,15 @@ func (op *SnapshotCronTaskOp) Execute(ctx context.Context) error {
 		log.Printf("Scheduled snapshot failed: %v", err)
 	} else {
 		op.phase("backup", "ok", nil)
+	}
 
+	// Ship whatever archive exists, INCLUDING one whose capture phase failed
+	// because some instance could not be captured. A degraded archive is still
+	// the newest restore point for every other instance, and leaving its only
+	// copy on the host is exactly backwards — the host is the thing offsite
+	// copies exist to survive. runSnapshot sets snapshotID whenever an archive
+	// was produced, which is the difference between "partial" and "nothing".
+	if op.snapshotID != 0 {
 		if err := op.runUpload(ctx); err != nil {
 			op.phase("backup_upload", "fail", err)
 			log.Printf("Snapshot upload failed: %v", err)
@@ -99,15 +112,23 @@ func (op *SnapshotCronTaskOp) Execute(ctx context.Context) error {
 	if err := op.deps.Store.Cron.CompleteLog(op.cronLogID); err != nil {
 		log.Printf("Warning: could not complete snapshot cron log %d: %v", op.cronLogID, err)
 	}
+
+	// Last, and never fatal: a notification problem must not turn a successful
+	// snapshot into a failed cron task.
+	op.reporter.finish(ctx)
 	return nil
 }
 
-// phase records one phase's outcome on the cron log.
+// phase records one phase's outcome on the cron log, and on the run reporter
+// that decides whether the operator hears about this run.
 func (op *SnapshotCronTaskOp) phase(name, status string, cause error) {
 	op.set(name+"_status", status)
 	op.set(name+"_finished_at", time.Now().UTC())
 	if cause != nil {
 		op.set(name+"_error", cause.Error())
+	}
+	if op.reporter != nil {
+		op.reporter.record(name, status, cause)
 	}
 }
 
@@ -144,6 +165,7 @@ func (op *SnapshotCronTaskOp) runSnapshot(ctx context.Context) error {
 		return err
 	}
 	op.snapshotID = result.ID
+	op.reporter.noteArchive()
 	log.Printf("Scheduled snapshot created: %s (%s, %d bytes, %d instance(s) with data, %d configuration-only)",
 		result.Path, result.Format, result.Size, result.InstancesWithData, result.ConfigOnly)
 	if result.ConfigOnly > 0 {
@@ -152,7 +174,13 @@ func (op *SnapshotCronTaskOp) runSnapshot(ctx context.Context) error {
 		log.Printf("WARNING: scheduled snapshot captured %d instance(s) configuration-only; they hold NO database contents",
 			result.ConfigOnly)
 	}
-	return nil
+
+	// An instance that could not be captured fails the capture PHASE even though
+	// the archive exists and is worth keeping. Reporting this run as successful
+	// would recreate, one level up, exactly the bug that made capture dispatch on
+	// the stored status: a green run over an archive that is silently empty for
+	// somebody. Every later phase still runs — the caller does not abort on this.
+	return result.CaptureFailureError()
 }
 
 func (op *SnapshotCronTaskOp) runUpload(ctx context.Context) error {
@@ -246,15 +274,21 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 	}
 
 	// List() is newest-first, so protecting the floor is a matter of counting
-	// how many still-present copies we have walked past.
-	kept := 0
+	// how many still-present copies we have walked past — see retentionFloor for
+	// why a record whose archive is gone must not consume a slot.
+	floor := newRetentionFloor(minRetainedSnapshots)
 	deleted := 0
+	reconciled := 0
 	for _, rec := range records {
 		if rec.LocalPath == "" {
 			continue
 		}
-		if kept < minRetainedSnapshots {
-			kept++
+		present := localArchivePresent("", rec.LocalPath)
+		if !present {
+			log.Printf("Warning: snapshot %d is catalogued with a local copy at %s but the file is not there; it does not count toward the newest-%d floor",
+				rec.ID, rec.LocalPath, minRetainedSnapshots)
+		}
+		if floor.protects(present) {
 			if rec.CreatedAt.Before(cutoff) {
 				log.Printf("Keeping local snapshot %d past retention: it is one of the newest %d, and expiring every archive would leave nothing to restore from",
 					rec.ID, minRetainedSnapshots)
@@ -264,7 +298,10 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 		if !rec.CreatedAt.Before(cutoff) {
 			continue
 		}
-		if offsiteConfigured && rec.RemotePath == "" {
+		// The only-copy safeguard protects a real copy. A record with no file
+		// behind it protects nothing, and holding it would strand the row
+		// forever: it can never be uploaded, so the condition can never clear.
+		if present && offsiteConfigured && rec.RemotePath == "" {
 			// The safeguard exists because "no remote copy" usually means the
 			// upload failed and will be retried. For an archive above the
 			// PutObject limit that is never true: it can NEVER be uploaded, so
@@ -284,10 +321,21 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 			log.Printf("Warning: could not remove local snapshot %d: %v", rec.ID, err)
 			continue
 		}
-		deleted++
+		if present {
+			deleted++
+		} else {
+			// removeLocalSnapshot tolerates a missing file, so an aged-out ghost
+			// row is repaired here rather than lingering. Counted separately: it
+			// freed no disk, and reporting it as a deleted archive would overstate
+			// what retention actually pruned.
+			reconciled++
+		}
 	}
 	if deleted > 0 {
 		log.Printf("Snapshot local cleanup: removed %d archive(s) older than %d days", deleted, plan.CleanupLocalDays)
+	}
+	if reconciled > 0 {
+		log.Printf("Snapshot local cleanup: cleared %d catalogue record(s) whose archive was already gone", reconciled)
 	}
 	return nil
 }
@@ -333,21 +381,29 @@ func (op *SnapshotCronTaskOp) runRemoteCleanup(ctx context.Context) error {
 		return err
 	}
 
-	kept := 0
+	// Same floor as local retention, and it matters more offsite: the remote copy
+	// is what survives losing the host. Existence is checked only while the floor
+	// is still filling, so this costs a couple of HeadObject calls per run rather
+	// than one per catalogued archive.
+	floor := newRetentionFloor(minRetainedSnapshots)
 	deleted := 0
 	for _, rec := range records {
 		if rec.RemotePath == "" {
 			continue
 		}
-		// Same floor as local retention, and it matters more offsite: the remote
-		// copy is what survives losing the host.
-		if kept < minRetainedSnapshots {
-			kept++
-			if rec.CreatedAt.Before(cutoff) {
-				log.Printf("Keeping offsite snapshot %d past retention: it is one of the newest %d",
-					rec.ID, minRetainedSnapshots)
+		if !floor.full() {
+			present := remoteArchivePresent(ctx, s3Client, settings.Bucket, rec.RemotePath)
+			if !present {
+				log.Printf("Warning: snapshot %d is catalogued with a remote copy at %s but the object is not in the bucket; it does not count toward the newest-%d floor",
+					rec.ID, rec.RemotePath, minRetainedSnapshots)
 			}
-			continue
+			if floor.protects(present) {
+				if rec.CreatedAt.Before(cutoff) {
+					log.Printf("Keeping offsite snapshot %d past retention: it is one of the newest %d",
+						rec.ID, minRetainedSnapshots)
+				}
+				continue
+			}
 		}
 		if !rec.CreatedAt.Before(cutoff) {
 			continue

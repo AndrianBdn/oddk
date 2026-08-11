@@ -178,11 +178,34 @@ func streamToLocalFileAtomic(ctx context.Context, s3Client *s3service.Client, ke
 	if err != nil {
 		return 0, err
 	}
+	// Verified BEFORE the rename, so a corrupt download never reaches a name
+	// that reads as a real archive — the same ordering writeVerifiedArchive uses
+	// on the way out.
+	if err := verifyDownloadedArchive(ctx, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, err
+	}
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("finalize downloaded archive: %w", err)
 	}
+	syncDir(filepath.Dir(localPath))
 	return written, nil
+}
+
+// syncDir flushes a directory entry so a rename survives a power loss. Failures
+// are logged, not returned: the file itself is already fsynced, and refusing a
+// completed download over an unsyncable directory would be the worse trade.
+func syncDir(dir string) {
+	d, err := os.Open(dir) // #nosec G304 - the daemon's own backup directory
+	if err != nil {
+		log.Printf("Warning: could not open %s to flush the rename: %v", dir, err)
+		return
+	}
+	if err := d.Sync(); err != nil {
+		log.Printf("Warning: could not flush directory %s: %v", dir, err)
+	}
+	_ = d.Close()
 }
 
 // FetchResult describes a fetched (or reused) archive in the downloads area.
@@ -198,7 +221,10 @@ type FetchResult struct {
 //   - an existing file with the object's exact size is REUSED (mtime bumped so
 //     the TTL sweep cannot reap an archive mid-restore-series) — retrying a
 //     failed restore or restoring several instances out of one archive must
-//     not download it again;
+//     not download it again. A reused file is NOT re-verified: it was verified
+//     when it was downloaded, and every restore path verifies again at extract
+//     time, so paying to decompress a multi-gigabyte archive on each instance of
+//     a restore series would buy nothing;
 //   - an existing file with a different size is atomically replaced: ODDK owns
 //     the downloads area exclusively and everything in it is re-fetchable, so a
 //     refusal here would only break retry-after-corruption;
@@ -248,6 +274,9 @@ func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key
 	}
 
 	written, err := client.DownloadFileTo(ctx, key, &downloadProgressWriter{w: tmpFile, total: size, progress: progress})
+	if err == nil {
+		err = tmpFile.Sync()
+	}
 	closeErr := tmpFile.Close()
 	if err == nil && closeErr != nil {
 		err = fmt.Errorf("finish temp download file: %w", closeErr)
@@ -255,6 +284,14 @@ func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key
 	if err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("download %s: %w", uri, err)
+	}
+	// Verified before the rename and before the sidecar: the sidecar's whole job
+	// is to let a later fetch REUSE this file without downloading it again, so
+	// vouching for bytes nobody has checked would cache the corruption.
+	emitLine(progress, "Verifying %s...", name)
+	if err := verifyDownloadedArchive(ctx, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, err
 	}
 	// Invalidate any stale sidecar before the archive lands: a crash between
 	// the rename and the sidecar write must leave "unknown provenance" (which
@@ -264,6 +301,7 @@ func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key
 		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("finalize downloaded archive: %w", err)
 	}
+	syncDir(destDir)
 	if err := writeDownloadSource(sidecarPath, uri, info.ETag); err != nil {
 		// Best-effort: a missing sidecar only costs a re-download next time.
 		emitLine(progress, "  (warning: could not record download provenance: %v)", err)

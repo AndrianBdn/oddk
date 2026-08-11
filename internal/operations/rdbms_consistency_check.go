@@ -41,24 +41,52 @@ func (op *ConsistencyCheckOp) Type() OpType {
 	return OpTypeRead
 }
 
+// Execute inspects the instance and reports what it finds. It WRITES NOTHING.
+//
+// It is declared OpTypeRead and reached from the three most-run read commands
+// (`oddk list`, `oddk instance status`, `oddk checklist`), and it runs on the
+// executor's lock-free read path — so writing here would both break the
+// OpTypeRead contract and race with whatever write operation is in flight.
+//
+// It used to persist. First the PostgreSQL probe verdict, which latched: one
+// blip wrote "broken-port" from an ordinary `oddk list`, and the recovery path
+// had no branch that wrote "running" back, so every later run observed a healthy
+// server and re-persisted the stale value. That was narrowed in 0.1.66 to
+// container-derived state only, and is now removed entirely — because even the
+// narrow version had the same shape of bug: an out-of-band `docker stop`,
+// once observed by any `oddk list`, wrote "stopped" and thereby removed the
+// instance from health monitoring (the checker skips anything not "running"), so
+// no degraded notification could ever fire for it. A read command silently
+// switching off monitoring is exactly the disease this file caught.
+//
+// Startup reconciliation owns store correction now (see daemon.decideReconcile).
+// Between restarts a stale row is harmless: snapshot capture asks Docker
+// directly, the checklist and `oddk list` display the corrected status computed
+// here in memory, and an instance whose container really did stop now fails its
+// health check and alerts — which is the truthful outcome.
 func (op *ConsistencyCheckOp) Execute(ctx context.Context) error {
-	// Check if container exists
-	containerStatus, err := op.deps.Docker.GetContainerStatus(op.instance.ContainerID)
+	containerState, err := op.deps.Docker.GetContainerStatus(op.instance.ContainerID)
 	if err != nil {
 		op.status.ContainerExists = false
-		op.status.Issues = append(op.status.Issues, fmt.Sprintf("container %s does not exist", op.instance.ContainerID))
-		op.instance.Status = "broken"
+		op.status.Issues = append(op.status.Issues, fmt.Sprintf("container state could not be determined: %v", err))
 		return nil // Continue checking other aspects
+	}
+
+	if containerState == "not found" {
+		op.status.ContainerExists = false
+		op.status.Issues = append(op.status.Issues, fmt.Sprintf("container %s does not exist", op.instance.ContainerID))
+		op.instance.Status = instances.StatusError
+		return nil
 	}
 	op.status.ContainerExists = true
 
 	// Check if container is running
-	if containerStatus == "running" {
+	if containerState == "running" {
 		op.status.ContainerRunning = true
 	} else {
 		op.status.ContainerRunning = false
-		op.status.Issues = append(op.status.Issues, fmt.Sprintf("container is %s, not running", containerStatus))
-		op.instance.Status = containerStatus
+		op.status.Issues = append(op.status.Issues, fmt.Sprintf("container is %s, not running", containerState))
+		op.instance.Status = instances.InstanceStatus(containerState)
 	}
 
 	// Check PostgreSQL connectivity (only if container is running)
@@ -68,16 +96,16 @@ func (op *ConsistencyCheckOp) Execute(ctx context.Context) error {
 
 		switch pgStatus {
 		case PostgreSQLStatusOK:
-			// All good, no action needed
+			op.instance.Status = instances.StatusRunning
 		case PostgreSQLStatusBrokenPort:
 			op.status.Issues = append(op.status.Issues, "PostgreSQL port is not accessible")
-			op.instance.Status = "broken-port"
+			op.instance.Status = instances.StatusBrokenPort
 		case PostgreSQLStatusBrokenAuth:
 			op.status.Issues = append(op.status.Issues, "PostgreSQL authentication failed")
-			op.instance.Status = "broken-auth"
+			op.instance.Status = instances.StatusBrokenAuth
 		case PostgreSQLStatusOther:
 			op.status.Issues = append(op.status.Issues, "PostgreSQL connectivity issue (other)")
-			op.instance.Status = "broken"
+			op.instance.Status = instances.StatusBroken
 		}
 	}
 
@@ -85,13 +113,6 @@ func (op *ConsistencyCheckOp) Execute(ctx context.Context) error {
 	op.status.OverallHealthy = op.status.ContainerExists &&
 		op.status.ContainerRunning &&
 		op.status.PostgreSQLReady
-
-	// Update status in database if needed
-	if op.instance.Status != containerStatus && op.status.ContainerExists {
-		if err := op.deps.Store.Instances.UpdateStatus(op.instance.Name, op.instance.Status); err != nil {
-			return fmt.Errorf("update status: %w", err)
-		}
-	}
 
 	return nil
 }

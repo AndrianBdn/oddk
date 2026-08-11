@@ -72,7 +72,7 @@ func (s *InstanceStore) List() ([]RDBMSInstance, error) {
 	return instances, nil
 }
 
-func (s *InstanceStore) UpdateStatus(name, status string) error {
+func (s *InstanceStore) UpdateStatus(name string, status InstanceStatus) error {
 	now := rfc3339time.Now()
 	result, err := s.db.Exec(`UPDATE rdbms_instances SET status = ?, updated_at = ? WHERE name = ?`,
 		status, now, name)

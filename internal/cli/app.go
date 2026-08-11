@@ -34,6 +34,7 @@ func BuildApp(client *Client) *cli.Command {
 			notifyCommands(client),
 			backupCommands(client),
 			snapshotCommands(client),
+			cronCommands(client),
 			parametersCommands(client),
 			customKVCommands(client),
 			offsiteCommands(client),
@@ -449,6 +450,47 @@ func instanceCommands(client *Client) *cli.Command {
 					},
 				},
 				Action: client.majorUpgradeAction,
+			},
+		},
+	}
+}
+
+// cronCommands exposes the scheduled-run history. It is its own group rather
+// than living under `backup` or `snapshot` because one history covers both:
+// per-instance backup runs and the whole-deployment snapshot run share the
+// cron_logs table, and "did last night's scheduled work succeed" is one
+// question, not two.
+//
+// The schedules themselves are still set with `backup setup-cron` /
+// `snapshot setup-cron`, next to the thing being scheduled.
+func cronCommands(client *Client) *cli.Command {
+	return &cli.Command{
+		Name:  "cron",
+		Usage: "Inspect scheduled backup and snapshot runs",
+		Commands: []*cli.Command{
+			{
+				Name:  "logs",
+				Usage: "Show the history of scheduled backup and snapshot runs",
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "limit",
+						Value: 20,
+						Usage: "Maximum number of runs to show",
+					},
+					&cli.StringFlag{
+						Name:  "instance",
+						Usage: "Only show runs for this instance (omit for all, including snapshots)",
+					},
+					&cli.BoolFlag{
+						Name:  "failures",
+						Usage: "Only show runs that had a failed phase",
+					},
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "Output as JSON",
+					},
+				},
+				Action: client.cronLogsAction,
 			},
 		},
 	}

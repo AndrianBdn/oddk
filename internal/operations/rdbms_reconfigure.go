@@ -66,7 +66,7 @@ func (op *ReconfigureRDBMSOp) Execute(ctx context.Context) error {
 		return fmt.Errorf("decrypt password: %w", err)
 	}
 
-	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, "reconfiguring"); err != nil {
+	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusReconfiguring); err != nil {
 		log.Printf("Error updating status to reconfiguring: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func (op *ReconfigureRDBMSOp) Execute(ctx context.Context) error {
 	)
 	if err != nil {
 		// Try to restore the old status
-		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, "error"); statusErr != nil {
+		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
 			log.Printf("Error updating status to error: %v", statusErr)
 		}
 		return fmt.Errorf("recreate container: %w", err)
@@ -103,7 +103,7 @@ func (op *ReconfigureRDBMSOp) Execute(ctx context.Context) error {
 	}
 
 	if err := op.deps.Docker.StartContainer(newContainerID); err != nil {
-		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, "error"); statusErr != nil {
+		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
 			log.Printf("Error updating status to error: %v", statusErr)
 		}
 		return fmt.Errorf("start container: %w", err)
@@ -112,13 +112,13 @@ func (op *ReconfigureRDBMSOp) Execute(ctx context.Context) error {
 	// Wait for the recreated container to actually accept connections before
 	// reporting "running".
 	if err := waitForPostgresReady(ctx, instance.Port, password); err != nil {
-		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, "error"); statusErr != nil {
+		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
 			log.Printf("Error updating status to error: %v", statusErr)
 		}
 		return fmt.Errorf("wait for PostgreSQL readiness: %w", err)
 	}
 
-	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, "running"); err != nil {
+	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusRunning); err != nil {
 		log.Printf("Error updating status to running: %v", err)
 	}
 

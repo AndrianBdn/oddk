@@ -15,6 +15,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/operr"
 	"github.com/andrianbdn/oddk/internal/rfc3339time"
+	"github.com/andrianbdn/oddk/internal/store/instances"
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 	"github.com/andrianbdn/oddk/internal/version"
 )
@@ -170,6 +171,16 @@ type MakeSnapshotParams struct {
 	SpreadCheckpoint bool
 }
 
+// SnapshotCaptureFailure is one instance whose data capture was ATTEMPTED and
+// FAILED, as opposed to one that had nothing to capture (no container, stopped
+// under --logical, paused). Both end up configuration-only in the archive; only
+// this one means something is broken and needs fixing.
+type SnapshotCaptureFailure struct {
+	Instance string `json:"instance"`
+	Stage    string `json:"stage"` // "base backup", "cold copy", "dump", "decrypt password"
+	Error    string `json:"error"`
+}
+
 // MakeSnapshotResult describes the produced archive.
 type MakeSnapshotResult struct {
 	ID                int                     `json:"id,omitempty"`
@@ -180,6 +191,27 @@ type MakeSnapshotResult struct {
 	Instances         []SnapshotInstanceEntry `json:"instances"`
 	InstancesWithData int                     `json:"instancesWithData"`
 	ConfigOnly        int                     `json:"configOnly"`
+
+	// CaptureFailures is non-empty when the archive was written but is NOT a
+	// complete capture of the deployment. Callers must treat that as a failed
+	// run — see CaptureFailureError — while still keeping, shipping and
+	// cataloguing the archive.
+	CaptureFailures []SnapshotCaptureFailure `json:"captureFailures,omitempty"`
+}
+
+// CaptureFailureError summarises the per-instance capture failures as one
+// error, or nil when the capture was complete. It is what turns a degraded
+// archive into a reported failure at every layer above this one.
+func (r *MakeSnapshotResult) CaptureFailureError() error {
+	if len(r.CaptureFailures) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(r.CaptureFailures))
+	for _, f := range r.CaptureFailures {
+		parts = append(parts, fmt.Sprintf("%s (%s: %s)", f.Instance, f.Stage, f.Error))
+	}
+	return fmt.Errorf("the archive was written but %d of %d instance(s) could not be captured and hold NO database contents in it: %s",
+		len(r.CaptureFailures), len(r.Instances), strings.Join(parts, "; "))
 }
 
 // MakeSnapshot captures the whole deployment — every instance's databases and
@@ -224,7 +256,7 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 	}
 	defer func() { _ = os.RemoveAll(stagingDir) }()
 
-	entries, err := stageAllInstances(ctx, deps, stagingDir, format, params.SpreadCheckpoint)
+	entries, captureFailures, err := stageAllInstances(ctx, deps, stagingDir, format, params.SpreadCheckpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -273,9 +305,14 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 		})
 	}
 
-	size, err := compression.NewCompressor().CreateTarZstdOrdered(ctx, archiveEntries, archivePath)
+	// The archive is read back before it is published, and this asserts it holds
+	// what the manifest promises. On any failure nothing is written to
+	// archivePath and nothing is catalogued — see writeVerifiedArchive.
+	size, err := compression.NewCompressor().CreateTarZstdOrdered(ctx, archiveEntries, archivePath,
+		func(members []compression.Member) error {
+			return assertSnapshotMembers(members, entries)
+		})
 	if err != nil {
-		_ = os.Remove(archivePath)
 		return nil, fmt.Errorf("create snapshot archive: %w", err)
 	}
 
@@ -332,26 +369,107 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 		Instances:         entries,
 		InstancesWithData: withData,
 		ConfigOnly:        len(entries) - withData,
+		CaptureFailures:   captureFailures,
 	}, nil
+}
+
+// captureAction is how stageAllInstances should capture one instance.
+type captureAction int
+
+const (
+	captureConfigOnly captureAction = iota
+	captureBasebackup
+	captureCold
+	captureLogicalDump
+)
+
+// decideCapture chooses how to capture one instance, and returns the reason
+// when the answer is configuration-only.
+//
+// It dispatches on actualState — what Docker reports the container is doing
+// right now — and NEVER on storedStatus. That distinction is the difference
+// between a correct DR archive and a silently empty one, because storedStatus
+// drifts, in ways this codebase creates itself:
+//
+//   - startup reconcile repairs only a few (storedStatus, dockerState) pairs,
+//     so a crashed switch/upgrade/reconfigure leaves its transient status
+//     behind forever;
+//   - ConsistencyCheckOp can latch "broken-port" onto an instance that is up
+//     and serving, from an ordinary `oddk list` during a blip, and never
+//     clears it;
+//   - an operator can `docker start`/`docker stop` out of band.
+//
+// Dispatching on that string reduced a live, serving cluster to
+// configuration-only in EVERY subsequent archive — the worst failure this
+// command had, because it failed OPEN: the snapshot still completed, was
+// catalogued, was uploaded, and counted toward the retention floor.
+//
+// storedStatus survives only as warning text, and as the caller's rule for
+// whether a capture failure may abort the whole run.
+func decideCapture(format string, storedStatus instances.InstanceStatus, containerID, actualState string, stateErr error) (captureAction, string) {
+	switch {
+	case containerID == "":
+		return captureConfigOnly, fmt.Sprintf("instance is recorded %q and has no container; databases not captured", storedStatus)
+	case stateErr != nil:
+		return captureConfigOnly, fmt.Sprintf("container state could not be determined (%v); databases not captured", stateErr)
+	case actualState == "not found":
+		return captureConfigOnly, fmt.Sprintf("instance is recorded %q and its container no longer exists; databases not captured", storedStatus)
+	}
+
+	if format == SnapshotFormatPhysical {
+		switch actualState {
+		case "running":
+			return captureBasebackup, ""
+		case "stopped":
+			// GetContainerStatus normalizes every existing, non-live state
+			// (exited/created/dead) to "stopped" — exactly the set that is safe
+			// to copy file-by-file. A stopped cluster's data directory is a
+			// valid physical backup (worst case it recovers like a crash on
+			// start), which is why physical mode captures it rather than
+			// reducing it to configuration the way logical mode must.
+			return captureCold, ""
+		default:
+			// paused/restarting: neither cleanly stopped (a cold copy would
+			// tear) nor serving (a basebackup would hang).
+			return captureConfigOnly, fmt.Sprintf("container is %q, which is neither serving nor cleanly stopped; databases not captured", actualState)
+		}
+	}
+
+	// Logical mode needs a live server: a dump cannot read a stopped cluster.
+	if actualState != "running" {
+		return captureConfigOnly, fmt.Sprintf("container is %q and logical dumps need a live server; databases not captured", actualState)
+	}
+	return captureLogicalDump, ""
 }
 
 // stageAllInstances captures every instance into stagingDir/instances/<name>/,
 // returning one manifest entry per instance.
 //
-// Logical mode dumps running instances and captures the rest
-// configuration-only. Physical mode does better on stopped instances: a
+// Dispatch is on the container's ACTUAL Docker state, never on the instance's
+// stored status — see the long comment in the loop for why that distinction is
+// the difference between a correct DR archive and a silently empty one.
+//
+// Logical mode dumps whatever is running and captures the rest
+// configuration-only. Physical mode does better on a stopped container: a
 // stopped cluster's data directory is a valid physical backup (worst case it
 // recovers like a crash on start), so it is COLD-COPIED rather than reduced to
 // configuration — the whole reason a deployment stops an instance is that its
-// data still matters. Only "error" instances (nothing reliable to copy) and
-// stopped instances whose container is gone stay configuration-only.
-func stageAllInstances(ctx context.Context, deps *Dependencies, stagingDir, format string, spreadCheckpoint bool) ([]SnapshotInstanceEntry, error) {
+// data still matters. Only an instance with no container at all, one whose
+// container state cannot be read, and one that is paused/restarting (neither
+// serving nor cleanly stopped) stay configuration-only.
+//
+// A capture that is ATTEMPTED and FAILS degrades that one entry to
+// configuration-only and is reported through the returned failure list; it does
+// not abort the run. See the comment on degrade below for why that is the safer
+// of the two options, and what still does abort.
+func stageAllInstances(ctx context.Context, deps *Dependencies, stagingDir, format string, spreadCheckpoint bool) ([]SnapshotInstanceEntry, []SnapshotCaptureFailure, error) {
 	list, err := deps.Store.Instances.List()
 	if err != nil {
-		return nil, fmt.Errorf("list instances: %w", err)
+		return nil, nil, fmt.Errorf("list instances: %w", err)
 	}
 
 	entries := make([]SnapshotInstanceEntry, 0, len(list))
+	var failures []SnapshotCaptureFailure
 	for i := range list {
 		instance := &list[i]
 		entry := SnapshotInstanceEntry{
@@ -363,7 +481,7 @@ func stageAllInstances(ctx context.Context, deps *Dependencies, stagingDir, form
 
 		instanceDir := filepath.Join(stagingDir, snapshotInstancesDir, instance.Name)
 		if err := os.MkdirAll(instanceDir, 0o750); err != nil {
-			return nil, fmt.Errorf("create staging dir for %s: %w", instance.Name, err)
+			return nil, nil, fmt.Errorf("create staging dir for %s: %w", instance.Name, err)
 		}
 		// Every entry carries instance.json: apply rebuilds the container from
 		// it whether or not the entry holds data. The logical dump path writes
@@ -380,99 +498,135 @@ func stageAllInstances(ctx context.Context, deps *Dependencies, stagingDir, form
 			entries = append(entries, entry)
 		}
 
-		switch {
-		case format == SnapshotFormatPhysical && instance.Status == "running":
+		// Ask Docker what the container is doing RIGHT NOW — never the stored
+		// status. See decideCapture for why.
+		var actual string
+		var stateErr error
+		if instance.ContainerID != "" {
+			actual, stateErr = deps.Docker.GetContainerStatus(instance.ContainerID)
+		}
+
+		action, reason := decideCapture(format, instance.Status, instance.ContainerID, actual, stateErr)
+
+		// The capture is correct either way, but a disagreement means the stored
+		// row is wrong and something should be fixed — say so.
+		if stateErr == nil && actual != "" && string(instance.Status) != actual {
+			log.Printf("WARNING: snapshot: instance %q is recorded %q but its container is %q; capturing from the container's ACTUAL state (the stored status is stale — 'oddk instance start %s' will correct it)",
+				instance.Name, instance.Status, actual, instance.Name)
+		}
+
+		// A capture failure DEGRADES this one entry to configuration-only. It does
+		// not abort the run.
+		//
+		// The original behaviour was the opposite: any genuine capture failure
+		// returned an error and produced no archive for ANY instance. That trades
+		// one instance's bad night for every instance's — and the scheduler dedups
+		// on the slot start, so the interval is burned too. A persistent trigger
+		// (exhausted WAL senders, wal_level=minimal, a tablespace) therefore meant
+		// weeks with no DR archive at all for a deployment that was otherwise
+		// perfectly capturable.
+		//
+		// Degrading is only defensible because the failure is now impossible to
+		// miss. It is reported six ways: the manifest entry (hasData:false plus a
+		// specific skipReason), snapshot_history.instances_json — which makes
+		// `oddk checklist` print "✗ config-only" for that instance — a stdout
+		// WARNING, the capture phase of the scheduled run recorded as FAILED, the
+		// notification that phase sends, and a non-zero exit from
+		// `oddk snapshot make`. Before those existed (v0.1.62 and v0.1.67),
+		// aborting was the safer of two bad options; now it is just the worse one.
+		//
+		// What still aborts is anything that makes the ARCHIVE ITSELF
+		// untrustworthy: listing instances, staging directories, oddk.db, the
+		// manifest, and the archive write with its read-back verification.
+		degrade := func(what string, cause error) {
+			failures = append(failures, SnapshotCaptureFailure{
+				Instance: instance.Name, Stage: what, Error: cause.Error(),
+			})
+			resetToConfigOnly(instanceDir, writeMeta)
+			configOnly(fmt.Sprintf("%s FAILED (%v); databases not captured — this instance would restore EMPTY",
+				what, cause))
+		}
+
+		// Every entry carries instance.json. The logical dump path writes its
+		// own copy inside stageInstanceDump (shared with per-instance backups).
+		if action != captureLogicalDump {
 			if err := writeMeta(); err != nil {
-				return nil, fmt.Errorf("stage %s: %w", instance.Name, err)
+				return nil, nil, fmt.Errorf("stage %s: %w", instance.Name, err)
 			}
+		}
+
+		switch action {
+		case captureConfigOnly:
+			configOnly(reason)
+
+		case captureBasebackup:
 			password, err := crypto.DecryptPassword(instance.Password, deps.MasterKey)
 			if err != nil {
-				return nil, fmt.Errorf("decrypt password for %s: %w", instance.Name, err)
+				degrade("decrypt password", err)
+				continue
 			}
 			log.Printf("Snapshot: base backup of instance %s", instance.Name)
 			if err := stagePhysicalBasebackup(ctx, deps, instance, password, instanceDir, spreadCheckpoint); err != nil {
-				return nil, fmt.Errorf("base backup of instance %s: %w", instance.Name, err)
+				degrade("base backup", err)
+				continue
 			}
 			entry.HasData = true
 			entry.CaptureMode = captureModeBasebackup
 			entries = append(entries, entry)
 
-		case format == SnapshotFormatPhysical && instance.Status == "stopped" && instance.ContainerID != "":
-			if err := writeMeta(); err != nil {
-				return nil, fmt.Errorf("stage %s: %w", instance.Name, err)
+		case captureCold:
+			log.Printf("Snapshot: cold copy of stopped instance %s", instance.Name)
+			if err := stagePhysicalCold(ctx, deps, instance, instanceDir); err != nil {
+				degrade("cold copy", err)
+				continue
 			}
-			// The stored status can drift from Docker between daemon restarts
-			// (reconcile runs only at startup): an operator can `docker start`
-			// or `docker rm` the container out-of-band. Dispatch on the
-			// container's ACTUAL state — a cold copy of a live cluster would be
-			// silently torn, and a vanished container must degrade this one
-			// instance rather than abort the whole DR capture.
-			actual, statusErr := deps.Docker.GetContainerStatus(instance.ContainerID)
-			switch {
-			case statusErr != nil:
-				configOnly(fmt.Sprintf("instance is stopped but its container state could not be determined (%v); databases not captured", statusErr))
-			case actual == "not found":
-				configOnly("instance is stopped and its container no longer exists; databases not captured")
-			case actual == "running":
-				// The server is actually up: capture it the safe way, over the
-				// replication protocol, rather than refusing the whole night.
-				log.Printf("WARNING: snapshot: instance %q is recorded stopped but its container is RUNNING (started outside ODDK?); capturing with pg_basebackup instead of a cold copy", instance.Name)
-				password, err := crypto.DecryptPassword(instance.Password, deps.MasterKey)
-				if err != nil {
-					return nil, fmt.Errorf("decrypt password for %s: %w", instance.Name, err)
-				}
-				if err := stagePhysicalBasebackup(ctx, deps, instance, password, instanceDir, spreadCheckpoint); err != nil {
-					return nil, fmt.Errorf("base backup of instance %s: %w", instance.Name, err)
-				}
-				entry.HasData = true
-				entry.CaptureMode = captureModeBasebackup
-				entries = append(entries, entry)
-			case actual == "stopped":
-				// GetContainerStatus normalizes every existing, non-live state
-				// (exited/created/dead) to "stopped" — exactly the set that is
-				// safe to copy file-by-file.
-				log.Printf("Snapshot: cold copy of stopped instance %s", instance.Name)
-				if err := stagePhysicalCold(ctx, deps, instance, instanceDir); err != nil {
-					return nil, fmt.Errorf("cold copy of instance %s: %w", instance.Name, err)
-				}
-				entry.HasData = true
-				entry.CaptureMode = captureModeCold
-				entries = append(entries, entry)
-			default:
-				// paused/restarting: neither cleanly stopped (cold copy would
-				// tear) nor serving (basebackup would hang).
-				configOnly(fmt.Sprintf("instance is recorded stopped but its container is %q; databases not captured", actual))
-			}
+			entry.HasData = true
+			entry.CaptureMode = captureModeCold
+			entries = append(entries, entry)
 
-		case format == SnapshotFormatPhysical:
-			if err := writeMeta(); err != nil {
-				return nil, fmt.Errorf("stage %s: %w", instance.Name, err)
-			}
-			configOnly(fmt.Sprintf("instance was %s at snapshot time; databases not captured", instance.Status))
-
-		case instance.Status != "running":
-			// Logical mode cannot capture a stopped instance at all: dumps need
-			// a live server.
-			if err := writeMeta(); err != nil {
-				return nil, fmt.Errorf("stage %s: %w", instance.Name, err)
-			}
-			configOnly(fmt.Sprintf("instance was %s at snapshot time; databases not captured", instance.Status))
-
-		default:
+		case captureLogicalDump:
 			password, err := crypto.DecryptPassword(instance.Password, deps.MasterKey)
 			if err != nil {
-				return nil, fmt.Errorf("decrypt password for %s: %w", instance.Name, err)
+				degrade("decrypt password", err)
+				continue
 			}
 			log.Printf("Snapshot: dumping instance %s", instance.Name)
 			if err := stageInstanceDump(ctx, deps, instance, password, instanceDir); err != nil {
-				return nil, fmt.Errorf("dump instance %s: %w", instance.Name, err)
+				degrade("dump", err)
+				continue
 			}
 			entry.HasData = true
 			entries = append(entries, entry)
 		}
 	}
 
-	return entries, nil
+	return entries, failures, nil
+}
+
+// resetToConfigOnly discards whatever a failed capture left in the staging
+// directory and makes sure the entry still carries its instance.json.
+//
+// A capture that fails part-way through has usually already written something —
+// a truncated base.tar.zst, a partial dump directory. Archiving that would put
+// bytes into every copy of the snapshot that no restore path will ever read
+// (apply and restore-instance branch on the manifest entry, which now says
+// hasData:false), and would leave a trap for anyone who inspects the files
+// instead of the manifest and concludes the data is in there.
+//
+// Failures here are logged rather than fatal: a missing instance.json is caught
+// by assertSnapshotMembers before the archive is published, which is the check
+// that must have the last word anyway.
+func resetToConfigOnly(instanceDir string, writeMeta func() error) {
+	// Everything a capture can produce under the instance directory; instance.json
+	// is deliberately not in the list.
+	for _, leftover := range []string{snapshotBasebackupDir, "databases", "globals.sql", databaseMetadataFile} {
+		if err := os.RemoveAll(filepath.Join(instanceDir, leftover)); err != nil {
+			log.Printf("Warning: snapshot: could not discard partial %q left by a failed capture: %v", leftover, err)
+		}
+	}
+	if err := writeMeta(); err != nil {
+		log.Printf("Warning: snapshot: could not write %s for a degraded entry: %v", instanceMetadataFile, err)
+	}
 }
 
 // sanitizeHostForFilename reduces a hostname to characters that are safe in a
@@ -525,4 +679,100 @@ func ReadSnapshotManifest(extractedDir string) (*SnapshotManifest, error) {
 		return nil, fmt.Errorf("parse %s: %w", snapshotManifestFile, err)
 	}
 	return &manifest, nil
+}
+
+// assertSnapshotMembers checks that a freshly written snapshot archive actually
+// holds what its manifest promises.
+//
+// This is the structural half of verification, and it is the defensible version
+// of a "size baseline". A byte threshold cannot do this job: a perfectly good
+// snapshot is a few megabytes for one small cluster, or a few kilobytes when
+// every instance was captured configuration-only, and for physical archives the
+// WAL term alone swings by orders of magnitude between an idle and a busy
+// capture window. What an operator actually wants to know is "did every instance
+// that claims to have data actually get its data written", and that is a
+// presence-and-non-zero question, not a size question.
+//
+// The expected set is derived from the same `entries` slice that becomes the
+// manifest and instances_json, never from hard-coded paths, so the assertion and
+// the archive layout cannot drift apart.
+func assertSnapshotMembers(members []compression.Member, entries []SnapshotInstanceEntry) error {
+	// A zero-length file decompresses cleanly with zero members, so the stream
+	// check alone cannot catch it. This is the branch that does.
+	if len(members) == 0 {
+		return fmt.Errorf("archive contains no members")
+	}
+
+	byName := make(map[string]compression.Member, len(members))
+	var firstFile string
+	for _, m := range members {
+		byName[m.Name] = m
+		if firstFile == "" && !m.IsDir {
+			firstFile = m.Name
+		}
+	}
+
+	// Ordering is a load-bearing property, not a cosmetic one: apply reads the
+	// manifest to check version compatibility, and tar has no index, so a
+	// manifest that is not first means streaming gigabytes to find it. Asserting
+	// it on the ARTIFACT (rather than only in TestSnapshotMake) means an archive
+	// with the wrong order can never be published.
+	if firstFile != snapshotManifestFile {
+		return fmt.Errorf("first archive member is %q, expected %q", firstFile, snapshotManifestFile)
+	}
+
+	nonEmpty := func(name string) error {
+		m, ok := byName[name]
+		if !ok {
+			return fmt.Errorf("archive is missing %s", name)
+		}
+		if m.Size == 0 {
+			return fmt.Errorf("archive member %s is empty", name)
+		}
+		return nil
+	}
+
+	if err := nonEmpty(snapshotStoreFile); err != nil {
+		return err
+	}
+
+	for _, e := range entries {
+		base := snapshotInstancesDir + "/" + e.Name
+
+		// Every entry carries its configuration, including configuration-only
+		// ones — apply rebuilds the container from it either way.
+		if err := nonEmpty(base + "/" + instanceMetadataFile); err != nil {
+			return fmt.Errorf("instance %s: %w", e.Name, err)
+		}
+
+		if !e.HasData {
+			continue
+		}
+
+		// An entry claiming data must actually carry a non-empty payload. This is
+		// the check that catches "the dump ran, returned success, and produced
+		// nothing" — the failure mode that otherwise reaches a restore.
+		if entryFormat(e) == SnapshotFormatPhysical {
+			if err := nonEmpty(base + "/" + snapshotBasebackupDir + "/base.tar.zst"); err != nil {
+				return fmt.Errorf("instance %s claims physical data: %w", e.Name, err)
+			}
+			continue
+		}
+
+		if err := nonEmpty(base + "/globals.sql"); err != nil {
+			return fmt.Errorf("instance %s claims logical data: %w", e.Name, err)
+		}
+		hasDatabasePayload := false
+		for name, m := range byName {
+			if !m.IsDir && m.Size > 0 && strings.HasPrefix(name, base+"/databases/") {
+				hasDatabasePayload = true
+				break
+			}
+		}
+		if !hasDatabasePayload {
+			return fmt.Errorf("instance %s claims logical data but no non-empty file exists under %s/databases/", e.Name, base)
+		}
+	}
+
+	return nil
 }

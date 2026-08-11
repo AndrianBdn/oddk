@@ -18,7 +18,7 @@ func (s *Server) handleGetPassword(w http.ResponseWriter, r *http.Request) {
 
 	op := operations.NewGetPasswordOp(s.opDeps, name)
 
-	if err := s.executor.Execute(context.Background(), op); err != nil {
+	if err := s.executor.ExecuteRead(context.Background(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get password: %v", err))
 		return
 	}

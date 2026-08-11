@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -1046,9 +1048,53 @@ func runDaemon(port int, dataDir, backupDir string, allowRemote bool) error {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
 
+	// `systemctl stop oddk` — which scripts/remote/oddk-update.sh runs
+	// unconditionally on every update — used to kill this process instantly,
+	// including inside the destructive phase of a major upgrade, a restore or a
+	// snapshot. Operations are uninterruptible by design (see
+	// operations.Executor.Execute), so the only safe stop is to stop accepting
+	// work and then WAIT for whatever is running.
+	//
+	// A second signal gives up waiting, for an operator who knows what they are
+	// interrupting. systemd's TimeoutStopSec is the final backstop.
+	//
+	// The handler lives here, in the daemon's process entry point, rather than
+	// in Server.Start: the e2e harness constructs servers in-process, and a
+	// library that installs signal handlers would hijack its test binary.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
 	// Note: the daemon no longer drops a .oddk-cli.json in its working dir.
 	// Mint and install a CLI token explicitly with `oddk auth mint` instead.
-	return server.Start()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Start() }()
+
+	select {
+	case err := <-serveErr:
+		return err
+	case sig := <-sigCh:
+		log.Printf("Received %s: shutting down. Waiting for any in-flight operation to finish "+
+			"(a snapshot, restore or major upgrade can take a while) - send the signal again to stop waiting.", sig)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case sig := <-sigCh:
+			log.Printf("WARNING: received %s again: abandoning the graceful shutdown. An operation may be "+
+				"interrupted; the next daemon start will reconcile what it left behind.", sig)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	if err := server.Shutdown(ctx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	log.Printf("ODDK daemon stopped cleanly.")
+	return nil
 }
 
 // openAuthStore resolves the data dir (the same way the daemon does for the

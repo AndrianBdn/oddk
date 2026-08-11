@@ -1,6 +1,14 @@
 package store
 
-import "github.com/jmoiron/sqlx"
+import (
+	"fmt"
+	"log"
+	"strings"
+
+	"github.com/jmoiron/sqlx"
+
+	"github.com/andrianbdn/oddk/internal/store/instances"
+)
 
 func (s *Store) runAllMigrations() error {
 	migrations := []struct {
@@ -26,6 +34,7 @@ func (s *Store) runAllMigrations() error {
 		{"017_snapshot_tables", migration017SnapshotTables},
 		{"018_snapshot_format", migration018SnapshotFormat},
 		{"019_snapshot_instances", migration019SnapshotInstances},
+		{"020_instance_status_check", migration020InstanceStatusCheck},
 	}
 
 	for _, m := range migrations {
@@ -479,5 +488,114 @@ func migration018SnapshotFormat(sqx *sqlx.DB) error {
 // know what an old archive holds.
 func migration019SnapshotInstances(sqx *sqlx.DB) error {
 	sqx.MustExec(`ALTER TABLE snapshot_history ADD COLUMN instances_json TEXT`)
+	return nil
+}
+
+// migration020InstanceStatusCheck puts a CHECK constraint on
+// rdbms_instances.status.
+//
+// The column was TEXT NOT NULL with no constraint and no Go type, written as
+// bare string literals from a dozen sites — and it had quietly become a
+// DATA-SAFETY input: snapshot capture, the health checker and every data command
+// branch on it, so a value no reader understood meant an instance silently
+// dropped out of monitoring and out of DR archives. The Go side now owns the
+// vocabulary (internal/store/instances/status.go); this is the database half, so
+// a writer that bypasses that package fails loudly here instead of storing
+// something nothing can interpret.
+//
+// SQLite cannot ALTER TABLE ADD CONSTRAINT, so this is the standard table
+// rebuild — wrapped in ONE transaction, because a failure between DROP and
+// RENAME would leave a deployment with no instances table at all. There are no
+// foreign keys referencing rdbms_instances, so no PRAGMA dance is needed.
+//
+// Rows carrying an unrecognised status are normalized to 'error' during the copy
+// rather than failing the migration: refusing to start the daemon because of a
+// stale status value would be a far worse outcome than quarantining that one
+// instance, and 'error' is what startup reconciliation would conclude anyway.
+// The legacy broken/broken-port/broken-auth values are ACCEPTED (see the note on
+// their constants) so already-affected rows survive to be un-latched by
+// reconciliation on this same startup; nothing writes them any more.
+func migration020InstanceStatusCheck(sqx *sqlx.DB) error {
+	quoted := make([]string, 0, len(instances.AllStatuses()))
+	for _, s := range instances.AllStatuses() {
+		quoted = append(quoted, "'"+string(s)+"'")
+	}
+	allowed := strings.Join(quoted, ", ")
+
+	tx, err := sqx.Beginx()
+	if err != nil {
+		return fmt.Errorf("020: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op once committed
+
+	if _, err := tx.Exec(fmt.Sprintf(`
+		CREATE TABLE rdbms_instances_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE NOT NULL,
+			port INTEGER NOT NULL,
+			version TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN (%s)),
+			container_id TEXT,
+			password TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			cpu_cores INTEGER NOT NULL DEFAULT 1,
+			ram_mb INTEGER NOT NULL DEFAULT 1024,
+			parameter_group TEXT NOT NULL DEFAULT 'default:2025-08-27',
+			image TEXT NOT NULL DEFAULT ''
+		)`, allowed)); err != nil {
+		return fmt.Errorf("020: create table: %w", err)
+	}
+
+	// Count what we are about to quarantine, so the operator can be told rather
+	// than discovering an instance in 'error' with no explanation.
+	var normalized int
+	if err := tx.Get(&normalized,
+		fmt.Sprintf(`SELECT COUNT(*) FROM rdbms_instances WHERE status NOT IN (%s)`, allowed)); err != nil {
+		return fmt.Errorf("020: count unrecognised statuses: %w", err)
+	}
+
+	if _, err := tx.Exec(fmt.Sprintf(`
+		INSERT INTO rdbms_instances_new
+			(id, name, port, version, status, container_id, password,
+			 created_at, updated_at, cpu_cores, ram_mb, parameter_group, image)
+		SELECT
+			id, name, port, version,
+			CASE WHEN status IN (%s) THEN status ELSE 'error' END,
+			container_id, password,
+			created_at, updated_at, cpu_cores, ram_mb, parameter_group, image
+		FROM rdbms_instances`, allowed)); err != nil {
+		return fmt.Errorf("020: copy rows: %w", err)
+	}
+
+	// Prove the copy is complete before dropping the original. A silently short
+	// copy here would delete a deployment's entire instance registry, including
+	// the encrypted postgres passwords, which nothing else holds.
+	var oldCount, newCount int
+	if err := tx.Get(&oldCount, `SELECT COUNT(*) FROM rdbms_instances`); err != nil {
+		return fmt.Errorf("020: count source rows: %w", err)
+	}
+	if err := tx.Get(&newCount, `SELECT COUNT(*) FROM rdbms_instances_new`); err != nil {
+		return fmt.Errorf("020: count copied rows: %w", err)
+	}
+	if oldCount != newCount {
+		return fmt.Errorf("020: copied %d of %d instance rows; refusing to drop the original", newCount, oldCount)
+	}
+
+	if _, err := tx.Exec(`DROP TABLE rdbms_instances`); err != nil {
+		return fmt.Errorf("020: drop old table: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE rdbms_instances_new RENAME TO rdbms_instances`); err != nil {
+		return fmt.Errorf("020: rename: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("020: commit: %w", err)
+	}
+
+	if normalized > 0 {
+		log.Printf("Migration 020: %d instance(s) had an unrecognised status and were marked 'error'; "+
+			"use 'oddk instance start <name>' to bring one back", normalized)
+	}
 	return nil
 }

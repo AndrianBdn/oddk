@@ -318,7 +318,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	// check (a bare connect+ping) reports as green. reconcileInstances converts
 	// a stuck "restoring" to "error".
 	if existing != nil {
-		if err := deps.Store.Instances.UpdateStatus(meta.Name, "restoring"); err != nil {
+		if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRestoring); err != nil {
 			return nil, fmt.Errorf("mark instance restoring: %w", err)
 		}
 	} else {
@@ -328,7 +328,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		); err != nil {
 			return nil, fmt.Errorf("create instance row: %w", err)
 		}
-		if err := deps.Store.Instances.UpdateStatus(meta.Name, "restoring"); err != nil {
+		if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRestoring); err != nil {
 			return nil, fmt.Errorf("mark instance restoring: %w", err)
 		}
 	}
@@ -368,7 +368,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		if err == nil {
 			return
 		}
-		if statusErr := deps.Store.Instances.UpdateStatus(meta.Name, "error"); statusErr != nil {
+		if statusErr := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusError); statusErr != nil {
 			emitLine(params.Progress, "  (also failed to mark %s as error: %v)", meta.Name, statusErr)
 		}
 	}()
@@ -430,14 +430,14 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 			if err := deps.Docker.StopContainer(containerID); err != nil {
 				return nil, fmt.Errorf("stop cold-captured instance after verification: %w", err)
 			}
-			if err := deps.Store.Instances.UpdateStatus(meta.Name, "stopped"); err != nil {
+			if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusStopped); err != nil {
 				return nil, fmt.Errorf("mark instance stopped: %w", err)
 			}
 			result.FinalStatus = "stopped"
 			emitLine(params.Progress, "  ✓ Instance left stopped, matching its state when the snapshot was taken")
 			return result, nil
 		}
-		if err := deps.Store.Instances.UpdateStatus(meta.Name, "running"); err != nil {
+		if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
 			return nil, fmt.Errorf("mark instance running: %w", err)
 		}
 		return result, nil
@@ -469,7 +469,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	result.Databases = restored
 	emitLine(params.Progress, "  ✓ Roles and %d database(s) restored", restored)
 
-	if err := deps.Store.Instances.UpdateStatus(meta.Name, "running"); err != nil {
+	if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
 		return nil, fmt.Errorf("mark instance running: %w", err)
 	}
 	return result, nil

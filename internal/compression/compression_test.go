@@ -157,7 +157,7 @@ func TestCompressor_CreateTarZstd(t *testing.T) {
 
 	// Create compressor and archive
 	compressor := compression.NewCompressor()
-	size, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath)
+	size, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
 	if err != nil {
 		t.Fatalf("CreateTarZstd failed: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestCompressor_CreateTarZstd_EmptyDirectory(t *testing.T) {
 	}
 
 	compressor := compression.NewCompressor()
-	size, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath)
+	size, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
 	if err != nil {
 		t.Fatalf("CreateTarZstd failed for empty directory: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestCompressor_CreateTarZstd_InvalidPath(t *testing.T) {
 	compressor := compression.NewCompressor()
 
 	// Test with non-existent source directory
-	_, err := compressor.CreateTarZstd(context.Background(), "/non/existent/path", "/tmp/test.tar.zst")
+	_, err := compressor.CreateTarZstd(context.Background(), "/non/existent/path", "/tmp/test.tar.zst", nil)
 	if err == nil {
 		t.Errorf("expected error for non-existent source directory")
 	}
@@ -272,7 +272,7 @@ func TestCompressor_CreateTarZstd_InvalidPath(t *testing.T) {
 		t.Fatalf("failed to create source dir: %v", err)
 	}
 
-	_, err = compressor.CreateTarZstd(context.Background(), sourceDir, "/non/existent/dir/archive.tar.zst")
+	_, err = compressor.CreateTarZstd(context.Background(), sourceDir, "/non/existent/dir/archive.tar.zst", nil)
 	if err == nil {
 		t.Errorf("expected error for invalid archive path")
 	}

@@ -8,6 +8,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
+	"github.com/andrianbdn/oddk/internal/store/instances"
 	"github.com/andrianbdn/oddk/internal/util"
 )
 
@@ -146,7 +147,7 @@ func (op *CreateRDBMSOp) Execute(ctx context.Context) error {
 		return fmt.Errorf("wait for PostgreSQL readiness: %w", err)
 	}
 
-	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, "running"); err != nil {
+	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusRunning); err != nil {
 		log.Printf("Error updating RDBMS status to running: %v", err)
 	}
 

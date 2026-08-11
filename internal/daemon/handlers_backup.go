@@ -50,6 +50,8 @@ func (s *Server) handleRDBMSBackup(w http.ResponseWriter, r *http.Request) {
 		result: &backupResult,
 	}
 
+	s.clearWriteDeadline(w, fmt.Sprintf("backup %s", name))
+
 	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeOpError(w, err)
 		return
@@ -86,7 +88,7 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 		result: &result,
 	}
 
-	if err := s.executor.Execute(context.Background(), op); err != nil {
+	if err := s.executor.ExecuteRead(context.Background(), op); err != nil {
 		s.writeOpError(w, err)
 		return
 	}
@@ -133,7 +135,7 @@ func (s *Server) handleListAllBackups(w http.ResponseWriter, r *http.Request) {
 		result: &result,
 	}
 
-	if err := s.executor.Execute(context.Background(), op); err != nil {
+	if err := s.executor.ExecuteRead(context.Background(), op); err != nil {
 		s.writeOpError(w, err)
 		return
 	}
@@ -171,6 +173,8 @@ func (s *Server) handleUploadBackup(w http.ResponseWriter, r *http.Request) {
 		deps:   s.opDeps,
 		result: &uploadResult,
 	}
+
+	s.clearWriteDeadline(w, fmt.Sprintf("backup upload %s/%d", name, backupID))
 
 	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeOpError(w, err)
@@ -249,6 +253,8 @@ func (s *Server) handleDownloadBackup(w http.ResponseWriter, r *http.Request) {
 		deps:   s.opDeps,
 		result: &downloadResult,
 	}
+
+	s.clearWriteDeadline(w, fmt.Sprintf("backup download %s/%d", name, backupID))
 
 	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeOpError(w, err)

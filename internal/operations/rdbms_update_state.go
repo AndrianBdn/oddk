@@ -6,6 +6,7 @@ import (
 	"log"
 
 	"github.com/andrianbdn/oddk/internal/operr"
+	"github.com/andrianbdn/oddk/internal/store/instances"
 )
 
 // UpdateStateOp updates the state of an RDBMS instance
@@ -54,12 +55,12 @@ func (op *UpdateStateOp) Execute(ctx context.Context) error {
 			// promote the instance once PostgreSQL is actually ready. We don't
 			// auto-promote from "error" here, matching how every other
 			// non-"running" status in ODDK is cleared only by an explicit op.
-			if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, "error"); statusErr != nil {
+			if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
 				log.Printf("Error updating status to error: %v", statusErr)
 			}
 			return fmt.Errorf("wait for PostgreSQL readiness: %w", err)
 		}
-		if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, "running"); err != nil {
+		if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusRunning); err != nil {
 			log.Printf("Error updating RDBMS status to running: %v", err)
 		}
 
@@ -67,7 +68,7 @@ func (op *UpdateStateOp) Execute(ctx context.Context) error {
 		if err := op.deps.Docker.StopContainer(instance.ContainerID); err != nil {
 			return fmt.Errorf("stop container: %w", err)
 		}
-		if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, "stopped"); err != nil {
+		if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusStopped); err != nil {
 			log.Printf("Error updating RDBMS status to stopped: %v", err)
 		}
 

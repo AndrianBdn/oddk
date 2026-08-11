@@ -24,6 +24,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
 	"github.com/andrianbdn/oddk/internal/store"
+	"github.com/andrianbdn/oddk/internal/store/instances"
 	"github.com/andrianbdn/oddk/internal/util"
 	"github.com/andrianbdn/oddk/internal/version"
 )
@@ -694,7 +695,7 @@ func rebuildInstanceFromSnapshot(
 	// healthy — reconcileInstances converts a stuck "restoring" to "error", and
 	// the health checker's bare connect-and-ping would otherwise report an
 	// instance missing most of its databases as green.
-	if err := deps.Store.Instances.UpdateStatus(meta.Name, "restoring"); err != nil {
+	if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRestoring); err != nil {
 		return fmt.Errorf("mark instance restoring: %w", err)
 	}
 
@@ -705,7 +706,7 @@ func rebuildInstanceFromSnapshot(
 		if err == nil {
 			return
 		}
-		if statusErr := deps.Store.Instances.UpdateStatus(meta.Name, "error"); statusErr != nil {
+		if statusErr := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusError); statusErr != nil {
 			emitLine(progress, "  (also failed to mark %s as error: %v)", meta.Name, statusErr)
 		}
 	}()
@@ -767,13 +768,13 @@ func rebuildInstanceFromSnapshot(
 			if err := deps.Docker.StopContainer(containerID); err != nil {
 				return fmt.Errorf("stop cold-captured instance after verification: %w", err)
 			}
-			if err := deps.Store.Instances.UpdateStatus(meta.Name, "stopped"); err != nil {
+			if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusStopped); err != nil {
 				return fmt.Errorf("mark instance stopped: %w", err)
 			}
 			emitLine(progress, "  ✓ Instance left stopped, matching its state when the snapshot was taken")
 			return nil
 		}
-		if err := deps.Store.Instances.UpdateStatus(meta.Name, "running"); err != nil {
+		if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
 			return fmt.Errorf("mark instance running: %w", err)
 		}
 		return nil
@@ -817,7 +818,7 @@ func rebuildInstanceFromSnapshot(
 	}
 	emitLine(progress, "  ✓ Roles and %d database(s) restored", restored)
 
-	if err := deps.Store.Instances.UpdateStatus(meta.Name, "running"); err != nil {
+	if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
 		return fmt.Errorf("mark instance running: %w", err)
 	}
 	return nil
@@ -875,13 +876,26 @@ func markInstanceUnbuilt(st *store.Store, name string) error {
 	if err := st.Instances.UpdateContainerID(name, ""); err != nil {
 		return fmt.Errorf("clear stale container id for %s: %w", name, err)
 	}
-	if err := st.Instances.UpdateStatus(name, "error"); err != nil {
+	if err := st.Instances.UpdateStatus(name, instances.StatusError); err != nil {
 		return fmt.Errorf("mark %s unbuilt: %w", name, err)
 	}
 	return nil
 }
 
-// copyFile copies src to dst with the given permissions.
+// copyFile copies src to dst with the given permissions, atomically and
+// durably: temp file in the destination directory -> fsync -> checked close ->
+// rename -> directory fsync.
+//
+// This installs the snapshot's oddk.db onto a disaster-recovery host — a
+// machine that by definition holds no other copy of that state. The previous
+// version wrote straight to the final path with no fsync, so a crash during
+// apply could leave a truncated oddk.db AT the real name, and a power loss just
+// after apply could leave one whose data never reached the disk. Either way the
+// operator would be recovering a recovery. Same sequence as
+// internal/crypto/keyfile.go and compression's writeVerifiedArchive; there is no
+// read-back here because the caller immediately opens the file as a SQLite
+// database and runs migrations on it, which is a far stronger check than
+// re-reading the bytes.
 func copyFile(src, dst string, perm os.FileMode) error {
 	in, err := os.Open(src) // #nosec G304 - src is inside our own extracted staging tree
 	if err != nil {
@@ -889,15 +903,39 @@ func copyFile(src, dst string, perm os.FileMode) error {
 	}
 	defer func() { _ = in.Close() }()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm) // #nosec G304 - dst is the daemon's data dir
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(dst)+"-*")
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+
+	if err := tmp.Chmod(perm); err != nil {
+		cleanup()
 		return err
 	}
-	return out.Close()
+	if _, err := io.Copy(tmp, in); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	syncDir(dir)
+	return nil
 }
 
 func emitLine(w io.Writer, format string, args ...any) {
