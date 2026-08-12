@@ -406,20 +406,46 @@ const (
 //
 // storedStatus survives only as warning text, and as the caller's rule for
 // whether a capture failure may abort the whole run.
-func decideCapture(format string, storedStatus instances.InstanceStatus, containerID, actualState string, stateErr error) (captureAction, string) {
+//
+// The third return value separates the two kinds of configuration-only outcome,
+// because they deserve opposite reporting:
+//
+//   - ANOMALOUS (true): the instance's data almost certainly still exists on
+//     this host and we could not read it — its container vanished, its state
+//     could not be determined, or it is paused/restarting. ODDK's data lives in
+//     a named volume (oddk-data-<instance>), which `docker rm -f` does NOT
+//     remove, so "the container is gone" does not mean "the data is gone": it
+//     means a recoverable cluster was sitting right there and the archive was
+//     written without it. That is a capture failure in everything but name, and
+//     reporting the run green over it recreates — one level up — exactly the bug
+//     that made capture dispatch on the stored status.
+//
+//   - EXPECTED (false): there is nothing to capture, or the operator chose a
+//     format that cannot capture it. An instance with no container at all is
+//     already broken and holds no cluster to read; a cleanly stopped instance
+//     under --logical is a documented limitation of that format (physical
+//     cold-copies it instead, which is one reason physical is the default).
+//     These recur every run for as long as the condition lasts, so alerting on
+//     them would teach operators to filter the channel — the exact outcome the
+//     one-notification-per-run rule exists to avoid.
+//
+// Both still produce a configuration-only entry with hasData:false, a
+// skipReason, a stdout warning and a "✗ config-only" verdict on the checklist.
+// The flag decides only whether the run is additionally reported as FAILED.
+func decideCapture(format string, storedStatus instances.InstanceStatus, containerID, actualState string, stateErr error) (action captureAction, reason string, anomalous bool) {
 	switch {
 	case containerID == "":
-		return captureConfigOnly, fmt.Sprintf("instance is recorded %q and has no container; databases not captured", storedStatus)
+		return captureConfigOnly, fmt.Sprintf("instance is recorded %q and has no container; databases not captured", storedStatus), false
 	case stateErr != nil:
-		return captureConfigOnly, fmt.Sprintf("container state could not be determined (%v); databases not captured", stateErr)
+		return captureConfigOnly, fmt.Sprintf("container state could not be determined (%v); databases not captured", stateErr), true
 	case actualState == "not found":
-		return captureConfigOnly, fmt.Sprintf("instance is recorded %q and its container no longer exists; databases not captured", storedStatus)
+		return captureConfigOnly, fmt.Sprintf("instance is recorded %q and its container no longer exists; databases not captured", storedStatus), true
 	}
 
 	if format == SnapshotFormatPhysical {
 		switch actualState {
 		case "running":
-			return captureBasebackup, ""
+			return captureBasebackup, "", false
 		case "stopped":
 			// GetContainerStatus normalizes every existing, non-live state
 			// (exited/created/dead) to "stopped" — exactly the set that is safe
@@ -427,19 +453,26 @@ func decideCapture(format string, storedStatus instances.InstanceStatus, contain
 			// valid physical backup (worst case it recovers like a crash on
 			// start), which is why physical mode captures it rather than
 			// reducing it to configuration the way logical mode must.
-			return captureCold, ""
+			return captureCold, "", false
 		default:
 			// paused/restarting: neither cleanly stopped (a cold copy would
-			// tear) nor serving (a basebackup would hang).
-			return captureConfigOnly, fmt.Sprintf("container is %q, which is neither serving nor cleanly stopped; databases not captured", actualState)
+			// tear) nor serving (a basebackup would hang). The cluster itself is
+			// intact and will be capturable again as soon as the container
+			// settles, so leaving it out of the archive is a real gap, not a
+			// steady state to be tolerated quietly.
+			return captureConfigOnly, fmt.Sprintf("container is %q, which is neither serving nor cleanly stopped; databases not captured", actualState), true
 		}
 	}
 
 	// Logical mode needs a live server: a dump cannot read a stopped cluster.
+	// This is the format's documented limitation rather than something going
+	// wrong, so it does not fail the run — an instance parked for weeks would
+	// otherwise fail every scheduled run for weeks. Physical mode cold-copies
+	// the same instance, which is why it is the default.
 	if actualState != "running" {
-		return captureConfigOnly, fmt.Sprintf("container is %q and logical dumps need a live server; databases not captured", actualState)
+		return captureConfigOnly, fmt.Sprintf("container is %q and logical dumps need a live server; databases not captured", actualState), false
 	}
-	return captureLogicalDump, ""
+	return captureLogicalDump, "", false
 }
 
 // stageAllInstances captures every instance into stagingDir/instances/<name>/,
@@ -506,7 +539,7 @@ func stageAllInstances(ctx context.Context, deps *Dependencies, stagingDir, form
 			actual, stateErr = deps.Docker.GetContainerStatus(instance.ContainerID)
 		}
 
-		action, reason := decideCapture(format, instance.Status, instance.ContainerID, actual, stateErr)
+		action, reason, anomalous := decideCapture(format, instance.Status, instance.ContainerID, actual, stateErr)
 
 		// The capture is correct either way, but a disagreement means the stored
 		// row is wrong and something should be fixed — say so.
@@ -557,6 +590,20 @@ func stageAllInstances(ctx context.Context, deps *Dependencies, stagingDir, form
 
 		switch action {
 		case captureConfigOnly:
+			// An ANOMALOUS skip is a capture failure even though nothing was
+			// attempted: the cluster is still on this host (ODDK keeps data in a
+			// named volume, which removing a container does not delete) and the
+			// archive is being written without it. Recording it here is what
+			// gives it the non-zero exit, the failed capture phase and the
+			// notification — the same treatment a failed base backup gets, for
+			// the same reason: after a restore, both leave that instance EMPTY.
+			// Expected skips (no container at all, a stopped instance under
+			// --logical) stay quiet; see decideCapture.
+			if anomalous {
+				failures = append(failures, SnapshotCaptureFailure{
+					Instance: instance.Name, Stage: "capture", Error: reason,
+				})
+			}
 			configOnly(reason)
 
 		case captureBasebackup:

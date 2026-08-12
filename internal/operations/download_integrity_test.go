@@ -80,6 +80,17 @@ func TestStreamToLocalFileAtomic_LandsAGoodArchive(t *testing.T) {
 			t.Errorf("temp file %s left behind after a successful download", e.Name())
 		}
 	}
+
+	// A downloaded archive is as sensitive as a written one: database contents
+	// plus role password hashes, unencrypted. writeVerifiedArchive already
+	// enforces 0600 on the write path; os.Create would have landed 0644 here.
+	fi, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat downloaded archive: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("downloaded archive mode = %v, want 0600 — it holds database contents and role password hashes", fi.Mode().Perm())
+	}
 }
 
 // copyFile installs the snapshot's oddk.db onto a disaster-recovery host, which

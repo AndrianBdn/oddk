@@ -114,7 +114,7 @@ func (c *Client) cronLogsAction(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
-	_, _ = fmt.Fprintln(c.out, "\n✓ ok   ✗ failed   ○ not run   … interrupted")
+	_, _ = fmt.Fprintln(c.out, "\n✓ ok   ✗ failed   ○ not run   … in progress")
 	return nil
 }
 
@@ -130,9 +130,18 @@ func cronLogTarget(l *cron.CronLog) string {
 
 func cronPhaseGlyph(status *string, runIncomplete bool) string {
 	if status == nil {
-		// A phase with no status on a run that never completed was interrupted
-		// (daemon killed mid-run); on a completed run it simply did not apply,
-		// e.g. upload with no offsite configured.
+		// A phase with no status on a run with no completed_at belongs to a run
+		// that is STILL EXECUTING — not one that was interrupted. A run the
+		// daemon died in the middle of does not reach here: startup
+		// reconciliation (CronStore.MarkInterruptedRuns) stamps completed_at and
+		// writes the literal status "interrupted" plus its reason, which render
+		// through the default branch below. So this branch means "in progress",
+		// and labelling it "interrupted" told an operator watching a healthy
+		// multi-minute capture that the daemon had died — inviting the one
+		// response that would actually break it.
+		//
+		// On a completed run a nil status simply did not apply, e.g. upload with
+		// no offsite configured.
 		if runIncomplete {
 			return "…"
 		}

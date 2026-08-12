@@ -268,7 +268,11 @@ func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key
 
 	emitLine(progress, "Downloading %s (%s)...", uri, humanBytes(size))
 	tmpPath := filepath.Join(destDir, ".tmp-"+name)
-	tmpFile, err := os.Create(tmpPath) // #nosec G304 - path is constructed from safe components
+	// 0600 for the same reason writeVerifiedArchive chmods its temp file: the
+	// archive holds every database's contents and the role password hashes, and
+	// is not encrypted by the master key. os.Create's 0666&^umask would publish
+	// it world-readable into a downloads area that survives for seven days.
+	tmpFile, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 - path is constructed from safe components
 	if err != nil {
 		return nil, fmt.Errorf("create temp download file: %w", err)
 	}

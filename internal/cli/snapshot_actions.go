@@ -677,9 +677,9 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 	if err != nil {
 		return err
 	}
-	backupDir := cmd.String("backup-dir")
-	if backupDir == "" {
-		backupDir = filepath.Join(dataDir, "backups")
+	backupDir, err := resolveLocalBackupDir(cmd, dataDir)
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(backupDir, 0o750); err != nil {
 		return fmt.Errorf("create backup dir: %w", err)

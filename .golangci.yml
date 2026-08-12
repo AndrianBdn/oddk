@@ -60,6 +60,16 @@ linters:
       - path: internal/store/migration020_test\.go
         linters:
           - testpackage
+      # backup_dir_resolution_test.go pins the one rule that `oddk daemon` and
+      # `oddk snapshot apply` must share when resolving the backup directory.
+      # oddkUserBackupDir is deliberately unexported — it is an internal
+      # invariant, not API — and the exported paths that consume it are a systemd
+      # daemon and a destructive DR command, neither reachable from a unit test.
+      # The two defaults silently disagreeing is what stranded applied archives
+      # outside the daemon's sweep, so the rule is worth pinning directly.
+      - path: internal/cli/backup_dir_resolution_test\.go
+        linters:
+          - testpackage
 
 # Formatters are a separate subsystem from linters in golangci-lint v2: they are
 # applied by `golangci-lint fmt`, NOT `golangci-lint run` (and `run --fix` does

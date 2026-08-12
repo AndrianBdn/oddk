@@ -1144,6 +1144,42 @@ func resolveLocalDataDir(cmd *cli.Command) (string, error) {
 	return dataDir, nil
 }
 
+// oddkUserBackupDir is where `oddk daemon` keeps archives for the oddk service
+// user: a SIBLING of the data dir under the user's home, not a child of it.
+//
+// It exists so the daemon and the daemon-less commands resolve the same
+// directory from one rule. They used to each spell their own default, and the
+// two spellings disagreed: the daemon used $HOME/backups while `snapshot apply`
+// used <data-dir>/backups. Under the installed layout (data-dir
+// /var/lib/oddk/data) that put a DR host's downloaded archive in
+// /var/lib/oddk/data/backups/downloads, which the daemon's 7-day downloads sweep
+// — bounded to its own backup dir — never looks at, so a multi-GB archive leaked
+// permanently; and apply reconciled the restored backup catalogue against a
+// directory the daemon does not use.
+func oddkUserBackupDir(homeDir string) string {
+	return filepath.Join(homeDir, "backups")
+}
+
+// resolveLocalBackupDir resolves --backup-dir for the commands that bypass the
+// daemon, matching what the daemon itself would use.
+//
+// An explicit --data-dir means the caller has stepped outside the standard
+// layout, so the backup dir is derived from it; only the defaulted case can
+// assume the daemon's home-relative layout.
+func resolveLocalBackupDir(cmd *cli.Command, dataDir string) (string, error) {
+	if backupDir := cmd.String("backup-dir"); backupDir != "" {
+		return backupDir, nil
+	}
+	if cmd.String("data-dir") == "" {
+		u, err := user.Current()
+		if err != nil {
+			return "", fmt.Errorf("determine current user: %w", err)
+		}
+		return oddkUserBackupDir(u.HomeDir), nil
+	}
+	return filepath.Join(dataDir, "backups"), nil
+}
+
 // ensureDataDirOwnedByCurrentUser fails if the data dir is owned by a different
 // user than the one running the command - almost always a forgotten
 // `sudo -u oddk`. A missing data dir is left to the db-existence check below,

@@ -303,8 +303,9 @@ oddk cron logs --instance app
 
 **One instance failing does not cost the others their archive.** If an instance
 cannot be captured — its server is unreachable, its stored password no longer
-authenticates, PostgreSQL is out of WAL senders — that instance is recorded in
-the snapshot as configuration-only and everything else is captured normally. The
+authenticates, PostgreSQL is out of WAL senders, its container has vanished — that
+instance is recorded in the snapshot as configuration-only and everything else is
+captured normally. The
 archive is kept, uploaded and catalogued, because it is still the newest restore
 point for every other instance. But the run *reports failure*: `snapshot make`
 exits non-zero and names the instance, a scheduled run's capture phase is marked
@@ -367,10 +368,15 @@ What you need to know:
   an instance whose recorded status has drifted is still captured correctly. A
   stopped container is captured as a cold copy of its data directory (and
   restored back to a stopped instance); only with `--logical` — which needs a
-  live server to dump — is it reduced to configuration-only. An instance with no
-  container, or one paused or restarting, is captured configuration-only with a
-  specific reason recorded in the manifest and printed on stdout — reported,
-  never silent.
+  live server to dump — is it reduced to configuration-only. When an instance
+  *should* have been capturable but was not — its container has vanished, its
+  state cannot be read, or it is paused or restarting — the run is reported as
+  failed, because the data is still on this host (ODDK keeps it in a Docker
+  volume that removing a container does not delete) and the archive was written
+  without it. Only the cases where there is nothing to read fall back to a quiet
+  configuration-only entry: an instance with no container at all, or one you
+  deliberately stopped under `--logical`. Either way the specific reason is
+  recorded in the manifest and printed on stdout — reported, never silent.
 - Restoring an instance sets its postgres password to the snapshot's, because the
   archive carries only the hash. Re-read it with `instance get-postgres-password`.
 - Retention keeps the newest snapshots regardless of age, so a run of failed

@@ -144,7 +144,14 @@ func parseRemoteS3Location(s3Location, configuredBucket string) (string, error) 
 // page cache can leave a zero-length archive at the final name after a power
 // loss.
 func streamToLocalFile(ctx context.Context, s3Client *s3service.Client, key, localPath string) (int64, error) {
-	localFile, err := os.Create(localPath) // #nosec G304 - path is constructed from safe components
+	// 0600, not os.Create's 0666&^umask (0644 under the systemd unit): an archive
+	// holds every database's contents and the role password hashes, and is not
+	// encrypted by the master key. Archives WRITTEN here are already 0600
+	// (writeVerifiedArchive chmods the temp file for exactly this reason), so a
+	// downloaded one landing world-readable in the same directory was an
+	// unintended asymmetry — and a restore is precisely when a host pulls the
+	// whole deployment's data down.
+	localFile, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 - path is constructed from safe components
 	if err != nil {
 		return 0, fmt.Errorf("create local file: %w", err)
 	}

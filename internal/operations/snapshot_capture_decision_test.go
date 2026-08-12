@@ -44,18 +44,24 @@ var everyStoredStatus = instances.AllStatuses()
 func TestDecideCapture_RunningContainerIsAlwaysCaptured(t *testing.T) {
 	for _, stored := range everyStoredStatus {
 		t.Run("physical/"+string(stored), func(t *testing.T) {
-			action, reason := decideCapture(SnapshotFormatPhysical, stored, "container-id", "running", nil)
+			action, reason, anomalous := decideCapture(SnapshotFormatPhysical, stored, "container-id", "running", nil)
 			if action != captureBasebackup {
 				t.Fatalf("stored status %q with a RUNNING container: got %s (%s), want basebackup.\n"+
 					"A running cluster must never be reduced to configuration-only because a TEXT column disagreed.",
 					stored, action, reason)
 			}
+			if anomalous {
+				t.Error("an instance that IS being captured must never be flagged anomalous — that would fail every healthy run")
+			}
 		})
 		t.Run("logical/"+string(stored), func(t *testing.T) {
-			action, reason := decideCapture(SnapshotFormatLogical, stored, "container-id", "running", nil)
+			action, reason, anomalous := decideCapture(SnapshotFormatLogical, stored, "container-id", "running", nil)
 			if action != captureLogicalDump {
 				t.Fatalf("stored status %q with a RUNNING container: got %s (%s), want logicalDump",
 					stored, action, reason)
+			}
+			if anomalous {
+				t.Error("an instance that IS being captured must never be flagged anomalous")
 			}
 		})
 	}
@@ -66,18 +72,27 @@ func TestDecideCapture_RunningContainerIsAlwaysCaptured(t *testing.T) {
 func TestDecideCapture_StoppedContainer(t *testing.T) {
 	for _, stored := range everyStoredStatus {
 		t.Run("physical/"+string(stored), func(t *testing.T) {
-			action, reason := decideCapture(SnapshotFormatPhysical, stored, "container-id", "stopped", nil)
+			action, reason, anomalous := decideCapture(SnapshotFormatPhysical, stored, "container-id", "stopped", nil)
 			if action != captureCold {
 				t.Fatalf("stored status %q with a STOPPED container: got %s (%s), want cold", stored, action, reason)
 			}
+			if anomalous {
+				t.Error("a cold-captured instance must never be flagged anomalous")
+			}
 		})
 		t.Run("logical/"+string(stored), func(t *testing.T) {
-			action, reason := decideCapture(SnapshotFormatLogical, stored, "container-id", "stopped", nil)
+			action, reason, anomalous := decideCapture(SnapshotFormatLogical, stored, "container-id", "stopped", nil)
 			if action != captureConfigOnly {
 				t.Fatalf("stored status %q with a STOPPED container: got %s, want configOnly (a dump needs a live server)", stored, action)
 			}
 			if !strings.Contains(reason, "live server") {
 				t.Errorf("reason should explain why logical cannot capture a stopped container, got %q", reason)
+			}
+			// A documented limitation of the chosen format, not something going
+			// wrong: an instance parked for weeks must not fail a run every hour
+			// for weeks, or the notification channel becomes noise.
+			if anomalous {
+				t.Error("a deliberately stopped instance under --logical must NOT fail the run; physical cold-copies it instead")
 			}
 		})
 	}
@@ -92,6 +107,12 @@ func TestDecideCapture_Uncapturable(t *testing.T) {
 		actual      string
 		stateErr    error
 		wantReason  string
+		// wantAnomalous distinguishes "the cluster is still on this host and we
+		// could not read it" (fails the run) from "there is nothing to capture,
+		// or this format cannot capture it" (quiet). ODDK's data lives in a named
+		// volume that removing a container does not delete, so a vanished
+		// container means recoverable data was left out of the archive.
+		wantAnomalous bool
 	}{
 		{
 			name:        "no container at all",
@@ -99,44 +120,51 @@ func TestDecideCapture_Uncapturable(t *testing.T) {
 			stored:      instances.StatusError,
 			containerID: "",
 			wantReason:  "no container",
+			// Already-broken instance with no cluster to read: nothing was lost
+			// by not capturing it, so it must not fail every run.
+			wantAnomalous: false,
 		},
 		{
-			name:        "container state unreadable",
-			format:      SnapshotFormatPhysical,
-			stored:      instances.StatusRunning,
-			containerID: "container-id",
-			stateErr:    errors.New("docker daemon unreachable"),
-			wantReason:  "could not be determined",
+			name:          "container state unreadable",
+			format:        SnapshotFormatPhysical,
+			stored:        instances.StatusRunning,
+			containerID:   "container-id",
+			stateErr:      errors.New("docker daemon unreachable"),
+			wantReason:    "could not be determined",
+			wantAnomalous: true,
 		},
 		{
-			name:        "container vanished",
-			format:      SnapshotFormatPhysical,
-			stored:      instances.StatusRunning,
-			containerID: "container-id",
-			actual:      "not found",
-			wantReason:  "no longer exists",
+			name:          "container vanished",
+			format:        SnapshotFormatPhysical,
+			stored:        instances.StatusRunning,
+			containerID:   "container-id",
+			actual:        "not found",
+			wantReason:    "no longer exists",
+			wantAnomalous: true,
 		},
 		{
-			name:        "paused: neither serving nor cleanly stopped",
-			format:      SnapshotFormatPhysical,
-			stored:      instances.StatusRunning,
-			containerID: "container-id",
-			actual:      "paused",
-			wantReason:  "neither serving nor cleanly stopped",
+			name:          "paused: neither serving nor cleanly stopped",
+			format:        SnapshotFormatPhysical,
+			stored:        instances.StatusRunning,
+			containerID:   "container-id",
+			actual:        "paused",
+			wantReason:    "neither serving nor cleanly stopped",
+			wantAnomalous: true,
 		},
 		{
-			name:        "restarting: neither serving nor cleanly stopped",
-			format:      SnapshotFormatPhysical,
-			stored:      instances.StatusRunning,
-			containerID: "container-id",
-			actual:      "restarting",
-			wantReason:  "neither serving nor cleanly stopped",
+			name:          "restarting: neither serving nor cleanly stopped",
+			format:        SnapshotFormatPhysical,
+			stored:        instances.StatusRunning,
+			containerID:   "container-id",
+			actual:        "restarting",
+			wantReason:    "neither serving nor cleanly stopped",
+			wantAnomalous: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			action, reason := decideCapture(tt.format, tt.stored, tt.containerID, tt.actual, tt.stateErr)
+			action, reason, anomalous := decideCapture(tt.format, tt.stored, tt.containerID, tt.actual, tt.stateErr)
 			if action != captureConfigOnly {
 				t.Fatalf("got %s, want configOnly", action)
 			}
@@ -145,6 +173,13 @@ func TestDecideCapture_Uncapturable(t *testing.T) {
 					"explanation for why this instance has no data in the archive, so it must be specific",
 					reason, tt.wantReason)
 			}
+			if anomalous != tt.wantAnomalous {
+				t.Errorf("anomalous = %v, want %v.\n"+
+					"This flag decides whether the run reports FAILED (non-zero exit, capture phase ✗, one\n"+
+					"notification). Too eager and operators filter the channel; too shy and an archive that\n"+
+					"is silently empty for an instance is reported green — the bug this whole path exists to\n"+
+					"prevent.", anomalous, tt.wantAnomalous)
+			}
 		})
 	}
 }
@@ -152,12 +187,15 @@ func TestDecideCapture_Uncapturable(t *testing.T) {
 // A stateErr must never be silently treated as "container is fine". It also must
 // not abort the run: one unreadable container degrades one entry.
 func TestDecideCapture_StateErrorBeatsActualState(t *testing.T) {
-	action, reason := decideCapture(SnapshotFormatPhysical, "running", "container-id", "running", errors.New("boom"))
+	action, reason, anomalous := decideCapture(SnapshotFormatPhysical, "running", "container-id", "running", errors.New("boom"))
 	if action != captureConfigOnly {
 		t.Fatalf("a state-read error with a stale 'running' reading must not be captured as if healthy; got %s", action)
 	}
 	if !strings.Contains(reason, "boom") {
 		t.Errorf("reason must carry the underlying error, got %q", reason)
+	}
+	if !anomalous {
+		t.Error("an unreadable container state must fail the run: the cluster is probably fine and still on disk, and the archive is being written without it")
 	}
 }
 
@@ -168,13 +206,20 @@ func TestDecideCapture_ConfigOnlyAlwaysHasAReason(t *testing.T) {
 		for _, stored := range everyStoredStatus {
 			for _, actual := range []string{"", "running", "stopped", "paused", "restarting", "not found"} {
 				for _, id := range []string{"", "container-id"} {
-					action, reason := decideCapture(format, stored, id, actual, nil)
+					action, reason, anomalous := decideCapture(format, stored, id, actual, nil)
 					if action == captureConfigOnly && strings.TrimSpace(reason) == "" {
 						t.Fatalf("configOnly with empty reason: format=%s stored=%s id=%q actual=%q", format, stored, id, actual)
 					}
 					if action != captureConfigOnly && reason != "" {
 						t.Fatalf("non-configOnly action %s carried a reason %q: format=%s stored=%s actual=%q",
 							action, reason, format, stored, actual)
+					}
+					// Anomalous is only meaningful for a skipped capture: a
+					// captured instance flagged anomalous would fail a run that
+					// actually succeeded in full.
+					if action != captureConfigOnly && anomalous {
+						t.Fatalf("action %s was flagged anomalous: format=%s stored=%s actual=%q",
+							action, format, stored, actual)
 					}
 				}
 			}

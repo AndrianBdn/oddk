@@ -118,6 +118,15 @@ func TestFetchRemoteSnapshot(t *testing.T) {
 	}
 	assertNoTempFiles(t, destDir)
 
+	// The downloads area holds whole-deployment archives — database contents plus
+	// role password hashes, unencrypted — for seven days. os.Create would land
+	// them world-readable; the write path has always used 0600.
+	if fi, err := os.Stat(res.Path); err != nil {
+		t.Fatalf("stat fetched archive: %v", err)
+	} else if fi.Mode().Perm() != 0o600 {
+		t.Errorf("fetched archive mode = %v, want 0600 — it holds database contents and role password hashes", fi.Mode().Perm())
+	}
+
 	// Same size at the same key: reused, not re-downloaded — and the mtime is
 	// bumped so the TTL sweep cannot reap an archive mid-restore-series.
 	old := time.Now().Add(-6 * 24 * time.Hour)

@@ -844,7 +844,7 @@ func snapshotCommands(client *Client) *cli.Command {
 					dataDirFlag(),
 					&cli.StringFlag{
 						Name:  "backup-dir",
-						Usage: "Backup directory (defaults to <data-dir>/backups)",
+						Usage: "Backup directory (defaults to the same one the daemon uses: the oddk user's ~/backups, or <data-dir>/backups when --data-dir is given)",
 					},
 					&cli.IntFlag{
 						Name:  "daemon-port",
@@ -1178,7 +1178,7 @@ func daemonAction(ctx context.Context, cmd *cli.Command) error {
 
 	if backupDir == "" {
 		if username.Username == "oddk" {
-			backupDir = filepath.Join(home, "backups")
+			backupDir = oddkUserBackupDir(home)
 		} else {
 			cwd, err := os.Getwd()
 			if err != nil {
