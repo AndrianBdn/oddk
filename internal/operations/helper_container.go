@@ -112,9 +112,13 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 		}
 	case status := <-statusCh:
 		if status.StatusCode != 0 {
-			logs, logErr := getContainerLogs(ctx, deps, resp.ID)
-			if logErr != nil {
+			out, logErr := getContainerLogs(ctx, deps, resp.ID)
+			logs := out.String()
+			switch {
+			case logErr != nil:
 				logs = fmt.Sprintf("<logs unavailable: %v>", logErr)
+			case logs == "":
+				logs = noHelperOutputHint
 			}
 			hint := ""
 			if spec.FailureHint != nil {
@@ -139,28 +143,64 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 	}
 
 	if spec.LogOutputOnSuccess {
-		if logs, lerr := getContainerLogs(ctx, deps, resp.ID); lerr == nil && strings.TrimSpace(logs) != "" {
-			log.Printf("[%s] output:\n%s", spec.ContainerName, logs)
+		// helperOutput.String() is empty exactly when the helper printed nothing;
+		// the old guard trimmed the already-formatted "stdout: \nstderr: ", which
+		// is never blank, so a silent helper still logged an empty pair.
+		if out, lerr := getContainerLogs(ctx, deps, resp.ID); lerr == nil {
+			if logs := out.String(); logs != "" {
+				log.Printf("[%s] output:\n%s", spec.ContainerName, logs)
+			}
 		}
 	}
 	return nil
 }
 
-// getContainerLogs fetches a container's combined stdout/stderr, demultiplexed.
-func getContainerLogs(ctx context.Context, deps *Dependencies, containerID string) (string, error) {
+// noHelperOutputHint replaces the empty "stdout: \nstderr: " pair a silent
+// helper would otherwise produce, which reads like a formatting bug rather than
+// information.
+//
+// The likeliest cause is the one failure that destroys its own diagnostic: the
+// helper fills the filesystem, writes "No space left on device" to stderr, and
+// Docker cannot append that line to a json log stored on the same — now full —
+// filesystem. Observed in a controlled disk-exhaustion test: the capture
+// degraded and was reported correctly at every layer, but with a blank reason,
+// which is the least useful moment to be told nothing. Docker records helper
+// logs normally with even a few hundred KB free, so this is specific to running
+// the disk right down to zero.
+const noHelperOutputHint = "the helper produced no output at all. If the filesystem holding " +
+	"the backup directory is full, Docker cannot record container logs — check free space there first"
+
+// helperOutput is a helper container's captured streams.
+type helperOutput struct {
+	stdout string
+	stderr string
+}
+
+// String renders the streams as the operator sees them, or "" when the helper
+// produced nothing — so callers can distinguish "no output" from output, which
+// a preformatted string cannot express.
+func (o helperOutput) String() string {
+	if strings.TrimSpace(o.stdout) == "" && strings.TrimSpace(o.stderr) == "" {
+		return ""
+	}
+	return fmt.Sprintf("stdout: %s\nstderr: %s", o.stdout, o.stderr)
+}
+
+// getContainerLogs fetches a container's stdout/stderr, demultiplexed.
+func getContainerLogs(ctx context.Context, deps *Dependencies, containerID string) (helperOutput, error) {
 	reader, err := deps.Docker.GetDockerClient().ContainerLogs(ctx, containerID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 	})
 	if err != nil {
-		return "", err
+		return helperOutput{}, err
 	}
 	defer func() { _ = reader.Close() }()
 
 	var stdout, stderr bytes.Buffer
 	if _, err := stdcopy.StdCopy(&stdout, &stderr, reader); err != nil {
-		return "", err
+		return helperOutput{}, err
 	}
 
-	return fmt.Sprintf("stdout: %s\nstderr: %s", stdout.String(), stderr.String()), nil
+	return helperOutput{stdout: stdout.String(), stderr: stderr.String()}, nil
 }
