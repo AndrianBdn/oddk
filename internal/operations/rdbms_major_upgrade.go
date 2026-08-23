@@ -269,7 +269,7 @@ func (op *UpgradeRDBMSOp) replaceCluster(ctx context.Context, plan *upgradePlan,
 	}
 
 	// Remove the old volume.
-	volumeName := fmt.Sprintf("oddk-data-%s", name)
+	volumeName := docker.VolumeName(name)
 	if err := op.deps.Docker.RemoveVolume(volumeName); err != nil {
 		op.markError()
 		return fmt.Errorf("remove old volume: %w; %s", err, recoverHint)
@@ -293,7 +293,8 @@ func (op *UpgradeRDBMSOp) replaceCluster(ctx context.Context, plan *upgradePlan,
 		return fmt.Errorf("create target cluster: %w; %s", err, recoverHint)
 	}
 	if err := op.deps.Store.Instances.UpdateContainerID(name, newContainerID); err != nil {
-		log.Printf("Error updating container ID: %v", err)
+		op.markError()
+		return fmt.Errorf("record container id: %w; %s", err, recoverHint)
 	}
 
 	// Start and wait for the fresh cluster to accept connections (initdb
@@ -304,7 +305,7 @@ func (op *UpgradeRDBMSOp) replaceCluster(ctx context.Context, plan *upgradePlan,
 	}
 	if err := waitForPostgresReady(ctx, instance.Port, plan.password); err != nil {
 		op.markError()
-		return fmt.Errorf("target cluster did not become ready: %w; %s", err, recoverHint)
+		return fmt.Errorf("target cluster did not become ready: %w; %s", annotateReadyError(op.deps, newContainerID, err), recoverHint)
 	}
 	return nil
 }
@@ -384,8 +385,7 @@ func resolveTargetImage(currentImage, targetVersion, providedImage string) (stri
 // connectDirect opens a PostgreSQL connection by port+password without checking
 // instance status (used during an upgrade when status is "upgrading").
 func connectDirect(ctx context.Context, port int, password, database string) (*pgx.Conn, error) {
-	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/%s?sslmode=disable", password, util.GatewayIP, port, database)
-	return pgx.Connect(ctx, connStr)
+	return pgx.Connect(ctx, util.PostgresURI(password, port, database))
 }
 
 // waitForPostgresReady polls until the cluster accepts connections or times out.

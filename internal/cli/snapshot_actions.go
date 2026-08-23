@@ -174,7 +174,11 @@ type snapshotPlan struct {
 	CleanupRemoteDays int    `json:"cleanupRemoteDays"`
 	Format            string `json:"format"`
 	UpdatedAt         string `json:"updatedAt"`
+	PausedAt          string `json:"pausedAt"`
+	PausedReason      string `json:"pausedReason"`
 }
+
+func (p *snapshotPlan) isPaused() bool { return p.PausedAt != "" }
 
 type snapshotRecord struct {
 	ID                int    `json:"id"`
@@ -214,8 +218,38 @@ func (c *Client) snapshotSetupCronAction(ctx context.Context, cmd *cli.Command) 
 		return nil
 	}
 
+	if cmd.Bool("pause") && cmd.Bool("resume") {
+		return fmt.Errorf("--pause and --resume are mutually exclusive")
+	}
+	if cmd.Bool("pause") || cmd.Bool("resume") {
+		verb := "resume"
+		if cmd.Bool("pause") {
+			verb = "pause"
+		}
+		resp, err := c.request("POST", "/api/cron/snapshot/"+verb, map[string]any{})
+		if err != nil {
+			return err
+		}
+		var wrapper struct {
+			Plan *snapshotPlan `json:"plan"`
+		}
+		if err := json.Unmarshal(resp, &wrapper); err != nil {
+			return fmt.Errorf("parse response: %w", err)
+		}
+		if wrapper.Plan == nil {
+			return fmt.Errorf("no snapshot schedule is configured")
+		}
+		if verb == "resume" {
+			_, _ = fmt.Fprintln(c.out, "Snapshot schedule resumed.")
+		} else {
+			_, _ = fmt.Fprintln(c.out, "Snapshot schedule paused.")
+		}
+		printSnapshotPlan(c.out, wrapper.Plan)
+		return nil
+	}
+
 	if !cmd.IsSet("utc-hour") {
-		return fmt.Errorf("--utc-hour is required (or --remove to delete the schedule)")
+		return fmt.Errorf("--utc-hour is required (or --remove/--pause/--resume)")
 	}
 
 	// Send ONLY what the operator actually set, so the daemon can merge with the
@@ -281,6 +315,17 @@ func (c *Client) snapshotListCronAction(ctx context.Context, cmd *cli.Command) e
 }
 
 func printSnapshotPlan(out io.Writer, plan *snapshotPlan) {
+	// Printed before the schedule itself: a paused plan's hours are what it
+	// WOULD do, not what it does, and an operator skimming the output must not
+	// read "daily at 03:00 UTC" as protection that is running.
+	if plan.isPaused() {
+		_, _ = fmt.Fprintf(out, "⚠️  PAUSED since %s — no snapshots are being taken.\n", plan.PausedAt)
+		if plan.PausedReason != "" {
+			_, _ = fmt.Fprintf(out, "   Reason: %s\n", plan.PausedReason)
+		}
+		_, _ = fmt.Fprintln(out, "   Resume with: oddk snapshot setup-cron --resume")
+		_, _ = fmt.Fprintln(out)
+	}
 	if plan.IntervalHours >= 24 {
 		_, _ = fmt.Fprintf(out, "Scheduled snapshot: daily at %02d:00 UTC\n", plan.UTCHour)
 	} else {
@@ -538,6 +583,7 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 		_, _ = fmt.Fprintln(c.out, "  - Its postgres password becomes the snapshot's. The archive carries only a")
 		_, _ = fmt.Fprintln(c.out, "    hash, so the source's password is the only one that can still authenticate.")
 		_, _ = fmt.Fprintln(c.out, "  - Other instances are untouched.")
+		_, _ = fmt.Fprintln(c.out, "  - A physical restore empties UNLOGGED tables (crash-recovery semantics).")
 		_, _ = fmt.Fprintln(c.out)
 
 		confirmed, err := c.cliConfirm(fmt.Sprintf("Restore instance %q from this snapshot? [y/N]: ", instance))
@@ -765,6 +811,11 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 		_, _ = fmt.Fprintln(c.out)
 		_, _ = fmt.Fprintln(c.out, "  - This REPLACES the entire ODDK deployment here: oddk.db, master.key and all")
 		_, _ = fmt.Fprintln(c.out, "    instance data.")
+		_, _ = fmt.Fprintln(c.out, "  - Physical restores empty UNLOGGED tables (crash-recovery semantics).")
+		_, _ = fmt.Fprintln(c.out, "  - The restored schedules are PAUSED automatically. They keep the source's")
+		_, _ = fmt.Fprintln(c.out, "    offsite settings, so running them here would write to — and expire")
+		_, _ = fmt.Fprintln(c.out, "    objects from — the same bucket the source may still be using. Nothing")
+		_, _ = fmt.Fprintln(c.out, "    is scheduled here until you resume them.")
 		if len(plan.PulledImages) > 0 {
 			_, _ = fmt.Fprintf(c.out, "  - No ODDK state has been modified yet. (%d Docker image(s) were pulled\n    above; that is additive and safe to leave behind.)\n", len(plan.PulledImages))
 		} else {
@@ -794,14 +845,36 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 	_, _ = fmt.Fprintln(c.out, "\nSnapshot applied.")
 	_, _ = fmt.Fprintf(c.out, "Instances: %d restored, %d configuration-only\n",
 		len(result.Restored), len(result.ConfigOnly))
-	_, _ = fmt.Fprintln(c.out, "Next: start the daemon (systemctl start oddk), then run 'oddk checklist'")
+	_, _ = fmt.Fprintln(c.out, "Next: start the daemon (systemctl start oddk), then run 'oddk checklist'.")
+
+	if result.SnapshotCronPaused || result.BackupCronsPaused > 0 {
+		_, _ = fmt.Fprintf(c.out,
+			"\n⚠️  SCHEDULES ARE PAUSED: %s.\n"+
+				"   This host is therefore NOT protecting itself — no snapshots will be taken\n"+
+				"   until you resume. That is deliberate: the restored offsite settings point at\n"+
+				"   the SOURCE host's bucket, and an unpaused restore would upload into it and\n"+
+				"   run retention against it, deleting archives the source still catalogues.\n"+
+				"\n"+
+				"   If this host REPLACES a dead source, resume now:\n",
+			operations.DescribePausedSchedules(result.SnapshotCronPaused, result.BackupCronsPaused))
+		if result.SnapshotCronPaused {
+			_, _ = fmt.Fprintln(c.out, "     oddk snapshot setup-cron --resume")
+		}
+		if result.BackupCronsPaused > 0 {
+			_, _ = fmt.Fprintln(c.out, "     oddk backup setup-cron --instance <name> --resume   # per instance")
+		}
+		_, _ = fmt.Fprintln(c.out, "\n   If the source is STILL LIVE (rehearsal or staged migration), leave them")
+		_, _ = fmt.Fprintln(c.out, "   paused, or point this host at its own bucket with 'oddk offsite apply'.")
+		_, _ = fmt.Fprintln(c.out, "   'oddk checklist' reports a paused schedule as a problem until it is resumed.")
+	}
 
 	if len(result.ConfigOnly) > 0 {
 		_, _ = fmt.Fprintf(c.out,
 			"\n⚠️  These instances held NO data in the snapshot and were left in 'error' with no\n"+
 				"   cluster: %s\n"+
-				"   Their configuration is restored; destroy and recreate them, or restore their\n"+
-				"   databases from a per-instance backup.\n",
+				"   Do not destroy and recreate them — that would build an empty healthy cluster.\n"+
+				"   Restore from a per-instance backup if you have one; otherwise treat them as\n"+
+				"   new instances to provision.\n",
 			strings.Join(result.ConfigOnly, ", "))
 	}
 	if result.BackupsRepointed > 0 || result.BackupsLocalCleared > 0 {

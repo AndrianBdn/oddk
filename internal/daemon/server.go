@@ -161,6 +161,11 @@ func (s *Server) Start() error {
 
 	go s.startLogRetentionSweeper(ctx)
 
+	// A paused schedule means this host is taking no snapshots. `snapshot apply`
+	// pauses deliberately; this is what stops that pause becoming permanent by
+	// forgetfulness.
+	go s.startPausedScheduleReminder(ctx)
+
 	// Bind to loopback by default. --allow-remote opts into 0.0.0.0; warn
 	// loudly because there's no TLS — the auth token transits cleartext.
 	bindHost := "127.0.0.1"

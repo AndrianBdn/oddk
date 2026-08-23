@@ -169,9 +169,6 @@ func (c *Client) backupUploadAction(ctx context.Context, cmd *cli.Command) error
 
 func (c *Client) backupSetupCronAction(ctx context.Context, cmd *cli.Command) error {
 	instanceName := cmd.String("instance")
-	utcHour := cmd.Int("utc-hour")
-	cleanupLocalDays := cmd.Int("cleanup-local-days")
-	cleanupRemoteDays := cmd.Int("cleanup-remote-days")
 	remove := cmd.Bool("remove")
 
 	if instanceName == "" {
@@ -179,7 +176,21 @@ func (c *Client) backupSetupCronAction(ctx context.Context, cmd *cli.Command) er
 		return fmt.Errorf("instance name required")
 	}
 
-	// Handle removal
+	if cmd.Bool("pause") && cmd.Bool("resume") {
+		return fmt.Errorf("--pause and --resume are mutually exclusive")
+	}
+	if cmd.Bool("pause") || cmd.Bool("resume") {
+		verb := "resume"
+		if cmd.Bool("pause") {
+			verb = "pause"
+		}
+		if _, err := c.request("POST", fmt.Sprintf("/api/cron/backup/%s/%s", instanceName, verb), map[string]any{}); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(c.out, "Backup schedule for instance '%s' %sd\n", instanceName, verb)
+		return nil
+	}
+
 	if remove {
 		_, err := c.request("DELETE", fmt.Sprintf("/api/cron/backup/%s", instanceName), nil)
 		if err != nil {
@@ -190,38 +201,47 @@ func (c *Client) backupSetupCronAction(ctx context.Context, cmd *cli.Command) er
 		return nil
 	}
 
-	// Handle creation/update
-	if utcHour < 0 || utcHour > 23 {
-		return fmt.Errorf("UTC hour must be between 0 and 23")
+	// Send only fields the operator set, so moving --utc-hour does not silently
+	// reset retention windows the way the flag defaults would.
+	req := map[string]any{"instanceName": instanceName}
+	if cmd.IsSet("utc-hour") {
+		utcHour := cmd.Int("utc-hour")
+		if utcHour < 0 || utcHour > 23 {
+			return fmt.Errorf("UTC hour must be between 0 and 23")
+		}
+		req["utcHour"] = utcHour
+	}
+	if cmd.IsSet("cleanup-local-days") {
+		n := cmd.Int("cleanup-local-days")
+		if n < 1 {
+			return fmt.Errorf("cleanup-local-days must be at least 1")
+		}
+		req["cleanupLocalDays"] = n
+	}
+	if cmd.IsSet("cleanup-remote-days") {
+		n := cmd.Int("cleanup-remote-days")
+		if n < 1 {
+			return fmt.Errorf("cleanup-remote-days must be at least 1")
+		}
+		req["cleanupRemoteDays"] = n
 	}
 
-	if cleanupLocalDays < 1 {
-		return fmt.Errorf("cleanup-local-days must be at least 1")
-	}
-
-	if cleanupRemoteDays < 1 {
-		return fmt.Errorf("cleanup-remote-days must be at least 1")
-	}
-
-	req := struct {
-		InstanceName      string `json:"instanceName"`
-		UTCHour           int    `json:"utcHour"`
-		CleanupLocalDays  int    `json:"cleanupLocalDays"`
-		CleanupRemoteDays int    `json:"cleanupRemoteDays"`
-	}{
-		InstanceName:      instanceName,
-		UTCHour:           utcHour,
-		CleanupLocalDays:  cleanupLocalDays,
-		CleanupRemoteDays: cleanupRemoteDays,
-	}
-
-	_, err := c.request("POST", "/api/cron/backup", req)
+	body, err := c.request("POST", "/api/cron/backup", req)
 	if err != nil {
 		return err
 	}
 
+	var plan struct {
+		UTCHour           int `json:"utcHour"`
+		CleanupLocalDays  int `json:"cleanupLocalDays"`
+		CleanupRemoteDays int `json:"cleanupRemoteDays"`
+	}
+	if err := json.Unmarshal(body, &plan); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
 	_, _ = fmt.Fprintf(c.out, "Scheduled daily backup for instance '%s' at %02d:00 UTC (keep local: %d days, remote: %d days)\n",
-		instanceName, utcHour, cleanupLocalDays, cleanupRemoteDays)
+		instanceName, plan.UTCHour, plan.CleanupLocalDays, plan.CleanupRemoteDays)
 	return nil
 }
 

@@ -50,6 +50,11 @@ type checklistResponse struct {
 		} `json:"copies"`
 		Stale       bool   `json:"stale"`
 		StaleDetail string `json:"staleDetail"`
+
+		Paused            bool     `json:"paused"`
+		PausedSince       string   `json:"pausedSince"`
+		PausedReason      string   `json:"pausedReason"`
+		PausedBackupCrons []string `json:"pausedBackupCrons"`
 	} `json:"snapshots"`
 	Notifications struct {
 		Configured []struct {
@@ -192,10 +197,29 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 		if snap.Format != "" {
 			formatSuffix = ", " + snap.Format
 		}
+		// A PAUSED schedule is a problem, not a schedule. It takes no snapshots,
+		// and the failure mode is precisely that someone restores a host and
+		// never resumes it — so the glyph must be ✗ and the line must not read
+		// like protection that is running.
+		glyph := glyphOK
+		suffix := formatSuffix
+		if snap.Paused {
+			glyph = glyphBad
+			suffix = formatSuffix + " - PAUSED, NO SNAPSHOTS ARE BEING TAKEN"
+		}
 		if snap.IntervalHours >= 24 || snap.IntervalHours == 0 {
-			_, _ = fmt.Fprintf(out, "  %s scheduled: daily at %02d:00 UTC%s\n", glyphOK, snap.UTCHour, formatSuffix)
+			_, _ = fmt.Fprintf(out, "  %s scheduled: daily at %02d:00 UTC%s\n", glyph, snap.UTCHour, suffix)
 		} else {
-			_, _ = fmt.Fprintf(out, "  %s scheduled: every %dh from %02d:00 UTC%s\n", glyphOK, snap.IntervalHours, snap.UTCHour, formatSuffix)
+			_, _ = fmt.Fprintf(out, "  %s scheduled: every %dh from %02d:00 UTC%s\n", glyph, snap.IntervalHours, snap.UTCHour, suffix)
+		}
+		if snap.Paused {
+			if snap.PausedSince != "" {
+				_, _ = fmt.Fprintf(out, "    paused since %s\n", snap.PausedSince)
+			}
+			if snap.PausedReason != "" {
+				_, _ = fmt.Fprintf(out, "    reason: %s\n", snap.PausedReason)
+			}
+			_, _ = fmt.Fprintln(out, "    resume: oddk snapshot setup-cron --resume")
 		}
 	} else {
 		_, _ = fmt.Fprintf(out, "  %s not scheduled (oddk snapshot setup-cron --utc-hour <h>)\n", glyphTodo)
@@ -218,6 +242,10 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 	if snap.Total > 0 {
 		_, _ = fmt.Fprintf(out, "    stored: %s\n", formatStoredCopies(
 			snap.Total, snap.Copies.LocalAndRemote, snap.Copies.RemoteOnly, snap.Copies.LocalOnly, snap.Copies.None))
+	}
+	if len(snap.PausedBackupCrons) > 0 {
+		_, _ = fmt.Fprintf(out, "  %s paused backup schedules: %s (oddk backup setup-cron --instance <name> --resume)\n",
+			glyphBad, strings.Join(snap.PausedBackupCrons, ", "))
 	}
 	_, _ = fmt.Fprintln(out)
 

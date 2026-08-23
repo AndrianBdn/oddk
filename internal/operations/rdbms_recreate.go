@@ -2,10 +2,12 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
 	"github.com/andrianbdn/oddk/internal/crypto"
+	"github.com/andrianbdn/oddk/internal/operr"
 	"github.com/andrianbdn/oddk/internal/store/instances"
 )
 
@@ -28,54 +30,34 @@ func recreateInstanceOnImage(ctx context.Context, deps *Dependencies, instance *
 		return nil, fmt.Errorf("get parameter group %s: %w", instance.ParameterGroup, err)
 	}
 
+	prev := specFromInstance(instance, password, parameterGroup)
+	next := prev
+	next.Image = newImage
+	next.Version = newVersion
+
+	prevStatus := instance.Status
 	if err := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusSwitching); err != nil {
 		log.Printf("Error updating status to switching: %v", err)
 	}
 
-	newContainerID, err := deps.Docker.RecreateContainer(
-		instance.Name,
-		newVersion,
-		newImage,
-		instance.Port,
-		password,
-		instance.CPUCores,
-		instance.RAMMB,
-		instance.ParameterGroup,
-		parameterGroup.Parameters,
-		instance.ContainerID,
-	)
+	rolledBack, err := applyClusterChange(ctx, deps, next, prev, instance.ContainerID)
+	if rolledBack {
+		return nil, fmt.Errorf("image %s could not start: %w (rolled back to %s)", newImage, err, instance.Image)
+	}
 	if err != nil {
-		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusError); statusErr != nil {
-			log.Printf("Error updating status to error: %v", statusErr)
+		if prevStatus != instances.StatusError && errors.Is(err, operr.ErrInvalid) {
+			if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, prevStatus); statusErr != nil {
+				log.Printf("Error restoring status after preflight refusal: %v", statusErr)
+			}
 		}
-		return nil, fmt.Errorf("recreate container: %w", err)
+		return nil, err
 	}
 
-	if err := deps.Store.Instances.UpdateContainerID(instance.Name, newContainerID); err != nil {
-		log.Printf("Error updating container ID: %v", err)
-	}
 	if err := deps.Store.Instances.UpdateImage(instance.Name, newImage, newVersion); err != nil {
-		log.Printf("Error updating image: %v", err)
+		return nil, fmt.Errorf("record image: %w", err)
 	}
-
-	if err := deps.Docker.StartContainer(newContainerID); err != nil {
-		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusError); statusErr != nil {
-			log.Printf("Error updating status to error: %v", statusErr)
-		}
-		return nil, fmt.Errorf("start container: %w", err)
-	}
-
-	// Docker reporting the container as started does not mean PostgreSQL is
-	// ready to accept connections; wait for it before reporting "running".
-	if err := waitForPostgresReady(ctx, instance.Port, password); err != nil {
-		if statusErr := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusError); statusErr != nil {
-			log.Printf("Error updating status to error: %v", statusErr)
-		}
-		return nil, fmt.Errorf("wait for PostgreSQL readiness: %w", err)
-	}
-
 	if err := deps.Store.Instances.UpdateStatus(instance.Name, instances.StatusRunning); err != nil {
-		log.Printf("Error updating status to running: %v", err)
+		return nil, fmt.Errorf("record running status: %w", err)
 	}
 
 	updated, err := deps.Store.Instances.Get(instance.Name)

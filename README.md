@@ -279,6 +279,10 @@ oddk snapshot make --comment "before major upgrade"
 oddk snapshot make --logical            # portable pg_dump-based format
 oddk snapshot list
 
+# Suspend a schedule without losing it (and put it back)
+oddk snapshot setup-cron --pause
+oddk snapshot setup-cron --resume
+
 # Schedule it. One schedule per deployment — a snapshot covers every instance.
 oddk snapshot setup-cron --utc-hour 3                     # daily at 03:00 UTC
 oddk snapshot setup-cron --utc-hour 3 --interval-hours 6  # 03,09,15,21 UTC
@@ -337,6 +341,9 @@ sudo -u oddk oddk snapshot apply \
       --master-key /mnt/restore/master.key
 systemctl start oddk
 
+# apply PAUSES every restored schedule. Resume once this host owns its bucket:
+oddk snapshot setup-cron --resume
+
 # apply can also fetch the archive itself, using this shell's AWS credentials —
 # see "Disaster recovery from S3" below for the full walkthrough.
 sudo -u oddk oddk snapshot apply \
@@ -352,7 +359,9 @@ What you need to know:
   ICU collations all survive, which the logical format cannot promise). A
   physical snapshot restores onto the same PostgreSQL major and the same CPU
   architecture; `--logical` produces the portable `pg_dump`-based format for
-  cross-architecture moves and single-database restore workflows.
+  cross-architecture moves and for UNLOGGED table rows that a physical restore
+  would empty. Restore a single database with `oddk backup restore --database`,
+  not a snapshot command.
 - **UNLOGGED tables come back empty from a physical restore.** This is standard
   physical-backup semantics (RDS storage snapshots behave the same): unlogged
   tables are truncated by any crash recovery, which is what a physical restore
@@ -478,6 +487,28 @@ directory before anything is touched — a failed apply keeps it there for the
 retry (re-running with the same `--s3-uri` reuses it), and it is pruned
 automatically after 7 days.
 
+> **`apply` pauses every restored schedule, and that is on purpose.** The
+> archive carries the source host's `oddk.db`, which holds its snapshot
+> schedule, its per-instance backup schedules *and* its offsite bucket and
+> credentials. Starting the daemon unpaused would put two hosts on one bucket:
+> this one would upload under the same layout and — the dangerous half — run
+> offsite **retention** against it, deleting archives the *source* still
+> catalogues. Since `apply` cannot know whether the source is alive, it fails
+> safe.
+>
+> So a restored host takes **no snapshots until you resume**. That is reported
+> three ways so it cannot be forgotten: `apply` prints it, `oddk checklist`
+> shows `✗ ... PAUSED, NO SNAPSHOTS ARE BEING TAKEN`, and a notification
+> repeats daily until it is resumed or removed.
+>
+> ```bash
+> oddk snapshot setup-cron --resume                      # the snapshot schedule
+> oddk backup setup-cron --instance <name> --resume      # any legacy backup schedule
+> ```
+>
+> If this is a **rehearsal** and the source is still live, leave them paused —
+> or point this host at its own bucket with `oddk offsite apply` first.
+
 > **You still need `master.key`, and it is deliberately *not* in the bucket** —
 > an archive and its key stored together would defeat the encryption of the
 > secrets inside. And remember that **snapshots themselves are not encrypted**:
@@ -567,11 +598,17 @@ oddk backup restore --instance app --id 42 --database analytics --restore-as ana
 oddk backup restore --instance app --file /path/to/backup.tar.zst --database analytics
 
 # Scheduling and offsite copies (superseded by `oddk snapshot setup-cron`)
-oddk backup setup-cron --instance app --utc-hour 3   # daily at 03:00 UTC
+oddk backup setup-cron --instance app --utc-hour 3              # daily at 03:00 UTC
+oddk backup setup-cron --instance app --cleanup-local-days 14   # keeps the existing hour
 oddk backup list-cron
 oddk backup upload app <backup-id>
 oddk backup download app <backup-id>
 ```
+
+Fields you do not pass to `setup-cron` are preserved, matching
+`oddk snapshot setup-cron` — changing a retention window cannot silently move
+the hour. `--utc-hour` is therefore required when creating a schedule, and
+optional when adjusting one.
 
 Backups record roles with database-level `CREATE` access, and both restore and
 `major-upgrade` reapply those grants automatically. A role must already exist on
@@ -630,6 +667,30 @@ oddk instance apply app --parameter-group custom      # reconfigure in place
 Parameters support expression evaluation against the instance's resources, e.g.
 `"{expr}DBContainerMemoryMB / 4{/expr} MB"` for `shared_buffers`.
 
+**Getting a group wrong does not cost you the instance.** `oddk instance apply`
+— and `create`, `instance switch`, `instance update`, which rebuild the
+container the same way — checks what it can *before* the running container is
+touched: a missing image, a group that will not resolve, or one whose
+shared-memory arena cannot fit the instance's RAM is refused outright and the
+old container keeps serving. If the new container is built but PostgreSQL never
+comes up, ODDK stops it, puts the previous configuration back, and reports the
+failure — the instance stays up. The stored group changes only once PostgreSQL
+is accepting connections, so a failed apply can be retried with the *same*
+group instead of forcing you to invent a different one.
+
+The shared-memory check is deliberately one-sided: it refuses only what it can
+prove will not fit (`shared_buffers`, WAL buffers, and the lock table implied by
+`max_locks_per_transaction × max_connections`). Anything it cannot parse is
+allowed through, because a wrong refusal would block a disaster-recovery
+restore, while a config PostgreSQL rejects is already caught by the rollback
+above.
+
+`parameters put` takes either a bare array or the object that
+`oddk parameters get --name <group> --json` prints, so a group round-trips
+without `jq`. It refuses a parameter whose `type` is not `postgres_cli_arg`:
+that is the only type ODDK applies, so anything else would be stored and then
+silently never take effect.
+
 ### Notifications
 
 ```bash
@@ -641,6 +702,16 @@ oddk notify logs --limit 50
 
 Supported channels: Email, Slack, Telegram, Webhook. Health degraded/restored
 events are delivered automatically with configurable thresholds.
+
+An instance left in `error` by a failed operation — an apply whose rollback also
+failed, a start that never reached readiness, a switch interrupted by a daemon
+restart — is reported as broken rather than skipped, so a deployment cannot read
+as healthy while an instance has no working cluster. The message names the
+reason, which is what separates a stalled operation from a cluster that simply
+stopped answering.
+Note that `oddk snapshot apply` deliberately leaves configuration-only instances
+in `error`, so a disaster-recovery restore will raise this too; the notification
+says so and points at `oddk checklist`.
 
 **Scheduled runs notify on failure.** A scheduled backup or snapshot that ends
 with any failed phase sends one message to every configured channel, naming what

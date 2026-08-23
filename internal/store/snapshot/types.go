@@ -22,9 +22,18 @@ type Plan struct {
 	// physical — that DEFAULT is the deliberate "binary by default" switch.
 	Format string `db:"format" json:"format"`
 
+	// PausedAt is zero (NULL) when the schedule runs. A paused plan keeps every
+	// field above — pausing is not deleting — but the scheduler skips it. See
+	// migration 021 for why `snapshot apply` pauses rather than removes.
+	PausedAt     rfc3339time.Time `db:"paused_at" json:"pausedAt,omitzero"`
+	PausedReason string           `db:"paused_reason" json:"pausedReason,omitempty"`
+
 	CreatedAt rfc3339time.Time `db:"created_at" json:"createdAt"`
 	UpdatedAt rfc3339time.Time `db:"updated_at" json:"updatedAt"`
 }
+
+// IsPaused reports whether the scheduler should skip this plan.
+func (p *Plan) IsPaused() bool { return !p.PausedAt.IsZero() }
 
 // RunsAtHour reports whether the plan fires at the given UTC hour.
 //

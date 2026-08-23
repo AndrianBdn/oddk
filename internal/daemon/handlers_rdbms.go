@@ -193,6 +193,8 @@ func (s *Server) handleDeleteRDBMS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.clearWriteDeadline(w, fmt.Sprintf("destroy %s", name))
+
 	// Coordinate connection cleanup before destroying instance
 	s.pauseHealthChecksAndCleanupConnections(name)
 	defer s.unpauseHealthChecks()
@@ -312,6 +314,9 @@ func (s *Server) handleGetRDBMSLogs(w http.ResponseWriter, r *http.Request) {
 	params := operations.GetLogsParams{InstanceName: name, Tail: tail}
 
 	if r.URL.Query().Get("follow") == "true" {
+		// Follow outlives WriteTimeout by design; without this the stream dies
+		// at 30s and looks like the container stopped.
+		s.clearWriteDeadline(w, fmt.Sprintf("logs follow %s", name))
 		// Streaming mode: write plain text, flush as Docker frames arrive
 		flusher, canFlush := w.(http.Flusher)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

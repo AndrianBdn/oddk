@@ -28,6 +28,28 @@ import (
 	"github.com/andrianbdn/oddk/internal/util"
 )
 
+// ErrPreflight marks a RecreateContainer/CreateContainer failure that happened
+// before any existing container was removed. Callers must not roll back on it
+// — the previous container is still the one that is running.
+var ErrPreflight = errors.New("container not modified")
+
+func preflightErrorf(format string, args ...any) error {
+	return fmt.Errorf("%w: "+format, append([]any{ErrPreflight}, args...)...)
+}
+
+// ContainerName and VolumeName are the only places these two names are spelled.
+// They are exported because the operations layer removes both by name during
+// destroy — a container whose ID the store never learned still has to go, and a
+// destroy that leaves the volume behind makes `oddk create --name <same>` fail
+// forever (CreateContainer refuses to adopt an existing volume).
+func ContainerName(instanceName string) string {
+	return fmt.Sprintf("oddk-pg-%s", instanceName)
+}
+
+func VolumeName(instanceName string) string {
+	return fmt.Sprintf("oddk-data-%s", instanceName)
+}
+
 type Client struct {
 	cli *client.Client
 	ctx context.Context
@@ -213,21 +235,32 @@ func (c *Client) ContainerPGData(containerID, version string) (string, error) {
 }
 
 func (c *Client) CreateContainer(name, version, image string, port int, password string, cpuCores, ramMB int, parameterGroupName string, parameterGroupParams []parameters.Parameter) (string, error) {
-	volumeName := fmt.Sprintf("oddk-data-%s", name)
-	containerName := fmt.Sprintf("oddk-pg-%s", name)
+	volumeName := VolumeName(name)
+	containerName := ContainerName(name)
 	imageName := image
 
 	// Verify the image exists locally
 	tags, exists := c.CheckImageExists(imageName)
 	if !exists {
-		return "", fmt.Errorf("image %s not found locally. Please run 'oddk pull --image %s' first", imageName, imageName)
+		return "", preflightErrorf("image %s not found locally. Please run 'oddk pull --image %s' first", imageName, imageName)
 	}
 	log.Printf("Using existing image %s (tags: %v)", imageName, tags)
 
+	// Resolve and refuse an oversized group BEFORE creating a volume we would
+	// then have to roll back. PUT only type-checks against dummy 8 GiB, so a
+	// group that is fine there can still be fatal for this instance's RAM.
+	resolvedParams, err := parameters.ResolveParameters(parameterGroupParams, cpuCores, ramMB)
+	if err != nil {
+		return "", preflightErrorf("resolve parameter group parameters: %w", err)
+	}
+	if err := parameters.ValidateForContainer(resolvedParams, ramMB); err != nil {
+		return "", preflightErrorf("%w", err)
+	}
+
 	// Check if volume already exists - we don't support adopting existing volumes
-	_, err := c.cli.VolumeInspect(c.ctx, volumeName)
+	_, err = c.cli.VolumeInspect(c.ctx, volumeName)
 	if err == nil {
-		return "", fmt.Errorf("volume %s already exists. ODDK does not support adopting existing volumes. Please remove the existing volume or use a different instance name", volumeName)
+		return "", preflightErrorf("volume %s already exists. ODDK does not support adopting existing volumes. Please remove the existing volume or use a different instance name", volumeName)
 	}
 
 	_, err = c.cli.VolumeCreate(c.ctx, volume.CreateOptions{
@@ -235,13 +268,6 @@ func (c *Client) CreateContainer(name, version, image string, port int, password
 	})
 	if err != nil {
 		return "", fmt.Errorf("create volume: %w", err)
-	}
-
-	// Resolve parameter group parameters
-	resolvedParams, err := parameters.ResolveParameters(parameterGroupParams, cpuCores, ramMB)
-	if err != nil {
-		_ = c.cli.VolumeRemove(c.ctx, volumeName, true)
-		return "", fmt.Errorf("resolve parameter group parameters: %w", err)
 	}
 
 	// Convert RAM MB to bytes
@@ -341,45 +367,53 @@ func (c *Client) StartContainer(containerID string) error {
 	return nil
 }
 
-// RecreateContainer stops and removes the old container, then creates a new one with the same volume but new parameters
+// RecreateContainer stops and removes the old container, then creates a new one with the same volume but new parameters.
+//
+// Cheap checks (image, parameter resolution, shared-memory fit, volume exists)
+// run BEFORE the old container is removed. Failures of those wrap ErrPreflight
+// so the caller knows the previous container is still the running one.
 func (c *Client) RecreateContainer(name, version, image string, port int, password string, cpuCores, ramMB int, parameterGroupName string, parameterGroupParams []parameters.Parameter, oldContainerID string) (string, error) {
-	volumeName := fmt.Sprintf("oddk-data-%s", name)
-	containerName := fmt.Sprintf("oddk-pg-%s", name)
+	volumeName := VolumeName(name)
+	containerName := ContainerName(name)
 	imageName := image
 
-	// Verify the image exists locally
 	tags, exists := c.CheckImageExists(imageName)
 	if !exists {
-		return "", fmt.Errorf("image %s not found locally. Please run 'oddk pull --image %s' first", imageName, imageName)
+		return "", preflightErrorf("image %s not found locally. Please run 'oddk pull --image %s' first", imageName, imageName)
 	}
 	log.Printf("Using existing image %s (tags: %v)", imageName, tags)
 
-	// Stop the old container if running
+	resolvedParams, err := parameters.ResolveParameters(parameterGroupParams, cpuCores, ramMB)
+	if err != nil {
+		return "", preflightErrorf("resolve parameter group parameters: %w", err)
+	}
+	if err := parameters.ValidateForContainer(resolvedParams, ramMB); err != nil {
+		return "", preflightErrorf("%w", err)
+	}
+
+	if _, err := c.cli.VolumeInspect(c.ctx, volumeName); err != nil {
+		return "", preflightErrorf("volume %s not found: %w", volumeName, err)
+	}
+
 	if oldContainerID != "" {
-		status, err := c.GetContainerStatus(oldContainerID)
-		if err != nil {
-			log.Printf("Warning: could not get container status: %v", err)
+		status, statusErr := c.GetContainerStatus(oldContainerID)
+		if statusErr != nil {
+			log.Printf("Warning: could not get container status: %v", statusErr)
 		} else if status == "running" {
 			if err := c.StopContainer(oldContainerID); err != nil {
 				return "", fmt.Errorf("stop old container: %w", err)
 			}
 		}
-
 		if err := c.RemoveContainer(oldContainerID); err != nil {
 			return "", fmt.Errorf("remove old container: %w", err)
 		}
 	}
-
-	// Verify the volume exists (it should, since we're reconfiguring)
-	_, err := c.cli.VolumeInspect(c.ctx, volumeName)
-	if err != nil {
-		return "", fmt.Errorf("volume %s not found: %w", volumeName, err)
-	}
-
-	// Resolve parameter group parameters
-	resolvedParams, err := parameters.ResolveParameters(parameterGroupParams, cpuCores, ramMB)
-	if err != nil {
-		return "", fmt.Errorf("resolve parameter group parameters: %w", err)
+	// A crash between ContainerCreate and UpdateContainerID leaves a container
+	// named oddk-pg-<name> whose ID the store does not know. Removing by name
+	// as well as ID makes a retry replace that orphan instead of hitting a
+	// name conflict. No-op when the ID remove above already took it.
+	if err := c.RemoveContainer(containerName); err != nil {
+		return "", fmt.Errorf("remove leftover container %s: %w", containerName, err)
 	}
 
 	// Convert RAM MB to bytes

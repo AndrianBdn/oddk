@@ -23,8 +23,10 @@ import (
 	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
+	"github.com/andrianbdn/oddk/internal/rfc3339time"
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/instances"
+	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 	"github.com/andrianbdn/oddk/internal/util"
 	"github.com/andrianbdn/oddk/internal/version"
 )
@@ -104,6 +106,14 @@ type SnapshotApplyResult struct {
 	SnapshotsRepointed    int
 	SnapshotsLocalCleared int
 	SnapshotsDangling     int
+
+	// Schedules suspended by this apply. The restored oddk.db carries the SOURCE
+	// host's schedule AND its offsite settings, so an unpaused restore starts
+	// writing into — and running RETENTION against — a bucket the source may
+	// still be using. SnapshotCronPaused is false when the archive carried no
+	// snapshot schedule at all.
+	SnapshotCronPaused bool
+	BackupCronsPaused  int
 }
 
 // PreflightSnapshotApply validates that this snapshot can be applied to this
@@ -631,6 +641,44 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 			snapRepointed, snapCleared)
 	}
 
+	// 3d. Suspend the restored schedules.
+	//
+	//     The archive's oddk.db carries the source host's snapshot schedule, its
+	//     per-instance backup schedules AND its offsite credentials and bucket
+	//     path. On a rehearsal or a planned migration — where the source is
+	//     STILL LIVE — starting the daemon here would put two hosts on one
+	//     bucket: this one uploads under the same layout, and its offsite
+	//     retention deletes objects the source still catalogues. That is silent
+	//     and it destroys the source's archives, not this host's.
+	//
+	//     Pausing rather than deleting is deliberate. Deleting the schedule (the
+	//     previously documented workaround) trades a rehearsal hazard for a
+	//     production one: a real DR host whose operator never recreates it is
+	//     permanently unprotected, and nothing says so. A paused schedule keeps
+	//     every setting, resumes with one command, and is reported as a PROBLEM
+	//     by `oddk checklist` plus a daily notification until it is resumed.
+	//
+	//     This is not conditional on "is the source alive" — apply cannot know
+	//     that. It fails safe and makes resuming a deliberate, one-command act.
+	pauseReason := fmt.Sprintf("suspended by 'snapshot apply' on %s; resume once you have confirmed no other host is writing to this offsite bucket",
+		rfc3339time.Now().UTC().Format("2006-01-02 15:04 MST"))
+	if err := st.Snapshot.PausePlan(pauseReason); err != nil {
+		if !errors.Is(err, snapshotstore.ErrNoSnapshotPlan) {
+			return nil, fmt.Errorf("pause restored snapshot schedule: %w", err)
+		}
+	} else {
+		result.SnapshotCronPaused = true
+	}
+	pausedBackups, err := st.Cron.PauseAllPlans(pauseReason)
+	if err != nil {
+		return nil, fmt.Errorf("pause restored backup schedules: %w", err)
+	}
+	result.BackupCronsPaused = int(pausedBackups)
+	if result.SnapshotCronPaused || result.BackupCronsPaused > 0 {
+		emitLine(progress, "  ✓ Restored schedules PAUSED (%s) — nothing writes to the offsite bucket until you resume",
+			DescribePausedSchedules(result.SnapshotCronPaused, result.BackupCronsPaused))
+	}
+
 	// 4. Rebuild each instance.
 	byName := make(map[string]SnapshotInstanceEntry, len(plan.Manifest.Instances))
 	for _, entry := range plan.Manifest.Instances {
@@ -1110,4 +1158,19 @@ func checkLocaleProviders(extractedDir string, instances []*InstanceMeta) error 
 		}
 	}
 	return nil
+}
+
+// DescribePausedSchedules renders the pause summary for both the apply progress
+// line and the CLI's closing warning, so the two cannot drift.
+func DescribePausedSchedules(snapshotPaused bool, backupCrons int) string {
+	switch {
+	case snapshotPaused && backupCrons > 0:
+		return fmt.Sprintf("snapshot schedule + %d backup schedule(s)", backupCrons)
+	case snapshotPaused:
+		return "snapshot schedule"
+	case backupCrons > 0:
+		return fmt.Sprintf("%d backup schedule(s)", backupCrons)
+	default:
+		return "none"
+	}
 }

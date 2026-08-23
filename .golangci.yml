@@ -70,6 +70,15 @@ linters:
       - path: internal/cli/backup_dir_resolution_test\.go
         linters:
           - testpackage
+      # health_notifications_test.go asserts the degraded notification body by
+      # calling the unexported buildDegradedMessage. The exported path needs a
+      # live *store.Store for the display name, so an external test package
+      # could only reach this formatting through a database — and this is
+      # formatting that silently dropped the one line saying WHY an instance was
+      # broken, precisely because nothing asserted what the operator receives.
+      - path: internal/services/health_notifications_test\.go
+        linters:
+          - testpackage
 
 # Formatters are a separate subsystem from linters in golangci-lint v2: they are
 # applied by `golangci-lint fmt`, NOT `golangci-lint run` (and `run --fix` does

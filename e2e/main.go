@@ -112,6 +112,14 @@ func main() {
 				"cron.debug_force_run.int":       "1",
 			},
 		},
+		{
+			Name: "SnapshotCronPause",
+			Fn:   testSnapshotCronPause,
+			KVMap: map[string]string{
+				"cron.debug_ticker_interval.int": "1",
+				"cron.debug_force_run.int":       "1",
+			},
+		},
 		{Name: "SnapshotUpload", Fn: testSnapshotUpload, RunFakeS3: true},
 		{Name: "SnapshotRestoreInstanceFromS3", Fn: testSnapshotRestoreInstanceFromS3, RunFakeS3: true},
 		{Name: "SnapshotApplyFromS3", Fn: testSnapshotApplyFromS3, RunFakeS3: true},

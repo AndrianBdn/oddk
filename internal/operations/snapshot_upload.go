@@ -95,18 +95,10 @@ func UploadSnapshot(ctx context.Context, deps *Dependencies, id int) (*UploadSna
 	// written and only the bookkeeping failed, the first object is orphaned in
 	// S3 forever, invisible to ODDK and to remote retention (which works off the
 	// recorded location). Deriving the key from CreatedAt makes upload
-	// idempotent — a retry targets the same key and overwrites it.
+	// idempotent — a retry targets the same key and PutObject overwrites it.
+	// Do not delete-then-put: a failed upload after a successful delete would
+	// drop a previously-good remote copy.
 	s3Key := fmt.Sprintf("%s/%s/%s", SnapshotS3Prefix, record.CreatedAt.Format("2006-01-02"), filename)
-
-	exists, err := s3Client.FileExists(ctx, s3Key)
-	if err != nil {
-		return nil, fmt.Errorf("check S3 file existence: %w", err)
-	}
-	if exists {
-		if err := s3Client.DeleteFile(ctx, s3Key); err != nil {
-			return nil, fmt.Errorf("delete existing S3 object: %w", err)
-		}
-	}
 
 	if _, err := localFile.Seek(0, 0); err != nil {
 		return nil, fmt.Errorf("reset file position: %w", err)
@@ -120,7 +112,7 @@ func UploadSnapshot(ctx context.Context, deps *Dependencies, id int) (*UploadSna
 		return nil, fmt.Errorf("upload to S3: %w", uploadErr)
 	}
 
-	exists, err = s3Client.FileExists(ctx, s3Key)
+	exists, err := s3Client.FileExists(ctx, s3Key)
 	if err != nil {
 		return nil, fmt.Errorf("verify upload: %w", err)
 	}

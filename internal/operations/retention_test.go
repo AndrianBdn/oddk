@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
 // The regression this whole file exists for: the floor used to count catalogue
@@ -29,6 +31,67 @@ func TestRetentionFloor_GhostRecordsDoNotConsumeSlots(t *testing.T) {
 	}
 	if !floor.full() {
 		t.Error("floor reports itself unfilled after protecting its quota")
+	}
+}
+
+func TestSnapshotRetentionProtects_DegradedDoNotEvictLastComplete(t *testing.T) {
+	// Newest-first: two degraded surviving copies, then one complete, then another complete.
+	// newest-2 keeps the degraded pair; the complete slot keeps the first complete
+	// (index 2); the older complete (index 3) is eligible for age-based delete.
+	type rec struct {
+		present  bool
+		complete bool
+	}
+	records := []rec{
+		{present: true, complete: false},
+		{present: true, complete: false},
+		{present: true, complete: true},
+		{present: true, complete: true},
+	}
+	floor := newRetentionFloor(2)
+	completeKept := false
+	var kept []int
+	for i, r := range records {
+		if snapshotRetentionProtects(floor, &completeKept, r.present, r.complete) != retentionKeepNone {
+			kept = append(kept, i)
+		}
+	}
+	if len(kept) != 3 || kept[0] != 0 || kept[1] != 1 || kept[2] != 2 {
+		t.Fatalf("kept %v, want the two newest copies plus the newest complete (0,1,2)", kept)
+	}
+}
+
+func TestSnapshotRetentionProtects_CompleteNewestFillsBothRules(t *testing.T) {
+	floor := newRetentionFloor(2)
+	completeKept := false
+	if got := snapshotRetentionProtects(floor, &completeKept, true, true); got != retentionKeepNewest {
+		t.Fatalf("newest complete copy is kept by newest-N first, got %v", got)
+	}
+	if !completeKept {
+		t.Fatal("complete slot should be filled by the newest complete copy")
+	}
+	if got := snapshotRetentionProtects(floor, &completeKept, true, true); got != retentionKeepNewest {
+		t.Fatalf("second-newest complete still fills newest-N, got %v", got)
+	}
+	if got := snapshotRetentionProtects(floor, &completeKept, true, true); got != retentionKeepNone {
+		t.Fatalf("third copy should not be protected by either rule, got %v", got)
+	}
+}
+
+func TestSnapshotIsComplete_UnknownIsComplete(t *testing.T) {
+	if !snapshotIsComplete(&snapshotstore.Record{}) {
+		t.Fatal("a pre-019 row (Instances nil) must count as complete so retention stays conservative")
+	}
+	if snapshotIsComplete(&snapshotstore.Record{Instances: []snapshotstore.RecordInstance{
+		{Name: "a", HasData: true},
+		{Name: "b", HasData: false},
+	}}) {
+		t.Fatal("an archive with a config-only instance is not complete")
+	}
+	if !snapshotIsComplete(&snapshotstore.Record{Instances: []snapshotstore.RecordInstance{
+		{Name: "a", HasData: true},
+	}}) {
+		t.Fatal("every instance having data is complete")
 	}
 }
 

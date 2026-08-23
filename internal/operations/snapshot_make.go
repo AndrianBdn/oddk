@@ -800,8 +800,13 @@ func assertSnapshotMembers(members []compression.Member, entries []SnapshotInsta
 		// the check that catches "the dump ran, returned success, and produced
 		// nothing" — the failure mode that otherwise reaches a restore.
 		if entryFormat(e) == SnapshotFormatPhysical {
-			if err := nonEmpty(base + "/" + snapshotBasebackupDir + "/base.tar.zst"); err != nil {
-				return fmt.Errorf("instance %s claims physical data: %w", e.Name, err)
+			// PG < 15 cannot --compress=client-zstd, so live captures stage a
+			// plain base.tar; restore already accepts either via physicalBasePath.
+			zst := base + "/" + snapshotBasebackupDir + "/" + physicalBaseTarZst
+			plain := base + "/" + snapshotBasebackupDir + "/" + physicalBaseTar
+			if nonEmpty(zst) != nil && nonEmpty(plain) != nil {
+				return fmt.Errorf("instance %s claims physical data: archive has neither %s nor %s",
+					e.Name, physicalBaseTarZst, physicalBaseTar)
 			}
 			continue
 		}

@@ -3,13 +3,20 @@ package cron
 import "github.com/andrianbdn/oddk/internal/rfc3339time"
 
 type CronPlan struct {
-	InstanceName      string           `db:"instance_name" json:"instanceName"`
-	UTCHour           int              `db:"utc_hour" json:"utcHour"`
-	CleanupLocalDays  int              `db:"cleanup_local_days" json:"cleanupLocalDays"`
-	CleanupRemoteDays int              `db:"cleanup_remote_days" json:"cleanupRemoteDays"`
-	CreatedAt         rfc3339time.Time `db:"created_at" json:"createdAt"`
-	UpdatedAt         rfc3339time.Time `db:"updated_at" json:"updatedAt"`
+	InstanceName      string `db:"instance_name" json:"instanceName"`
+	UTCHour           int    `db:"utc_hour" json:"utcHour"`
+	CleanupLocalDays  int    `db:"cleanup_local_days" json:"cleanupLocalDays"`
+	CleanupRemoteDays int    `db:"cleanup_remote_days" json:"cleanupRemoteDays"`
+	// PausedAt is zero (NULL) when the plan runs; see migration 021.
+	PausedAt     rfc3339time.Time `db:"paused_at" json:"pausedAt,omitzero"`
+	PausedReason string           `db:"paused_reason" json:"pausedReason,omitempty"`
+
+	CreatedAt rfc3339time.Time `db:"created_at" json:"createdAt"`
+	UpdatedAt rfc3339time.Time `db:"updated_at" json:"updatedAt"`
 }
+
+// IsPaused reports whether the scheduler should skip this plan.
+func (p *CronPlan) IsPaused() bool { return !p.PausedAt.IsZero() }
 
 type CronLog struct {
 	ID                            int               `db:"id" json:"id,omitempty"`

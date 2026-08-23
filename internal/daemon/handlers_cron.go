@@ -1,19 +1,22 @@
 package daemon
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/andrianbdn/oddk/internal/operations"
 )
 
 type CronPlanRequest struct {
 	InstanceName      string `json:"instanceName"`
-	UTCHour           int    `json:"utcHour"`
-	CleanupLocalDays  int    `json:"cleanupLocalDays"`
-	CleanupRemoteDays int    `json:"cleanupRemoteDays"`
+	UTCHour           *int   `json:"utcHour"`
+	CleanupLocalDays  *int   `json:"cleanupLocalDays"`
+	CleanupRemoteDays *int   `json:"cleanupRemoteDays"`
 }
 
 func (s *Server) handleCronBackupCreate(w http.ResponseWriter, r *http.Request) {
@@ -28,29 +31,47 @@ func (s *Server) handleCronBackupCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if req.UTCHour < 0 || req.UTCHour > 23 {
+	existing, err := s.store.Cron.GetPlan(req.InstanceName)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("read existing backup plan: %v", err))
+		return
+	}
+
+	utcHour := 3
+	cleanupLocal := 7
+	cleanupRemote := 14
+	if existing != nil {
+		utcHour = existing.UTCHour
+		cleanupLocal = existing.CleanupLocalDays
+		cleanupRemote = existing.CleanupRemoteDays
+	} else if req.UTCHour == nil {
+		s.writeError(w, http.StatusBadRequest, "UTC hour is required when creating a new backup schedule")
+		return
+	}
+	if req.UTCHour != nil {
+		utcHour = *req.UTCHour
+	}
+	if req.CleanupLocalDays != nil {
+		cleanupLocal = *req.CleanupLocalDays
+	}
+	if req.CleanupRemoteDays != nil {
+		cleanupRemote = *req.CleanupRemoteDays
+	}
+
+	if utcHour < 0 || utcHour > 23 {
 		s.writeError(w, http.StatusBadRequest, "UTC hour must be between 0 and 23")
 		return
 	}
-
-	// Set defaults if not provided
-	if req.CleanupLocalDays == 0 {
-		req.CleanupLocalDays = 7
-	}
-	if req.CleanupRemoteDays == 0 {
-		req.CleanupRemoteDays = 14
-	}
-
-	if req.CleanupLocalDays < 1 {
+	if cleanupLocal < 1 {
 		s.writeError(w, http.StatusBadRequest, "cleanup-local-days must be at least 1")
 		return
 	}
-	if req.CleanupRemoteDays < 1 {
+	if cleanupRemote < 1 {
 		s.writeError(w, http.StatusBadRequest, "cleanup-remote-days must be at least 1")
 		return
 	}
 
-	op := operations.NewCronBackupCreateOp(s.opDeps, req.InstanceName, req.UTCHour, req.CleanupLocalDays, req.CleanupRemoteDays)
+	op := operations.NewCronBackupCreateOp(s.opDeps, req.InstanceName, utcHour, cleanupLocal, cleanupRemote)
 
 	if err := s.executor.Execute(r.Context(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create cron backup: %v", err))
@@ -112,4 +133,54 @@ func (s *Server) handleCronBackupDelete(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCronBackupPause and handleCronBackupResume suspend/restore ONE
+// instance's backup schedule. Separate from the create/update endpoint for the
+// same reason as the snapshot pair: editing a field must never resume a
+// schedule that `snapshot apply` paused to keep this host out of another
+// deployment's offsite bucket.
+func (s *Server) handleCronBackupPause(w http.ResponseWriter, r *http.Request) {
+	instance := r.PathValue("instance")
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "paused by an operator"
+	}
+	n, err := s.store.Cron.PausePlan(instance, reason)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("pause backup schedule: %v", err))
+		return
+	}
+	if n == 0 {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("no backup schedule for instance %s", instance))
+		return
+	}
+	s.respondWithBackupPlan(w, instance)
+}
+
+func (s *Server) handleCronBackupResume(w http.ResponseWriter, r *http.Request) {
+	instance := r.PathValue("instance")
+	n, err := s.store.Cron.ResumePlan(instance)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("resume backup schedule: %v", err))
+		return
+	}
+	if n == 0 {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("no backup schedule for instance %s", instance))
+		return
+	}
+	s.respondWithBackupPlan(w, instance)
+}
+
+func (s *Server) respondWithBackupPlan(w http.ResponseWriter, instance string) {
+	plan, err := s.store.Cron.GetPlan(instance)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("read backup schedule: %v", err))
+		return
+	}
+	s.writeJSON(w, http.StatusOK, plan)
 }

@@ -47,6 +47,20 @@ type ChecklistSnapshots struct {
 	// writes no record at all, so there is nothing to make the gap visible.
 	Stale       bool   `json:"stale"`
 	StaleDetail string `json:"staleDetail,omitempty"`
+
+	// Paused reports a schedule that exists but is suspended, which `snapshot
+	// apply` does automatically so a restored host cannot write into the source
+	// deployment's offsite bucket. It is a PROBLEM, not a neutral state: the
+	// deployment is taking no snapshots, and the whole risk is that someone
+	// restores a host and never resumes it. Scheduled stays true — the schedule
+	// exists — so a reader must check both.
+	Paused       bool   `json:"paused"`
+	PausedSince  string `json:"pausedSince,omitempty"`
+	PausedReason string `json:"pausedReason,omitempty"`
+
+	// PausedBackupCrons counts suspended per-instance backup schedules, which
+	// `snapshot apply` pauses for the same reason.
+	PausedBackupCrons []string `json:"pausedBackupCrons,omitempty"`
 }
 
 // ChecklistSnapCopy breaks snapshots down by where they actually exist, the
@@ -261,6 +275,19 @@ func (op *ChecklistOp) collectSnapshots(out *ChecklistSnapshots) (*snapshotstore
 		out.UTCHour = plan.UTCHour
 		out.IntervalHours = plan.IntervalHours
 		out.Format = plan.Format
+		if plan.IsPaused() {
+			out.Paused = true
+			out.PausedSince = plan.PausedAt.UTC().Format("2006-01-02 15:04 MST")
+			out.PausedReason = plan.PausedReason
+		}
+	}
+
+	pausedBackups, err := op.deps.Store.Cron.ListPausedPlans()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range pausedBackups {
+		out.PausedBackupCrons = append(out.PausedBackupCrons, p.InstanceName)
 	}
 
 	records, err := op.deps.Store.Snapshot.List()

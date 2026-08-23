@@ -275,8 +275,10 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 
 	// List() is newest-first, so protecting the floor is a matter of counting
 	// how many still-present copies we have walked past — see retentionFloor for
-	// why a record whose archive is gone must not consume a slot.
+	// why a record whose archive is gone must not consume a slot. Degraded
+	// archives still fill newest-N, but they cannot evict the last complete one.
 	floor := newRetentionFloor(minRetainedSnapshots)
+	completeKept := false
 	deleted := 0
 	reconciled := 0
 	for _, rec := range records {
@@ -288,10 +290,9 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 			log.Printf("Warning: snapshot %d is catalogued with a local copy at %s but the file is not there; it does not count toward the newest-%d floor",
 				rec.ID, rec.LocalPath, minRetainedSnapshots)
 		}
-		if floor.protects(present) {
+		if keep := snapshotRetentionProtects(floor, &completeKept, present, snapshotIsComplete(rec)); keep != retentionKeepNone {
 			if rec.CreatedAt.Before(cutoff) {
-				log.Printf("Keeping local snapshot %d past retention: it is one of the newest %d, and expiring every archive would leave nothing to restore from",
-					rec.ID, minRetainedSnapshots)
+				log.Printf("Keeping local snapshot %d past retention: %s", rec.ID, keep.reason(minRetainedSnapshots))
 			}
 			continue
 		}
@@ -386,24 +387,30 @@ func (op *SnapshotCronTaskOp) runRemoteCleanup(ctx context.Context) error {
 	// is still filling, so this costs a couple of HeadObject calls per run rather
 	// than one per catalogued archive.
 	floor := newRetentionFloor(minRetainedSnapshots)
+	completeKept := false
 	deleted := 0
 	for _, rec := range records {
 		if rec.RemotePath == "" {
 			continue
 		}
-		if !floor.full() {
-			present := remoteArchivePresent(ctx, s3Client, settings.Bucket, rec.RemotePath)
+		complete := snapshotIsComplete(rec)
+		// HeadObject only while newest-N is filling, or while we still need a
+		// complete copy to pin. Once both are satisfied, existence cannot
+		// change the keep/delete decision.
+		needHead := !floor.full() || (!completeKept && complete)
+		present := false
+		if needHead {
+			present = remoteArchivePresent(ctx, s3Client, settings.Bucket, rec.RemotePath)
 			if !present {
 				log.Printf("Warning: snapshot %d is catalogued with a remote copy at %s but the object is not in the bucket; it does not count toward the newest-%d floor",
 					rec.ID, rec.RemotePath, minRetainedSnapshots)
 			}
-			if floor.protects(present) {
-				if rec.CreatedAt.Before(cutoff) {
-					log.Printf("Keeping offsite snapshot %d past retention: it is one of the newest %d",
-						rec.ID, minRetainedSnapshots)
-				}
-				continue
+		}
+		if keep := snapshotRetentionProtects(floor, &completeKept, present, complete); keep != retentionKeepNone {
+			if rec.CreatedAt.Before(cutoff) {
+				log.Printf("Keeping offsite snapshot %d past retention: %s", rec.ID, keep.reason(minRetainedSnapshots))
 			}
+			continue
 		}
 		if !rec.CreatedAt.Before(cutoff) {
 			continue

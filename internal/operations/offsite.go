@@ -66,6 +66,7 @@ func OffsiteGet(deps *Dependencies) (*OffsiteGetResult, error) {
 			Config: offsite.OffsiteSettingsJSON{
 				Type:            offsite.TypeS3,
 				Bucket:          "my-backup-bucket",
+				Endpoint:        new(""), // omitempty would hide this; MinIO/Ceph/R2 need it
 				Region:          new("us-east-1"),
 				AccessKeyID:     "YOUR_ACCESS_KEY_ID",
 				SecretAccessKey: "YOUR_SECRET_ACCESS_KEY",

@@ -35,6 +35,7 @@ func (s *Store) runAllMigrations() error {
 		{"018_snapshot_format", migration018SnapshotFormat},
 		{"019_snapshot_instances", migration019SnapshotInstances},
 		{"020_instance_status_check", migration020InstanceStatusCheck},
+		{"021_schedule_pause", migration021SchedulePause},
 	}
 
 	for _, m := range migrations {
@@ -596,6 +597,35 @@ func migration020InstanceStatusCheck(sqx *sqlx.DB) error {
 	if normalized > 0 {
 		log.Printf("Migration 020: %d instance(s) had an unrecognised status and were marked 'error'; "+
 			"use 'oddk instance start <name>' to bring one back", normalized)
+	}
+	return nil
+}
+
+// migration021SchedulePause lets a schedule be SUSPENDED without being deleted.
+//
+// The case that forced it: `oddk snapshot apply` restores the source host's
+// oddk.db, which carries that host's snapshot schedule AND its offsite
+// settings. On a DR rehearsal or a planned migration — where the SOURCE IS
+// STILL LIVE — the restored host then starts writing snapshots into the same
+// bucket and, worse, running offsite RETENTION against it, deleting objects the
+// source still catalogues. The documented workaround was `setup-cron --remove`,
+// which throws the schedule away: a real DR host whose operator forgets to
+// recreate it is then permanently unprotected, trading a rehearsal hazard for a
+// production one.
+//
+// Pausing keeps the schedule and its settings intact, is reversible with one
+// command, and is VISIBLE — `oddk checklist` reports a paused schedule as a
+// problem, not as "not scheduled".
+//
+// paused_at is nullable because NULL is the overwhelmingly common state and
+// means exactly one thing: this schedule runs. paused_reason is NOT NULL
+// DEFAULT ” so it scans into a plain string; it records WHO paused it and why,
+// which is what distinguishes "an operator paused this deliberately" from
+// "a DR restore paused it for you and you have not resumed it yet".
+func migration021SchedulePause(sqx *sqlx.DB) error {
+	for _, table := range []string{"snapshot_plans", "cron_plans"} {
+		sqx.MustExec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN paused_at TEXT`, table))
+		sqx.MustExec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN paused_reason TEXT NOT NULL DEFAULT ''`, table))
 	}
 	return nil
 }

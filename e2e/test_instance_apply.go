@@ -90,6 +90,48 @@ func testInstanceApply(h *TestHarness) error {
 		return fmt.Errorf("write test parameter file: %w", err)
 	}
 
+	// Oversized lock table: must be refused BEFORE the working container is
+	// destroyed (the 2026-07-29 apply outage). 1024 MB RAM cannot fit this.
+	oversizedFile := filepath.Join(h.dataDir, "apply-oversized-params.json")
+	oversized := []map[string]any{
+		{"name": "shared_buffers", "type": "postgres_cli_arg", "valueType": "numeric_mem", "value": "128 MB"},
+		{"name": "max_connections", "type": "postgres_cli_arg", "valueType": "numeric", "value": "512"},
+		{"name": "max_locks_per_transaction", "type": "postgres_cli_arg", "valueType": "numeric", "value": "65536"},
+	}
+	oversizedJSON, err := json.MarshalIndent(oversized, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal oversized parameters: %w", err)
+	}
+	if err := os.WriteFile(oversizedFile, oversizedJSON, 0o600); err != nil {
+		return fmt.Errorf("write oversized parameter file: %w", err)
+	}
+	if _, err := h.createParameterGroupCLI("apply-oversized-group", oversizedFile); err != nil {
+		return fmt.Errorf("create oversized parameter group failed: %w", err)
+	}
+	_, applyErr := h.applyParameterGroupCLI(instanceName, "apply-oversized-group")
+	if applyErr == nil {
+		return fmt.Errorf("applying an oversized parameter group should fail before destroying the container")
+	}
+	if !strings.Contains(applyErr.Error(), "shared memory") && !strings.Contains(applyErr.Error(), "RAM") {
+		return fmt.Errorf("oversized apply error should mention shared memory vs RAM, got: %v", applyErr)
+	}
+	if err := h.waitForPostgreSQL(instancePort); err != nil {
+		return fmt.Errorf("instance should still be reachable after refused apply: %w", err)
+	}
+	// A preflight refusal must also put the status back: the operation set
+	// "reconfiguring" before calling Docker, and leaving it there would make
+	// reconcile turn a perfectly healthy instance into "error" on next restart.
+	statusOutput, err := h.getInstanceStatusCLI(instanceName)
+	if err != nil {
+		return fmt.Errorf("get status after refused apply: %w", err)
+	}
+	if !strings.Contains(statusOutput, "running") {
+		return fmt.Errorf("instance should still be 'running' after a refused apply, got: %s", statusOutput)
+	}
+	if _, err := h.deleteParameterGroupCLI("apply-oversized-group", true); err != nil {
+		return fmt.Errorf("delete oversized parameter group: %w", err)
+	}
+
 	createGroupOutput, err := h.createParameterGroupCLI("apply-test-group", testParamFile)
 	if err != nil {
 		return fmt.Errorf("create parameter group failed: %w", err)

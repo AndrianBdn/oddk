@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
@@ -50,8 +51,10 @@ func (op *ReconfigureRDBMSOp) Execute(ctx context.Context) error {
 		return fmt.Errorf("get instance: %w", err)
 	}
 
-	// Check if the parameter group is different
-	if instance.ParameterGroup == op.params.ParameterGroup {
+	// Same group on a healthy instance is a no-op. Same group in "error" is a
+	// retry after a failed apply (the store may already record the new group,
+	// or a rollback restored the old one — either way Recreate is the recovery).
+	if instance.ParameterGroup == op.params.ParameterGroup && instance.Status != instances.StatusError {
 		return operr.Invalidf("instance already uses parameter group: %s", op.params.ParameterGroup)
 	}
 
@@ -60,66 +63,47 @@ func (op *ReconfigureRDBMSOp) Execute(ctx context.Context) error {
 		return operr.Invalidf("get parameter group %s: %w", op.params.ParameterGroup, err)
 	}
 
-	// Decrypt password (needed for container recreation)
+	prevGroup, err := op.deps.Store.Parameters.GetGroup(instance.ParameterGroup)
+	if err != nil {
+		return fmt.Errorf("get current parameter group %s: %w", instance.ParameterGroup, err)
+	}
+
 	password, err := crypto.DecryptPassword(instance.Password, op.deps.MasterKey)
 	if err != nil {
 		return fmt.Errorf("decrypt password: %w", err)
 	}
 
+	prev := specFromInstance(instance, password, prevGroup)
+	next := specFromInstance(instance, password, parameterGroup)
+	next.ParameterGroup = op.params.ParameterGroup
+
+	prevStatus := instance.Status
 	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusReconfiguring); err != nil {
 		log.Printf("Error updating status to reconfiguring: %v", err)
 	}
 
-	// Note: Health check coordination (pause/cleanup) is handled by the daemon/server layer
-	// before calling this operation
-
-	// Recreate the container with new parameters
-	newContainerID, err := op.deps.Docker.RecreateContainer(
-		op.params.Name,
-		instance.Version,
-		instance.Image,
-		instance.Port,
-		password,
-		instance.CPUCores,
-		instance.RAMMB,
-		op.params.ParameterGroup,
-		parameterGroup.Parameters,
-		instance.ContainerID,
-	)
+	rolledBack, err := applyClusterChange(ctx, op.deps, next, prev, instance.ContainerID)
+	if rolledBack {
+		return fmt.Errorf("parameter group %s could not start: %w (rolled back to %s)",
+			op.params.ParameterGroup, err, instance.ParameterGroup)
+	}
 	if err != nil {
-		// Try to restore the old status
-		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
-			log.Printf("Error updating status to error: %v", statusErr)
+		if prevStatus != instances.StatusError && errors.Is(err, operr.ErrInvalid) {
+			if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, prevStatus); statusErr != nil {
+				log.Printf("Error restoring status after preflight refusal: %v", statusErr)
+			}
 		}
-		return fmt.Errorf("recreate container: %w", err)
+		return err
 	}
 
-	if err := op.deps.Store.Instances.UpdateContainerID(op.params.Name, newContainerID); err != nil {
-		log.Printf("Error updating container ID: %v", err)
-	}
-
+	// Commit the group only after PostgreSQL is accepting connections. Doing
+	// this before start meant a failed apply recorded the bad group, so
+	// re-applying it was refused and recovery required a *different* group.
 	if err := op.deps.Store.Instances.UpdateParameterGroup(op.params.Name, op.params.ParameterGroup); err != nil {
-		log.Printf("Error updating parameter group: %v", err)
+		return fmt.Errorf("record parameter group: %w", err)
 	}
-
-	if err := op.deps.Docker.StartContainer(newContainerID); err != nil {
-		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
-			log.Printf("Error updating status to error: %v", statusErr)
-		}
-		return fmt.Errorf("start container: %w", err)
-	}
-
-	// Wait for the recreated container to actually accept connections before
-	// reporting "running".
-	if err := waitForPostgresReady(ctx, instance.Port, password); err != nil {
-		if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
-			log.Printf("Error updating status to error: %v", statusErr)
-		}
-		return fmt.Errorf("wait for PostgreSQL readiness: %w", err)
-	}
-
 	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusRunning); err != nil {
-		log.Printf("Error updating status to running: %v", err)
+		return fmt.Errorf("record running status: %w", err)
 	}
 
 	instance, err = op.deps.Store.Instances.Get(op.params.Name)

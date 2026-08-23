@@ -28,6 +28,9 @@ func NewSnapshotStore(db *sqlx.DB) *SnapshotStore {
 
 // SetPlan creates or replaces the deployment's snapshot schedule, preserving
 // created_at across updates (as CronStore.CreatePlan does).
+// ErrNoSnapshotPlan is returned by PausePlan/ResumePlan when no schedule exists.
+var ErrNoSnapshotPlan = errors.New("no snapshot schedule is configured")
+
 func (s *SnapshotStore) SetPlan(utcHour, intervalHours, cleanupLocalDays, cleanupRemoteDays int, format string) error {
 	now := rfc3339time.Now()
 	_, err := s.db.Exec(`
@@ -61,6 +64,50 @@ func (s *SnapshotStore) GetPlan() (*Plan, error) {
 		return nil, fmt.Errorf("get snapshot plan: %w", err)
 	}
 	return &plan, nil
+}
+
+// PausePlan suspends the schedule without deleting it. Idempotent by intent:
+// re-pausing an already-paused plan refreshes the reason rather than failing,
+// so a second `snapshot apply` on the same host cannot leave a stale one.
+//
+// SetPlan deliberately does NOT clear this — an operator adjusting the hour of a
+// paused schedule is not saying "resume it", and silently resuming one on a host
+// that shares a bucket with a live source is the exact accident this prevents.
+func (s *SnapshotStore) PausePlan(reason string) error {
+	res, err := s.db.Exec(`
+		UPDATE snapshot_plans SET paused_at = ?, paused_reason = ?, updated_at = ?
+		WHERE id = ?`, rfc3339time.Now(), reason, rfc3339time.Now(), planID)
+	if err != nil {
+		return fmt.Errorf("pause snapshot plan: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("pause snapshot plan: %w", err)
+	}
+	if n == 0 {
+		return ErrNoSnapshotPlan
+	}
+	return nil
+}
+
+// ResumePlan clears the pause. Returns errNoSnapshotPlan when no schedule
+// exists, so the caller can say "nothing to resume" rather than reporting a
+// silent success on a host that has no schedule at all.
+func (s *SnapshotStore) ResumePlan() error {
+	res, err := s.db.Exec(`
+		UPDATE snapshot_plans SET paused_at = NULL, paused_reason = '', updated_at = ?
+		WHERE id = ?`, rfc3339time.Now(), planID)
+	if err != nil {
+		return fmt.Errorf("resume snapshot plan: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("resume snapshot plan: %w", err)
+	}
+	if n == 0 {
+		return ErrNoSnapshotPlan
+	}
+	return nil
 }
 
 func (s *SnapshotStore) DeletePlan() error {

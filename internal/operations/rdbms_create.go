@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
@@ -124,12 +125,15 @@ func (op *CreateRDBMSOp) Execute(ctx context.Context) error {
 		if delErr := op.deps.Store.Instances.Delete(op.params.Name); delErr != nil {
 			log.Printf("Error cleaning up instance after container creation failure: %v", delErr)
 		}
+		if refusal := classifyRecreateError(err); errors.Is(refusal, operr.ErrInvalid) {
+			return refusal
+		}
 		return fmt.Errorf("create container: %w", err)
 	}
 
 	if err := op.deps.Store.Instances.UpdateContainerID(op.params.Name, containerID); err != nil {
-		log.Printf("Error updating container ID: %v", err)
-		// Continue anyway since container was created successfully
+		op.cleanupFailedCreate(containerID)
+		return fmt.Errorf("record container id: %w", err)
 	}
 
 	if err := op.deps.Docker.StartContainer(containerID); err != nil {
@@ -144,11 +148,11 @@ func (op *CreateRDBMSOp) Execute(ctx context.Context) error {
 	// connected immediately after create.
 	if err := waitForPostgresReady(ctx, op.params.Port, password); err != nil {
 		op.cleanupFailedCreate(containerID)
-		return fmt.Errorf("wait for PostgreSQL readiness: %w", err)
+		return fmt.Errorf("wait for PostgreSQL readiness: %w", annotateReadyError(op.deps, containerID, err))
 	}
 
 	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusRunning); err != nil {
-		log.Printf("Error updating RDBMS status to running: %v", err)
+		return fmt.Errorf("record running status: %w", err)
 	}
 
 	instance.ContainerID = containerID
@@ -175,7 +179,7 @@ func (op *CreateRDBMSOp) cleanupFailedCreate(containerID string) {
 	if err := op.deps.Docker.RemoveContainer(containerID); err != nil {
 		log.Printf("Error removing container after failed create: %v", err)
 	}
-	if err := op.deps.Docker.RemoveVolume(fmt.Sprintf("oddk-data-%s", op.params.Name)); err != nil {
+	if err := op.deps.Docker.RemoveVolume(docker.VolumeName(op.params.Name)); err != nil {
 		log.Printf("Error removing volume after failed create: %v", err)
 	}
 	if err := op.deps.Store.Instances.Delete(op.params.Name); err != nil {

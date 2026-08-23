@@ -93,21 +93,8 @@ func UploadBackup(ctx context.Context, deps *Dependencies, params UploadBackupPa
 		backupFilename,
 	)
 
-	// Check if file already exists in S3
-	exists, err := s3Client.FileExists(ctx, s3Key)
-	if err != nil {
-		return nil, fmt.Errorf("check S3 file existence: %w", err)
-	}
-
-	if exists {
-		// File exists, for simplicity we'll re-upload it
-		// In the future, we could add size checking if needed
-		if err := s3Client.DeleteFile(ctx, s3Key); err != nil {
-			return nil, fmt.Errorf("delete existing S3 file: %w", err)
-		}
-	}
-
-	// Reset file position for upload
+	// PutObject overwrites the same key. Deleting first meant a failed upload
+	// after a successful delete left no remote copy of a previously-good object.
 	if _, err := localFile.Seek(0, 0); err != nil {
 		return nil, fmt.Errorf("reset file position: %w", err)
 	}
@@ -118,7 +105,7 @@ func UploadBackup(ctx context.Context, deps *Dependencies, params UploadBackupPa
 	}
 
 	// Verify upload by checking existence
-	exists, err = s3Client.FileExists(ctx, s3Key)
+	exists, err := s3Client.FileExists(ctx, s3Key)
 	if err != nil {
 		return nil, fmt.Errorf("verify upload: %w", err)
 	}

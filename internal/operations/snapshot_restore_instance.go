@@ -493,7 +493,7 @@ func destroyInstanceCluster(deps *Dependencies, existing *instances.RDBMSInstanc
 			return fmt.Errorf("clear container id: %w", err)
 		}
 	}
-	volumeName := fmt.Sprintf("oddk-data-%s", existing.Name)
+	volumeName := docker.VolumeName(existing.Name)
 	if err := deps.Docker.RemoveVolume(volumeName); err != nil {
 		return fmt.Errorf("remove existing data volume %s: %w", volumeName, err)
 	}

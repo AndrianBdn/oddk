@@ -3,7 +3,8 @@ package operations
 import (
 	"context"
 	"fmt"
-	"log"
+
+	"github.com/andrianbdn/oddk/internal/docker"
 )
 
 // DeleteRDBMSOp deletes an RDBMS instance
@@ -30,15 +31,23 @@ func (op *DeleteRDBMSOp) Execute(ctx context.Context) error {
 		return fmt.Errorf("get instance: %w", err)
 	}
 
-	// Remove container (ignore errors since container might not exist)
-	if err := op.deps.Docker.RemoveContainer(instance.ContainerID); err != nil {
-		log.Printf("Error removing container: %v", err)
+	// Do not drop the catalogue row until Docker cleanup succeeds. Create
+	// refuses to adopt an existing volume, so a "successful" destroy that left
+	// the volume behind makes `oddk create --name <same>` fail forever.
+	if instance.ContainerID != "" {
+		if err := op.deps.Docker.RemoveContainer(instance.ContainerID); err != nil {
+			return fmt.Errorf("remove container: %w (instance was not deleted; retry destroy)", err)
+		}
 	}
-
-	// Remove volume (ignore errors since volume might not exist)
-	volumeName := fmt.Sprintf("oddk-data-%s", op.params.Name)
+	// A crash between create and UpdateContainerID can leave oddk-pg-<name>
+	// with an ID the store does not know. Remove by name too; no-op if gone.
+	containerName := docker.ContainerName(op.params.Name)
+	if err := op.deps.Docker.RemoveContainer(containerName); err != nil {
+		return fmt.Errorf("remove container %s: %w (instance was not deleted; retry destroy)", containerName, err)
+	}
+	volumeName := docker.VolumeName(op.params.Name)
 	if err := op.deps.Docker.RemoveVolume(volumeName); err != nil {
-		log.Printf("Error removing volume: %v", err)
+		return fmt.Errorf("remove volume %s: %w (instance was not deleted; retry destroy)", volumeName, err)
 	}
 
 	if err := op.deps.Store.Instances.Delete(op.params.Name); err != nil {

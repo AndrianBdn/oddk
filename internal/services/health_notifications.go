@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/andrianbdn/oddk/internal/store"
@@ -170,6 +171,22 @@ func (e *HealthNotificationEvaluator) sendHealthNotification(ctx context.Context
 	return nil
 }
 
+const (
+	// instanceErrorPrefix is how performInstanceChecks reports an instance whose
+	// STORED status is "error" — a fact from the store, not a failed probe.
+	instanceErrorPrefix = "instance_error:"
+
+	// instanceErrorHint separates the two ways an instance reaches "error",
+	// because they need opposite responses: a write operation that failed leaves
+	// a cluster that must be repaired, while `snapshot apply` deliberately parks
+	// configuration-only instances there and the operator has already been told
+	// so at the terminal. Without this the channel says only "Broken Instances:
+	// foo", which reads identically to a cluster that just died.
+	instanceErrorHint = "\nAn instance in 'error' state is not being probed — it is recorded as broken.\n" +
+		"That is either a failed operation (apply/switch/start) that needs repair, or a\n" +
+		"configuration-only instance left behind by 'snapshot apply'. Run 'oddk checklist'.\n"
+)
+
 // buildNotificationMessage creates the notification message content
 func (e *HealthNotificationEvaluator) buildNotificationMessage(notificationType string, record *health.HealthRecord) string {
 	timestamp := time.Unix(record.TsUnix, 0).Format("2006-01-02 15:04:05 UTC")
@@ -177,19 +194,7 @@ func (e *HealthNotificationEvaluator) buildNotificationMessage(notificationType 
 
 	switch notificationType {
 	case "service_degraded":
-		message := fmt.Sprintf("🚨 ODDK Service Degraded (%s)\n\n", displayName)
-		message += fmt.Sprintf("Time: %s\n", timestamp)
-
-		if !record.HealthyHost {
-			message += fmt.Sprintf("Host Issues: %s\n", record.FailDetails)
-		}
-
-		if record.BrokenInstances != "" {
-			message += fmt.Sprintf("Broken Instances: %s\n", record.BrokenInstances)
-		}
-
-		message += "\nPlease check the ODDK daemon for more details."
-		return message
+		return buildDegradedMessage(displayName, timestamp, record)
 
 	case "service_restored":
 		message := fmt.Sprintf("✅ ODDK Service Restored (%s)\n\n", displayName)
@@ -207,6 +212,38 @@ func (e *HealthNotificationEvaluator) buildNotificationMessage(notificationType 
 	default:
 		return fmt.Sprintf("ODDK Health Status Update (%s): %s at %s", displayName, notificationType, timestamp)
 	}
+}
+
+// buildDegradedMessage renders the degraded body. Split out from
+// buildNotificationMessage so it can be tested without a store: this formatting
+// is where a real defect hid unnoticed, because nothing asserted what the
+// operator actually receives.
+func buildDegradedMessage(displayName, timestamp string, record *health.HealthRecord) string {
+	message := fmt.Sprintf("🚨 ODDK Service Degraded (%s)\n\n", displayName)
+	message += fmt.Sprintf("Time: %s\n", timestamp)
+
+	if !record.HealthyHost {
+		message += "Host: unhealthy\n"
+	}
+	if record.BrokenInstances != "" {
+		message += fmt.Sprintf("Broken Instances: %s\n", record.BrokenInstances)
+	}
+	// fail_details is ONE comma-joined string carrying both the host and the
+	// instance messages (see the run loop in health_checker.go), so it can be
+	// neither labelled "Host Issues" nor shown only when the host is unhealthy.
+	// It used to be both: an instance failure was dropped entirely when the host
+	// was fine, and mislabelled as a host issue when it was not. It is the only
+	// part of the message that says WHY, and the reasons need different
+	// responses — see instanceErrorHint.
+	if record.FailDetails != "" {
+		message += fmt.Sprintf("Details: %s\n", record.FailDetails)
+	}
+	if strings.Contains(record.FailDetails, instanceErrorPrefix) {
+		message += instanceErrorHint
+	}
+
+	message += "\nPlease check the ODDK daemon for more details."
+	return message
 }
 
 // sendWithRetries sends a notification with retry logic

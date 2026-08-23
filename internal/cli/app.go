@@ -201,7 +201,7 @@ func listCommand(client *Client) *cli.Command {
 func checklistCommand(client *Client) *cli.Command {
 	return &cli.Command{
 		Name:  "checklist",
-		Usage: "Audit overview of all instances: health, parameter groups, backups, notifications",
+		Usage: "Audit overview of all instances: health, parameter groups, snapshot coverage, notifications",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
 				Name:  "json",
@@ -583,8 +583,10 @@ func snapshotCommands(client *Client) *cli.Command {
 				Description: "Snapshots are PHYSICAL by default: each running instance is captured\n" +
 					"with pg_basebackup (fast, low server strain, byte-for-byte fidelity) and\n" +
 					"each stopped instance as a cold copy of its data directory. Pass --logical\n" +
-					"for the portable pg_dump-based format, which restores across architectures\n" +
-					"and on older ODDK versions, and supports single-database restore.",
+					"for the portable pg_dump-based format (cross-architecture restores, and\n" +
+					"UNLOGGED table rows that a physical restore would empty). Physical restore\n" +
+					"requires the same PG major and CPU architecture. To restore a single\n" +
+					"database, use 'oddk backup restore --database', not a snapshot command.",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:  "comment",
@@ -592,7 +594,7 @@ func snapshotCommands(client *Client) *cli.Command {
 					},
 					&cli.BoolFlag{
 						Name:  "logical",
-						Usage: "Portable pg_dump-based snapshot instead of the physical (binary) default",
+						Usage: "Portable pg_dump-based snapshot (cross-arch / UNLOGGED rows); default is physical",
 					},
 					&cli.BoolFlag{
 						Name:  "json",
@@ -678,6 +680,14 @@ func snapshotCommands(client *Client) *cli.Command {
 					&cli.BoolFlag{
 						Name:  "remove",
 						Usage: "Remove the snapshot schedule",
+					},
+					&cli.BoolFlag{
+						Name:  "pause",
+						Usage: "Suspend the schedule without deleting it (keeps every setting)",
+					},
+					&cli.BoolFlag{
+						Name:  "resume",
+						Usage: "Resume a paused schedule (e.g. after 'oddk snapshot apply')",
 					},
 				},
 				Action: client.snapshotSetupCronAction,
@@ -913,8 +923,7 @@ func backupCommands(client *Client) *cli.Command {
 					},
 					&cli.IntFlag{
 						Name:  "utc-hour",
-						Usage: "Hour in UTC (0-23) when backup should run (required if not removing)",
-						Value: 3, // Default to 3 AM UTC
+						Usage: "Hour in UTC (0-23) when backup should run (required to create a new schedule; omitted fields are preserved on update)",
 					},
 					&cli.IntFlag{
 						Name:  "cleanup-local-days",
@@ -929,6 +938,14 @@ func backupCommands(client *Client) *cli.Command {
 					&cli.BoolFlag{
 						Name:  "remove",
 						Usage: "Remove scheduled backup for this instance",
+					},
+					&cli.BoolFlag{
+						Name:  "pause",
+						Usage: "Suspend this instance's schedule without deleting it",
+					},
+					&cli.BoolFlag{
+						Name:  "resume",
+						Usage: "Resume this instance's paused schedule",
 					},
 				},
 				Action: client.backupSetupCronAction,

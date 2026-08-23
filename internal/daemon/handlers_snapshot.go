@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/andrianbdn/oddk/internal/operations"
 	s3service "github.com/andrianbdn/oddk/internal/services/s3"
+	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
 // handleSnapshotMake handles POST /api/snapshot
@@ -415,6 +418,54 @@ func (s *Server) handleCronSnapshotGet(w http.ResponseWriter, r *http.Request) {
 	}
 	// A missing plan is an ordinary state, not a 404: the client asks in order
 	// to render "not configured".
+	s.writeJSON(w, http.StatusOK, map[string]any{"plan": plan})
+}
+
+// handleCronSnapshotPause serves POST /api/cron/snapshot/pause and .../resume.
+//
+// Separate from the SET endpoint on purpose: adjusting a schedule's hour must
+// not silently resume it. A host restored from another deployment's snapshot
+// shares that deployment's offsite bucket, and resuming has to be a deliberate
+// act, not a side effect of editing an unrelated field.
+func (s *Server) handleCronSnapshotPause(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	// An empty body is fine — the reason is optional.
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "paused by an operator"
+	}
+	if err := s.store.Snapshot.PausePlan(reason); err != nil {
+		if errors.Is(err, snapshotstore.ErrNoSnapshotPlan) {
+			s.writeError(w, http.StatusNotFound, "no snapshot schedule is configured")
+			return
+		}
+		s.writeOpError(w, err)
+		return
+	}
+	s.respondWithSnapshotPlan(w)
+}
+
+func (s *Server) handleCronSnapshotResume(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.Snapshot.ResumePlan(); err != nil {
+		if errors.Is(err, snapshotstore.ErrNoSnapshotPlan) {
+			s.writeError(w, http.StatusNotFound, "no snapshot schedule is configured")
+			return
+		}
+		s.writeOpError(w, err)
+		return
+	}
+	s.respondWithSnapshotPlan(w)
+}
+
+func (s *Server) respondWithSnapshotPlan(w http.ResponseWriter) {
+	plan, err := s.store.Snapshot.GetPlan()
+	if err != nil {
+		s.writeOpError(w, err)
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"plan": plan})
 }
 

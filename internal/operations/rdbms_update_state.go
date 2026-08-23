@@ -58,7 +58,7 @@ func (op *UpdateStateOp) Execute(ctx context.Context) error {
 			if statusErr := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusError); statusErr != nil {
 				log.Printf("Error updating status to error: %v", statusErr)
 			}
-			return fmt.Errorf("wait for PostgreSQL readiness: %w", err)
+			return fmt.Errorf("wait for PostgreSQL readiness: %w", annotateReadyError(op.deps, instance.ContainerID, err))
 		}
 		if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusRunning); err != nil {
 			log.Printf("Error updating RDBMS status to running: %v", err)

@@ -59,10 +59,7 @@ func ConnectToRunningInstance(ctx context.Context, deps *Dependencies, instanceN
 		database = opts[0].Database
 	}
 
-	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/%s?sslmode=disable",
-		password, util.GatewayIP, instance.Port, database)
-
-	conn, err := pgx.Connect(ctx, connStr)
+	conn, err := pgx.Connect(ctx, util.PostgresURI(password, instance.Port, database))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
 	}
@@ -87,10 +84,7 @@ func TestPostgreSQLConnectivity(ctx context.Context, deps *Dependencies, instanc
 	}
 
 	// Optimistically try PostgreSQL connection first
-	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/postgres?sslmode=disable",
-		password, util.GatewayIP, instance.Port)
-
-	pgConn, err := pgx.Connect(checkCtx, connStr)
+	pgConn, err := pgx.Connect(checkCtx, util.PostgresURI(password, instance.Port, "postgres"))
 	if err != nil {
 		// Connection failed, determine the reason
 
@@ -129,11 +123,7 @@ func TestPostgreSQLConnectivityWithPassword(ctx context.Context, port int, passw
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/postgres?sslmode=disable",
-		password, util.GatewayIP, port)
-
-	// Try to connect with the provided password
-	pgConn, err := pgx.Connect(checkCtx, connStr)
+	pgConn, err := pgx.Connect(checkCtx, util.PostgresURI(password, port, "postgres"))
 	if err != nil {
 		if strings.Contains(err.Error(), "password authentication failed") ||
 			strings.Contains(err.Error(), "authentication failed") {

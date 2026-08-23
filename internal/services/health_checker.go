@@ -320,14 +320,14 @@ func (hc *HealthChecker) performInstanceChecks(ctx context.Context) InstanceHeal
 		BrokenInstances:  []string{},
 	}
 
-	instances, err := hc.store.Instances.List()
+	listed, err := hc.store.Instances.List()
 	if err != nil {
 		result.FailMsg = fmt.Sprintf("runtime_error:list_%s", shortenError(err.Error()))
 		return result
 	}
 
 	var failMessages []string
-	for _, instance := range instances {
+	for _, instance := range listed {
 		// Get fresh instance data to avoid race conditions during iteration
 		freshInstance, err := hc.store.Instances.Get(instance.Name)
 		if err != nil {
@@ -335,8 +335,16 @@ func (hc *HealthChecker) performInstanceChecks(ctx context.Context) InstanceHeal
 			continue
 		}
 
-		if freshInstance.Status != "running" {
-			continue // Skip stopped instances
+		if freshInstance.Status == instances.StatusError {
+			// error is terminal and was set by a write op (failed apply, start
+			// timeout, crashed switch). Skipping it would report the deployment
+			// GREEN while the container crash-loops. Stopped instances stay silent.
+			result.BrokenInstances = append(result.BrokenInstances, freshInstance.Name)
+			failMessages = append(failMessages, instanceErrorPrefix+freshInstance.Name)
+			continue
+		}
+		if freshInstance.Status != instances.StatusRunning {
+			continue
 		}
 
 		if hc.checkInstanceHealth(ctx, freshInstance) {
@@ -436,8 +444,7 @@ func (hc *HealthChecker) checkInstanceHealth(ctx context.Context, instance *inst
 	}
 
 	// Build connection string using the correct pattern with sslmode=disable
-	connStr := fmt.Sprintf("postgres://postgres:%s@%s:%d/postgres?sslmode=disable",
-		password, util.GatewayIP, instance.Port)
+	connStr := util.PostgresURI(password, instance.Port, "postgres")
 
 	// Get or create cached connection
 	// getOrCreateConnection already validates the connection with ping, so no need to ping again

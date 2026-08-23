@@ -56,6 +56,18 @@ func (s *Server) checkSnapshotPlan(ctx context.Context, now time.Time, currentMi
 	if plan == nil {
 		return // no snapshot schedule configured
 	}
+	// A paused plan does not run, and forceRun does NOT override that: the debug
+	// force flag exists to make tests fire a schedule immediately, not to defeat
+	// the safeguard that keeps a DR-rehearsal host out of a live source's
+	// bucket. Logged only on an hour the plan would actually have fired, so a
+	// long pause costs one line per slot rather than one per minute.
+	if plan.IsPaused() {
+		if plan.RunsAtHour(now.Hour()) && currentMinute == 0 {
+			log.Printf("Snapshot schedule is PAUSED (%s); skipping this slot. Resume with 'oddk snapshot setup-cron --resume'",
+				plan.PausedReason)
+		}
+		return
+	}
 	if !forceRun && !plan.RunsAtHour(now.Hour()) {
 		return
 	}
@@ -194,6 +206,15 @@ func (s *Server) checkAndRunCronTasks(ctx context.Context) {
 	}
 
 	for _, plan := range plans {
+		// Same rule as the snapshot plan above: paused means paused, including
+		// under forceRun.
+		if plan.IsPaused() {
+			if currentMinute == 0 {
+				log.Printf("Backup schedule for instance %s is PAUSED (%s); skipping this slot. Resume with 'oddk backup setup-cron --instance %s --resume'",
+					plan.InstanceName, plan.PausedReason, plan.InstanceName)
+			}
+			continue
+		}
 		// Check if this task has already run in the last hour to avoid duplicates
 		hasRun, err := s.store.Cron.HasRunInLastHour(plan.InstanceName)
 		if err != nil {

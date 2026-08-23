@@ -43,6 +43,63 @@ func (s *CronStore) DeletePlan(instanceName string) error {
 	return err
 }
 
+// PauseAllPlans suspends every per-instance backup schedule and reports how
+// many it touched. Used by `snapshot apply`: legacy backup crons upload to and
+// prune the SAME offsite bucket as snapshots, so pausing only the snapshot
+// schedule would leave the collision wide open on any deployment that has not
+// run `snapshot migrate-from-backups` yet.
+func (s *CronStore) PauseAllPlans(reason string) (int64, error) {
+	now := rfc3339time.Now()
+	res, err := s.db.Exec(`
+		UPDATE cron_plans SET paused_at = ?, paused_reason = ?, updated_at = ?`, now, reason, now)
+	if err != nil {
+		return 0, fmt.Errorf("pause backup plans: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("pause backup plans: %w", err)
+	}
+	return n, nil
+}
+
+// ResumePlan clears the pause on one instance's schedule.
+func (s *CronStore) ResumePlan(instanceName string) (int64, error) {
+	res, err := s.db.Exec(`
+		UPDATE cron_plans SET paused_at = NULL, paused_reason = '', updated_at = ?
+		WHERE instance_name = ?`, rfc3339time.Now(), instanceName)
+	if err != nil {
+		return 0, fmt.Errorf("resume backup plan: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("resume backup plan: %w", err)
+	}
+	return n, nil
+}
+
+// PausePlan suspends one instance's schedule.
+func (s *CronStore) PausePlan(instanceName, reason string) (int64, error) {
+	now := rfc3339time.Now()
+	res, err := s.db.Exec(`
+		UPDATE cron_plans SET paused_at = ?, paused_reason = ?, updated_at = ?
+		WHERE instance_name = ?`, now, reason, now, instanceName)
+	if err != nil {
+		return 0, fmt.Errorf("pause backup plan: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("pause backup plan: %w", err)
+	}
+	return n, nil
+}
+
+// ListPausedPlans returns only the suspended schedules, newest pause first.
+func (s *CronStore) ListPausedPlans() ([]*CronPlan, error) {
+	var plans []*CronPlan
+	err := s.db.Select(&plans, `SELECT * FROM cron_plans WHERE paused_at IS NOT NULL ORDER BY instance_name`)
+	return plans, err
+}
+
 func (s *CronStore) GetPlan(instanceName string) (*CronPlan, error) {
 	var plan CronPlan
 	err := s.db.Get(&plan, `SELECT * FROM cron_plans WHERE instance_name = ?`, instanceName)

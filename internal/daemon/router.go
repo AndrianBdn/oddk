@@ -68,6 +68,10 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("POST /api/cron/snapshot", s.withAuth(s.handleCronSnapshotSet))
 	mux.HandleFunc("GET /api/cron/snapshot", s.withAuth(s.handleCronSnapshotGet))
 	mux.HandleFunc("DELETE /api/cron/snapshot", s.withAuth(s.handleCronSnapshotDelete))
+	mux.HandleFunc("POST /api/cron/snapshot/pause", s.withAuth(s.handleCronSnapshotPause))
+	mux.HandleFunc("POST /api/cron/snapshot/resume", s.withAuth(s.handleCronSnapshotResume))
+	mux.HandleFunc("POST /api/cron/backup/{instance}/pause", s.withAuth(s.handleCronBackupPause))
+	mux.HandleFunc("POST /api/cron/backup/{instance}/resume", s.withAuth(s.handleCronBackupResume))
 
 	// Password management
 	mux.HandleFunc("GET /api/rdbms/{name}/password", s.withAuth(s.handleGetPassword))

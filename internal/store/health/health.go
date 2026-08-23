@@ -182,7 +182,10 @@ func (s *HealthStore) CleanupOldRecords(olderThan time.Duration) error {
 
 // ResetInProgressRecords resets any stuck in_progress records on startup
 func (s *HealthStore) ResetInProgressRecords() error {
-	query := `UPDATE health SET in_progress = 0 WHERE in_progress = 1`
+	// StartHealthCheck inserts HealthyAll=true. Clearing only in_progress would
+	// turn a crash mid-check into a completed green sample and can suppress
+	// the next degraded notification. Mark it failed instead.
+	query := `UPDATE health SET in_progress = 0, healthy_all = 0, fail_details = CASE WHEN fail_details IS NULL OR fail_details = '' THEN 'interrupted' ELSE fail_details END WHERE in_progress = 1`
 
 	result, err := s.db.Exec(query)
 	if err != nil {

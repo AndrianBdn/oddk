@@ -2,11 +2,13 @@ package operations
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 
 	s3service "github.com/andrianbdn/oddk/internal/services/s3"
+	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
 
 // retentionFloor implements the newest-N rule that age-based retention may never
@@ -50,6 +52,69 @@ func (f *retentionFloor) protects(copyPresent bool) bool {
 // existence, since once the floor is full the answer cannot change the outcome.
 func (f *retentionFloor) full() bool {
 	return f.kept >= f.limit
+}
+
+// snapshotIsComplete reports whether the archive holds data for every instance
+// it recorded. Pre-019 rows (Instances == nil, unknown) are treated as complete
+// so retention stays conservative rather than aging out the last restorable
+// copy because we cannot read the coverage list.
+func snapshotIsComplete(rec *snapshotstore.Record) bool {
+	if rec.Instances == nil {
+		return true
+	}
+	for _, inst := range rec.Instances {
+		if !inst.HasData {
+			return false
+		}
+	}
+	return true
+}
+
+// retentionKeep says why a snapshot copy survived age-based retention, so the
+// two cleanup loops can log the actual reason instead of guessing at it.
+type retentionKeep int
+
+const (
+	retentionKeepNone retentionKeep = iota
+	retentionKeepNewest
+	retentionKeepNewestComplete
+)
+
+func (k retentionKeep) reason(limit int) string {
+	switch k {
+	case retentionKeepNewest:
+		return fmt.Sprintf("it is one of the newest %d, and expiring every archive would leave nothing to restore from", limit)
+	case retentionKeepNewestComplete:
+		return "it is the newest complete archive (every instance has data), and degraded copies must not age that out"
+	default:
+		return "it is not protected"
+	}
+}
+
+// snapshotRetentionProtects is the keep rule for one snapshot copy: the newest-N
+// surviving copies, PLUS the newest complete archive even if it is older.
+// Incomplete (degraded) archives still fill newest-N so they remain the latest
+// restore point for instances they did capture, but they must not evict the
+// last fully restorable copy.
+//
+// Both rules are always evaluated, never short-circuited: a complete archive
+// that newest-N already protects must still consume the complete slot, or the
+// next complete archive down would be pinned as well.
+func snapshotRetentionProtects(floor *retentionFloor, completeKept *bool, present, isComplete bool) retentionKeep {
+	newest := floor.protects(present)
+	complete := false
+	if present && isComplete && !*completeKept {
+		complete = true
+		*completeKept = true
+	}
+	switch {
+	case newest:
+		return retentionKeepNewest
+	case complete:
+		return retentionKeepNewestComplete
+	default:
+		return retentionKeepNone
+	}
 }
 
 // localArchivePresent reports whether a catalogued local archive is really on

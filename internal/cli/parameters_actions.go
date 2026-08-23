@@ -128,15 +128,13 @@ func (c *Client) parametersPutAction(ctx context.Context, cmd *cli.Command) erro
 		return fmt.Errorf("read parameters file: %w", err)
 	}
 
-	// Validate JSON
-	var parameters []map[string]any
-	if err := json.Unmarshal(fileData, &parameters); err != nil {
-		return fmt.Errorf("invalid JSON in parameters file: %w", err)
+	paramJSON, err := parametersFileToArray(fileData)
+	if err != nil {
+		return err
 	}
 
-	// Create request payload
 	payload := map[string]any{
-		"parameters": json.RawMessage(fileData),
+		"parameters": paramJSON,
 	}
 
 	// Make API request
@@ -155,6 +153,25 @@ func (c *Client) parametersPutAction(ctx context.Context, cmd *cli.Command) erro
 
 	_, _ = fmt.Fprintln(c.out, result.Message)
 	return nil
+}
+
+// parametersFileToArray accepts a bare parameter array or the
+// {groupName, parameters} object that `parameters get --json` writes.
+func parametersFileToArray(fileData []byte) (json.RawMessage, error) {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(fileData, &arr); err == nil {
+		return json.RawMessage(fileData), nil
+	}
+	var wrapped struct {
+		Parameters json.RawMessage `json:"parameters"`
+	}
+	if err := json.Unmarshal(fileData, &wrapped); err != nil || len(wrapped.Parameters) == 0 {
+		return nil, fmt.Errorf("invalid JSON in parameters file: expected a parameter array or {\"parameters\": [...]}")
+	}
+	if err := json.Unmarshal(wrapped.Parameters, &arr); err != nil {
+		return nil, fmt.Errorf("invalid JSON in parameters file: parameters is not an array: %w", err)
+	}
+	return wrapped.Parameters, nil
 }
 
 func (c *Client) parametersDeleteAction(ctx context.Context, cmd *cli.Command) error {
