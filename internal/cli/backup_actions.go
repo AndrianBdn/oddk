@@ -256,6 +256,8 @@ func (c *Client) backupListCronAction(ctx context.Context, cmd *cli.Command) err
 		UTCHour           int    `json:"utcHour"`
 		CleanupLocalDays  int    `json:"cleanupLocalDays"`
 		CleanupRemoteDays int    `json:"cleanupRemoteDays"`
+		PausedAt          string `json:"pausedAt"`
+		PausedReason      string `json:"pausedReason"`
 		CreatedAt         string `json:"createdAt"`
 		UpdatedAt         string `json:"updatedAt"`
 	}
@@ -269,19 +271,41 @@ func (c *Client) backupListCronAction(ctx context.Context, cmd *cli.Command) err
 		return nil
 	}
 
+	// STATUS is not decoration. A paused plan takes NO backups, and 'snapshot
+	// apply' pauses every restored one, so a listing that showed only the hour
+	// would describe protection that is not running — on a DR host, for the
+	// whole time nobody notices. Same rule as 'snapshot list-cron' and the
+	// checklist.
 	w := tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "INSTANCE\tUTC HOUR\tSCHEDULE\tKEEP LOCAL\tKEEP REMOTE\tUPDATED")
+	_, _ = fmt.Fprintln(w, "INSTANCE\tUTC HOUR\tSCHEDULE\tKEEP LOCAL\tKEEP REMOTE\tSTATUS\tUPDATED")
 	for _, plan := range plans {
-		_, _ = fmt.Fprintf(w, "%s\t%d\t%02d:00 UTC\t%d days\t%d days\t%s\n",
+		status := "active"
+		if plan.PausedAt != "" {
+			status = "PAUSED"
+		}
+		_, _ = fmt.Fprintf(w, "%s\t%d\t%02d:00 UTC\t%d days\t%d days\t%s\t%s\n",
 			plan.InstanceName,
 			plan.UTCHour,
 			plan.UTCHour,
 			plan.CleanupLocalDays,
 			plan.CleanupRemoteDays,
+			status,
 			plan.UpdatedAt,
 		)
 	}
 	_ = w.Flush()
+
+	for _, plan := range plans {
+		if plan.PausedAt == "" {
+			continue
+		}
+		_, _ = fmt.Fprintf(c.out, "\n⚠️  %s is PAUSED since %s — no backups are being taken.\n",
+			plan.InstanceName, plan.PausedAt)
+		if plan.PausedReason != "" {
+			_, _ = fmt.Fprintf(c.out, "    reason: %s\n", plan.PausedReason)
+		}
+		_, _ = fmt.Fprintf(c.out, "    resume with: oddk backup setup-cron --instance %s --resume\n", plan.InstanceName)
+	}
 
 	return nil
 }

@@ -862,6 +862,10 @@ func snapshotCommands(client *Client) *cli.Command {
 						Value: 5442,
 					},
 					&cli.BoolFlag{
+						Name:  "no-pause-schedules",
+						Usage: "Do not pause the restored schedules (DANGEROUS: they carry the SOURCE host's offsite settings, so this host will upload into and expire objects from the source's bucket; only for a real failover where the source is gone)",
+					},
+					&cli.BoolFlag{
 						Name:  "yes",
 						Usage: "Skip the confirmation prompt",
 					},

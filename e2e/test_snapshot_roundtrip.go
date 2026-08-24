@@ -76,6 +76,17 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	}
 	postgresPassword = strings.TrimSpace(postgresPassword)
 
+	// Schedule snapshots AND a legacy per-instance backup before capturing, so
+	// the archive's oddk.db carries both — the state that makes an unpaused
+	// restore join the SOURCE host's offsite bucket and expire its archives.
+	// (This test runs with cron.debug_force_run off, so nothing fires.)
+	if output, err = h.runCLI("snapshot", "setup-cron", "--utc-hour", "3"); err != nil {
+		return fmt.Errorf("snapshot setup-cron: %w (output: %s)", err, output)
+	}
+	if output, err = h.runCLI("backup", "setup-cron", "--instance", instanceName, "--utc-hour", "4"); err != nil {
+		return fmt.Errorf("backup setup-cron: %w (output: %s)", err, output)
+	}
+
 	log.Println("Step 2: Taking the snapshot")
 	if output, err = h.runCLI("snapshot", "make"); err != nil {
 		return fmt.Errorf("snapshot make: %w (output: %s)", err, output)
@@ -163,6 +174,12 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	if !strings.Contains(output, "Instance images are available") {
 		return fmt.Errorf("apply did not report an image preflight check; output: %s", output)
 	}
+	// Apply must suspend the restored schedules: they carry the SOURCE host's
+	// offsite settings, so running them here would upload into and run retention
+	// against a bucket the source may still own.
+	if !strings.Contains(output, "SCHEDULES ARE PAUSED") {
+		return fmt.Errorf("apply did not report pausing the restored schedules; output: %s", output)
+	}
 	if _, exists := h.imageExists("postgres:17"); !exists {
 		return fmt.Errorf("apply did not pull postgres:17 back onto the host")
 	}
@@ -183,6 +200,23 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	log.Println("Step 5: Starting the daemon and verifying the deployment came back")
 	if err := h.startDaemon(); err != nil {
 		return fmt.Errorf("start daemon after apply: %w", err)
+	}
+
+	// Not just the message — the plans themselves. A pause that only printed a
+	// warning would leave this host uploading into the source's bucket.
+	cronOut, err := h.runCLI("snapshot", "list-cron")
+	if err != nil {
+		return fmt.Errorf("snapshot list-cron after apply: %w (output: %s)", err, cronOut)
+	}
+	if !strings.Contains(cronOut, "PAUSED") {
+		return fmt.Errorf("restored snapshot schedule is not paused after apply; list-cron: %s", cronOut)
+	}
+	backupCronOut, err := h.runCLI("backup", "list-cron")
+	if err != nil {
+		return fmt.Errorf("backup list-cron after apply: %w (output: %s)", err, backupCronOut)
+	}
+	if !strings.Contains(backupCronOut, "PAUSED") {
+		return fmt.Errorf("restored backup schedule is not paused after apply; list-cron: %s", backupCronOut)
 	}
 
 	statusOut, err := h.getInstanceStatusCLI(instanceName)

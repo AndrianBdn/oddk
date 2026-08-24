@@ -508,6 +508,13 @@ automatically after 7 days.
 >
 > If this is a **rehearsal** and the source is still live, leave them paused —
 > or point this host at its own bucket with `oddk offsite apply` first.
+>
+> If the source host is **gone** and this one replaces it, `--no-pause-schedules`
+> skips the pause so the replacement is protected from its first scheduled run
+> rather than from whenever somebody reads the checklist. Only use it when you
+> know nothing else writes to that bucket — that is the one fact `apply` cannot
+> check for you. It leaves the schedules as the archive carried them, so a plan
+> the source had already paused stays paused.
 
 > **You still need `master.key`, and it is deliberately *not* in the bucket** —
 > an archive and its key stored together would defeat the encryption of the
@@ -561,6 +568,15 @@ When offsite is configured, each scheduled snapshot run uploads the new
 snapshot, retries earlier failed uploads, and then applies retention — and
 local retention never deletes an archive whose only copy is local.
 
+Retention keeps the newest two snapshots regardless of age, plus the newest
+**complete** one (every instance captured with data), so a run of degraded
+captures cannot expire the last fully restorable archive. That extra pin is
+bounded: it holds for your retention window plus 30 days, then releases with a
+warning naming `oddk checklist`. A deployment with a permanently
+configuration-only instance never produces another complete archive, and an
+unbounded pin would keep that one on disk and in your bucket forever while the
+checklist quietly reported the instance as uncovered.
+
 The same two safeguards apply to scheduled **backups**: a local backup with no
 remote copy is never aged out while offsite is configured, and retention (local
 and offsite) always keeps the newest two regardless of age, so a job that has
@@ -600,7 +616,9 @@ oddk backup restore --instance app --file /path/to/backup.tar.zst --database ana
 # Scheduling and offsite copies (superseded by `oddk snapshot setup-cron`)
 oddk backup setup-cron --instance app --utc-hour 3              # daily at 03:00 UTC
 oddk backup setup-cron --instance app --cleanup-local-days 14   # keeps the existing hour
-oddk backup list-cron
+oddk backup setup-cron --instance app --pause                  # suspend without deleting
+oddk backup setup-cron --instance app --resume
+oddk backup list-cron                                          # STATUS column: active / PAUSED
 oddk backup upload app <backup-id>
 oddk backup download app <backup-id>
 ```

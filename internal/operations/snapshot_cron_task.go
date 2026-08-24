@@ -267,7 +267,12 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 		offsiteConfigured = false
 	}
 
-	cutoff := time.Now().AddDate(0, 0, -plan.CleanupLocalDays)
+	now := time.Now()
+	cutoff := now.AddDate(0, 0, -plan.CleanupLocalDays)
+	// The complete-archive pin releases a grace period past the retention
+	// window, so a permanently degraded deployment cannot hold one archive here
+	// forever — see completePinGraceDays.
+	pinCutoff := completePinCutoff(now, plan.CleanupLocalDays)
 	records, err := op.deps.Store.Snapshot.List()
 	if err != nil {
 		return err
@@ -290,9 +295,11 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 			log.Printf("Warning: snapshot %d is catalogued with a local copy at %s but the file is not there; it does not count toward the newest-%d floor",
 				rec.ID, rec.LocalPath, minRetainedSnapshots)
 		}
-		if keep := snapshotRetentionProtects(floor, &completeKept, present, snapshotIsComplete(rec)); keep != retentionKeepNone {
+		verdict := snapshotRetentionProtects(floor, &completeKept, present,
+			snapshotIsComplete(rec), !rec.CreatedAt.Before(pinCutoff))
+		if verdict.keep != retentionKeepNone {
 			if rec.CreatedAt.Before(cutoff) {
-				log.Printf("Keeping local snapshot %d past retention: %s", rec.ID, keep.reason(minRetainedSnapshots))
+				log.Printf("Keeping local snapshot %d past retention: %s", rec.ID, verdict.keep.reason(minRetainedSnapshots))
 			}
 			continue
 		}
@@ -317,6 +324,14 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 				log.Printf("Warning: keeping local snapshot %d past retention: offsite is configured but it has no remote copy (upload it or remove it manually)", rec.ID)
 				continue
 			}
+		}
+		if verdict.pinExpired {
+			// The last archive in which every instance had data is going away.
+			// Say so explicitly: the deployment has been capturing degraded
+			// archives for longer than the pin's grace period, and after this
+			// there is no fully restorable local copy at all.
+			log.Printf("Warning: local snapshot %d was the newest COMPLETE archive, but every capture since has been degraded for more than %d days past the %d-day retention window, so the pin holding it has expired and it is being removed. Run 'oddk checklist' to see which instance is configuration-only; once it is captured again the next snapshot restores this protection.",
+				rec.ID, completePinGraceDays, plan.CleanupLocalDays)
 		}
 		if err := op.removeLocalSnapshot(rec); err != nil {
 			log.Printf("Warning: could not remove local snapshot %d: %v", rec.ID, err)
@@ -376,7 +391,9 @@ func (op *SnapshotCronTaskOp) runRemoteCleanup(ctx context.Context) error {
 		return fmt.Errorf("create S3 client: %w", err)
 	}
 
-	cutoff := time.Now().AddDate(0, 0, -plan.CleanupRemoteDays)
+	now := time.Now()
+	cutoff := now.AddDate(0, 0, -plan.CleanupRemoteDays)
+	pinCutoff := completePinCutoff(now, plan.CleanupRemoteDays)
 	records, err := op.deps.Store.Snapshot.List()
 	if err != nil {
 		return err
@@ -394,8 +411,12 @@ func (op *SnapshotCronTaskOp) runRemoteCleanup(ctx context.Context) error {
 			continue
 		}
 		complete := snapshotIsComplete(rec)
-		// HeadObject only while newest-N is filling, or while we still need a
-		// complete copy to pin. Once both are satisfied, existence cannot
+		// HeadObject only while newest-N is filling, or while the newest
+		// complete copy has not been identified yet. The second clause is not
+		// narrowed to pin-ELIGIBLE records on purpose: identifying that copy is
+		// also what produces the "the pin has expired and the last complete
+		// archive is going" warning below, and buying that with one extra
+		// HeadObject is worth it. Once both are satisfied, existence cannot
 		// change the keep/delete decision.
 		needHead := !floor.full() || (!completeKept && complete)
 		present := false
@@ -406,9 +427,11 @@ func (op *SnapshotCronTaskOp) runRemoteCleanup(ctx context.Context) error {
 					rec.ID, rec.RemotePath, minRetainedSnapshots)
 			}
 		}
-		if keep := snapshotRetentionProtects(floor, &completeKept, present, complete); keep != retentionKeepNone {
+		verdict := snapshotRetentionProtects(floor, &completeKept, present, complete,
+			!rec.CreatedAt.Before(pinCutoff))
+		if verdict.keep != retentionKeepNone {
 			if rec.CreatedAt.Before(cutoff) {
-				log.Printf("Keeping offsite snapshot %d past retention: %s", rec.ID, keep.reason(minRetainedSnapshots))
+				log.Printf("Keeping offsite snapshot %d past retention: %s", rec.ID, verdict.keep.reason(minRetainedSnapshots))
 			}
 			continue
 		}
@@ -424,6 +447,10 @@ func (op *SnapshotCronTaskOp) runRemoteCleanup(ctx context.Context) error {
 			// Guard against deleting from a bucket that is no longer ours.
 			log.Printf("Warning: snapshot %d lives in bucket %q but offsite is configured for %q; skipping", rec.ID, bucket, settings.Bucket)
 			continue
+		}
+		if verdict.pinExpired {
+			log.Printf("Warning: offsite snapshot %d was the newest COMPLETE archive in the bucket, but every capture since has been degraded for more than %d days past the %d-day offsite retention window, so the pin holding it has expired and it is being deleted. Run 'oddk checklist' to see which instance is configuration-only.",
+				rec.ID, completePinGraceDays, plan.CleanupRemoteDays)
 		}
 		if err := s3Client.DeleteFile(ctx, s3Client.RelativeKey(key)); err != nil {
 			log.Printf("Warning: could not delete remote snapshot %d: %v", rec.ID, err)

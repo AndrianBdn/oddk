@@ -775,6 +775,8 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 		Docker:        dockerClient,
 		Progress:      c.out,
 		PullProgress:  pullProgress,
+
+		NoPauseSchedules: cmd.Bool("no-pause-schedules"),
 	}
 
 	_, _ = fmt.Fprintln(c.out, "Reading snapshot...")
@@ -812,10 +814,18 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 		_, _ = fmt.Fprintln(c.out, "  - This REPLACES the entire ODDK deployment here: oddk.db, master.key and all")
 		_, _ = fmt.Fprintln(c.out, "    instance data.")
 		_, _ = fmt.Fprintln(c.out, "  - Physical restores empty UNLOGGED tables (crash-recovery semantics).")
-		_, _ = fmt.Fprintln(c.out, "  - The restored schedules are PAUSED automatically. They keep the source's")
-		_, _ = fmt.Fprintln(c.out, "    offsite settings, so running them here would write to — and expire")
-		_, _ = fmt.Fprintln(c.out, "    objects from — the same bucket the source may still be using. Nothing")
-		_, _ = fmt.Fprintln(c.out, "    is scheduled here until you resume them.")
+		if cmd.Bool("no-pause-schedules") {
+			_, _ = fmt.Fprintln(c.out, "  - --no-pause-schedules: the restored schedules will NOT be paused. They keep")
+			_, _ = fmt.Fprintln(c.out, "    the source's offsite settings, so this host will upload into the SOURCE's")
+			_, _ = fmt.Fprintln(c.out, "    bucket and run retention against it — deleting archives the source still")
+			_, _ = fmt.Fprintln(c.out, "    catalogues. Correct only if the source host is gone. If it is still live,")
+			_, _ = fmt.Fprintln(c.out, "    press N and re-run without this flag.")
+		} else {
+			_, _ = fmt.Fprintln(c.out, "  - The restored schedules are PAUSED automatically. They keep the source's")
+			_, _ = fmt.Fprintln(c.out, "    offsite settings, so running them here would write to — and expire")
+			_, _ = fmt.Fprintln(c.out, "    objects from — the same bucket the source may still be using. Nothing")
+			_, _ = fmt.Fprintln(c.out, "    is scheduled here until you resume them.")
+		}
 		if len(plan.PulledImages) > 0 {
 			_, _ = fmt.Fprintf(c.out, "  - No ODDK state has been modified yet. (%d Docker image(s) were pulled\n    above; that is additive and safe to leave behind.)\n", len(plan.PulledImages))
 		} else {
@@ -847,6 +857,19 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 		len(result.Restored), len(result.ConfigOnly))
 	_, _ = fmt.Fprintln(c.out, "Next: start the daemon (systemctl start oddk), then run 'oddk checklist'.")
 
+	if result.SchedulesLeftRunning {
+		_, _ = fmt.Fprintln(c.out,
+			"\n⚠️  SCHEDULES WERE NOT PAUSED (--no-pause-schedules).\n"+
+				"   This host now runs the snapshot's schedules against the snapshot's offsite\n"+
+				"   settings — the SOURCE host's bucket. If that host is still live, its archives\n"+
+				"   will be overwritten and expired by this one. Stop it now, or repoint this host\n"+
+				"   at its own bucket with 'oddk offsite apply' before the next scheduled run.\n"+
+				"\n"+
+				"   To suspend them after the fact:\n"+
+				"     oddk snapshot setup-cron --pause\n"+
+				"     oddk backup setup-cron --instance <name> --pause   # per instance")
+	}
+
 	if result.SnapshotCronPaused || result.BackupCronsPaused > 0 {
 		_, _ = fmt.Fprintf(c.out,
 			"\n⚠️  SCHEDULES ARE PAUSED: %s.\n"+
@@ -856,7 +879,7 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 				"   run retention against it, deleting archives the source still catalogues.\n"+
 				"\n"+
 				"   If this host REPLACES a dead source, resume now:\n",
-			operations.DescribePausedSchedules(result.SnapshotCronPaused, result.BackupCronsPaused))
+			operations.DescribeScheduleSet(result.SnapshotCronPaused, result.BackupCronsPaused))
 		if result.SnapshotCronPaused {
 			_, _ = fmt.Fprintln(c.out, "     oddk snapshot setup-cron --resume")
 		}

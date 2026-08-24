@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 )
@@ -52,7 +53,7 @@ func TestSnapshotRetentionProtects_DegradedDoNotEvictLastComplete(t *testing.T) 
 	completeKept := false
 	var kept []int
 	for i, r := range records {
-		if snapshotRetentionProtects(floor, &completeKept, r.present, r.complete) != retentionKeepNone {
+		if snapshotRetentionProtects(floor, &completeKept, r.present, r.complete, true).keep != retentionKeepNone {
 			kept = append(kept, i)
 		}
 	}
@@ -64,17 +65,93 @@ func TestSnapshotRetentionProtects_DegradedDoNotEvictLastComplete(t *testing.T) 
 func TestSnapshotRetentionProtects_CompleteNewestFillsBothRules(t *testing.T) {
 	floor := newRetentionFloor(2)
 	completeKept := false
-	if got := snapshotRetentionProtects(floor, &completeKept, true, true); got != retentionKeepNewest {
-		t.Fatalf("newest complete copy is kept by newest-N first, got %v", got)
+	if got := snapshotRetentionProtects(floor, &completeKept, true, true, true); got.keep != retentionKeepNewest {
+		t.Fatalf("newest complete copy is kept by newest-N first, got %v", got.keep)
 	}
 	if !completeKept {
 		t.Fatal("complete slot should be filled by the newest complete copy")
 	}
-	if got := snapshotRetentionProtects(floor, &completeKept, true, true); got != retentionKeepNewest {
-		t.Fatalf("second-newest complete still fills newest-N, got %v", got)
+	if got := snapshotRetentionProtects(floor, &completeKept, true, true, true); got.keep != retentionKeepNewest {
+		t.Fatalf("second-newest complete still fills newest-N, got %v", got.keep)
 	}
-	if got := snapshotRetentionProtects(floor, &completeKept, true, true); got != retentionKeepNone {
-		t.Fatalf("third copy should not be protected by either rule, got %v", got)
+	if got := snapshotRetentionProtects(floor, &completeKept, true, true, true); got.keep != retentionKeepNone {
+		t.Fatalf("third copy should not be protected by either rule, got %v", got.keep)
+	}
+}
+
+// The defect this bounds: the complete-archive pin had no age limit at all. A
+// deployment with a permanently configuration-only instance never produces
+// another complete archive, so the last one was held forever — on the disk and
+// in the bucket — while the checklist reported the instance as uncovered.
+func TestSnapshotRetentionProtects_PinReleasesOnceGraceExpires(t *testing.T) {
+	// Newest-first: two degraded copies fill newest-2, then the newest complete
+	// archive, now older than the pin window.
+	floor := newRetentionFloor(2)
+	completeKept := false
+
+	for i := range 2 {
+		if got := snapshotRetentionProtects(floor, &completeKept, true, false, true); got.keep != retentionKeepNewest {
+			t.Fatalf("degraded copy %d should fill newest-N, got %v", i, got.keep)
+		}
+	}
+
+	got := snapshotRetentionProtects(floor, &completeKept, true, true, false)
+	if got.keep != retentionKeepNone {
+		t.Fatalf("a complete archive past the pin window must not be kept, got %v", got.keep)
+	}
+	if !got.pinExpired {
+		t.Fatal("releasing the last complete archive must be reported, not done silently")
+	}
+	if !completeKept {
+		t.Fatal("an expired pin still consumes the complete slot: every archive below it is older still")
+	}
+}
+
+// pinExpired says "the last complete archive is going". It must never be set for
+// a copy that is in fact surviving, or the warning would fire on a healthy run.
+func TestSnapshotRetentionProtects_PinExpiredNeverSetOnASurvivingCopy(t *testing.T) {
+	floor := newRetentionFloor(2)
+	completeKept := false
+
+	// Kept by newest-N even though the pin window has passed.
+	if got := snapshotRetentionProtects(floor, &completeKept, true, true, false); got.keep != retentionKeepNewest || got.pinExpired {
+		t.Fatalf("keep=%v pinExpired=%v, want kept by newest-N with no expiry warning", got.keep, got.pinExpired)
+	}
+	// Kept by the pin itself.
+	floorFull := newRetentionFloor(0)
+	completeKept2 := false
+	if got := snapshotRetentionProtects(floorFull, &completeKept2, true, true, true); got.keep != retentionKeepNewestComplete || got.pinExpired {
+		t.Fatalf("keep=%v pinExpired=%v, want kept by the pin with no expiry warning", got.keep, got.pinExpired)
+	}
+	// A degraded copy is not the complete archive, so its removal is ordinary.
+	if got := snapshotRetentionProtects(floorFull, &completeKept2, true, false, false); got.keep != retentionKeepNone || got.pinExpired {
+		t.Fatalf("keep=%v pinExpired=%v, want an unremarkable delete", got.keep, got.pinExpired)
+	}
+}
+
+// The grace is ADDED to the tier's own window, not multiplied by it, so a long
+// offsite policy cannot silently pin a second one.
+func TestCompletePinCutoff_AddsGraceToTheRetentionWindow(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		cleanupDays int
+		wantDays    int
+	}{
+		{cleanupDays: 2, wantDays: 2 + completePinGraceDays},
+		{cleanupDays: 30, wantDays: 30 + completePinGraceDays},
+		{cleanupDays: 365, wantDays: 365 + completePinGraceDays},
+	} {
+		got := completePinCutoff(now, tc.cleanupDays)
+		want := now.AddDate(0, 0, -tc.wantDays)
+		if !got.Equal(want) {
+			t.Errorf("cleanupDays=%d: cutoff %s, want %s", tc.cleanupDays, got, want)
+		}
+		// The pin must always outlast the retention window it supplements,
+		// otherwise it could never keep anything age-based retention deletes.
+		if !got.Before(now.AddDate(0, 0, -tc.cleanupDays)) {
+			t.Errorf("cleanupDays=%d: pin cutoff %s is not older than the retention cutoff", tc.cleanupDays, got)
+		}
 	}
 }
 

@@ -40,6 +40,22 @@ type SnapshotApplyParams struct {
 	DaemonPort    int
 	Docker        *docker.Client
 
+	// NoPauseSchedules skips the automatic pause of every restored schedule.
+	//
+	// The pause exists because the restored oddk.db carries the SOURCE host's
+	// offsite settings alongside its schedules, so an unpaused restore uploads
+	// into — and runs RETENTION against — a bucket the source may still be
+	// using. Apply cannot tell a rehearsal from a real failover, so it fails
+	// safe by default.
+	//
+	// This flag is the operator asserting the one fact apply cannot check: that
+	// no other host is writing to that bucket. It is for the genuine
+	// disaster-recovery case, where the source is gone and the replacement must
+	// start protecting itself immediately rather than waiting for somebody to
+	// notice a paused schedule. Set it when the source is dead; leave it alone
+	// for a rehearsal or a staged migration.
+	NoPauseSchedules bool
+
 	// Progress receives human-readable status lines during preflight (nil
 	// discards them).
 	Progress io.Writer
@@ -114,6 +130,12 @@ type SnapshotApplyResult struct {
 	// snapshot schedule at all.
 	SnapshotCronPaused bool
 	BackupCronsPaused  int
+
+	// SchedulesLeftRunning records that --no-pause-schedules suppressed the
+	// pause, so the CLI can warn about the bucket collision the operator has
+	// just taken responsibility for instead of the paused schedules they do not
+	// have.
+	SchedulesLeftRunning bool
 }
 
 // PreflightSnapshotApply validates that this snapshot can be applied to this
@@ -641,42 +663,27 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 			snapRepointed, snapCleared)
 	}
 
-	// 3d. Suspend the restored schedules.
-	//
-	//     The archive's oddk.db carries the source host's snapshot schedule, its
-	//     per-instance backup schedules AND its offsite credentials and bucket
-	//     path. On a rehearsal or a planned migration — where the source is
-	//     STILL LIVE — starting the daemon here would put two hosts on one
-	//     bucket: this one uploads under the same layout, and its offsite
-	//     retention deletes objects the source still catalogues. That is silent
-	//     and it destroys the source's archives, not this host's.
-	//
-	//     Pausing rather than deleting is deliberate. Deleting the schedule (the
-	//     previously documented workaround) trades a rehearsal hazard for a
-	//     production one: a real DR host whose operator never recreates it is
-	//     permanently unprotected, and nothing says so. A paused schedule keeps
-	//     every setting, resumes with one command, and is reported as a PROBLEM
-	//     by `oddk checklist` plus a daily notification until it is resumed.
-	//
-	//     This is not conditional on "is the source alive" — apply cannot know
-	//     that. It fails safe and makes resuming a deliberate, one-command act.
-	pauseReason := fmt.Sprintf("suspended by 'snapshot apply' on %s; resume once you have confirmed no other host is writing to this offsite bucket",
-		rfc3339time.Now().UTC().Format("2006-01-02 15:04 MST"))
-	if err := st.Snapshot.PausePlan(pauseReason); err != nil {
-		if !errors.Is(err, snapshotstore.ErrNoSnapshotPlan) {
-			return nil, fmt.Errorf("pause restored snapshot schedule: %w", err)
-		}
-	} else {
-		result.SnapshotCronPaused = true
-	}
-	pausedBackups, err := st.Cron.PauseAllPlans(pauseReason)
+	// 3d. Suspend the restored schedules — see pauseRestoredSchedules.
+	snapshotPaused, backupsPaused, err := pauseRestoredSchedules(st, params.NoPauseSchedules)
 	if err != nil {
-		return nil, fmt.Errorf("pause restored backup schedules: %w", err)
+		return nil, err
 	}
-	result.BackupCronsPaused = int(pausedBackups)
-	if result.SnapshotCronPaused || result.BackupCronsPaused > 0 {
+	result.SnapshotCronPaused = snapshotPaused
+	result.BackupCronsPaused = backupsPaused
+	switch {
+	case params.NoPauseSchedules:
+		snapshotActive, backupsActive, countErr := countActiveRestoredSchedules(st)
+		if countErr != nil {
+			return nil, countErr
+		}
+		result.SchedulesLeftRunning = snapshotActive || backupsActive > 0
+		if result.SchedulesLeftRunning {
+			emitLine(progress, "  ○ Restored schedules left RUNNING (%s) — --no-pause-schedules",
+				DescribeScheduleSet(snapshotActive, backupsActive))
+		}
+	case snapshotPaused || backupsPaused > 0:
 		emitLine(progress, "  ✓ Restored schedules PAUSED (%s) — nothing writes to the offsite bucket until you resume",
-			DescribePausedSchedules(result.SnapshotCronPaused, result.BackupCronsPaused))
+			DescribeScheduleSet(snapshotPaused, backupsPaused))
 	}
 
 	// 4. Rebuild each instance.
@@ -1160,13 +1167,98 @@ func checkLocaleProviders(extractedDir string, instances []*InstanceMeta) error 
 	return nil
 }
 
-// DescribePausedSchedules renders the pause summary for both the apply progress
-// line and the CLI's closing warning, so the two cannot drift.
-func DescribePausedSchedules(snapshotPaused bool, backupCrons int) string {
+// pauseRestoredSchedules suspends every schedule the restored oddk.db carried,
+// and reports how many of each it touched.
+//
+// The archive's oddk.db carries the source host's snapshot schedule, its
+// per-instance backup schedules AND its offsite credentials and bucket path. On
+// a rehearsal or a planned migration — where the source is STILL LIVE — starting
+// the daemon here would put two hosts on one bucket: this one uploads under the
+// same layout, and its offsite retention deletes objects the source still
+// catalogues. That is silent, and it destroys the SOURCE's archives, not this
+// host's.
+//
+// Pausing rather than deleting is deliberate. Deleting the schedule (the
+// previously documented workaround) trades a rehearsal hazard for a production
+// one: a real DR host whose operator never recreates it is permanently
+// unprotected, and nothing says so. A paused schedule keeps every setting,
+// resumes with one command, and is reported as a PROBLEM by `oddk checklist`
+// plus a daily notification until it is resumed.
+//
+// The default is not conditional on "is the source alive" — apply cannot know
+// that, so it fails safe and makes resuming a deliberate, one-command act.
+// noPause is the operator asserting that fact for themselves, for a real
+// failover where the source is gone. It LEAVES every plan exactly as the archive
+// carried it, which is not the same as resuming: a plan the source had paused
+// stays paused, and this function reports nothing paused because it paused
+// nothing.
+func pauseRestoredSchedules(st *store.Store, noPause bool) (snapshotPaused bool, backupsPaused int, err error) {
+	if noPause {
+		return false, 0, nil
+	}
+
+	reason := fmt.Sprintf("suspended by 'snapshot apply' on %s; resume once you have confirmed no other host is writing to this offsite bucket",
+		rfc3339time.Now().UTC().Format("2006-01-02 15:04 MST"))
+	if err := st.Snapshot.PausePlan(reason); err != nil {
+		// No schedule in the archive is the ordinary case on a deployment that
+		// never scheduled one; anything else is a real failure.
+		if !errors.Is(err, snapshotstore.ErrNoSnapshotPlan) {
+			return false, 0, fmt.Errorf("pause restored snapshot schedule: %w", err)
+		}
+	} else {
+		snapshotPaused = true
+	}
+	paused, err := st.Cron.PauseAllPlans(reason)
+	if err != nil {
+		return snapshotPaused, 0, fmt.Errorf("pause restored backup schedules: %w", err)
+	}
+	return snapshotPaused, int(paused), nil
+}
+
+// countActiveRestoredSchedules reports how many of the restored schedules will
+// actually run here, for the --no-pause-schedules warning.
+//
+// It exists so that warning can be TRUE. Keying it off the flag alone would fire
+// it on a deployment whose archive carried no schedule at all, telling an
+// operator their host is writing to the source's bucket when nothing is
+// scheduled to write anywhere — and a warning that cries wolf on the harmless
+// case is one that gets skimmed past on the dangerous one. A plan the SOURCE had
+// already paused does not count either: --no-pause-schedules skips the pause
+// step, it does not resume anything.
+func countActiveRestoredSchedules(st *store.Store) (snapshotActive bool, backupsActive int, err error) {
+	plan, err := st.Snapshot.GetPlan()
+	if err != nil {
+		return false, 0, fmt.Errorf("read restored snapshot schedule: %w", err)
+	}
+	if plan != nil && !plan.IsPaused() {
+		snapshotActive = true
+	}
+	backupPlans, err := st.Cron.GetAllPlans()
+	if err != nil {
+		return snapshotActive, 0, fmt.Errorf("read restored backup schedules: %w", err)
+	}
+	for _, p := range backupPlans {
+		if !p.IsPaused() {
+			backupsActive++
+		}
+	}
+	return snapshotActive, backupsActive, nil
+}
+
+// DescribeScheduleSet names a set of schedules — "snapshot schedule + 2 backup
+// schedule(s)" — for the apply progress line and the CLI's closing warning, so
+// the two cannot drift.
+//
+// Deliberately neutral about WHY the set is interesting: it renders both the
+// schedules apply paused and, under --no-pause-schedules, the ones it left
+// running. It was called DescribePausedSchedules until the second caller
+// existed, at which point the name would have been describing the opposite of
+// what it printed.
+func DescribeScheduleSet(hasSnapshotPlan bool, backupCrons int) string {
 	switch {
-	case snapshotPaused && backupCrons > 0:
+	case hasSnapshotPlan && backupCrons > 0:
 		return fmt.Sprintf("snapshot schedule + %d backup schedule(s)", backupCrons)
-	case snapshotPaused:
+	case hasSnapshotPlan:
 		return "snapshot schedule"
 	case backupCrons > 0:
 		return fmt.Sprintf("%d backup schedule(s)", backupCrons)
