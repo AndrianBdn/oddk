@@ -370,8 +370,16 @@ What you need to know:
   table or use `--logical`, which dumps its rows.
 - **Back up `master.key` separately.** It is deliberately *not* in the archive,
   and a snapshot cannot be applied without it.
-- **Snapshots are not encrypted.** They contain database contents and role
-  password hashes in plaintext. Store them accordingly.
+- **Snapshots are not encrypted, and they carry more than your data.** The
+  archive holds database contents and role password hashes in plaintext, and it
+  embeds `oddk.db` verbatim. The master key encrypts only two columns in there —
+  each instance's postgres password and the S3 secret access key. **Everything
+  else in that database is in the clear, including every notification
+  credential**: the SMTP password, the Slack webhook URL, the Telegram bot
+  token, and any `Authorization` header you configured on a webhook. So whoever
+  can read a snapshot can read those secrets, and that includes anyone with read
+  access to the offsite bucket you upload to. Restrict the bucket accordingly,
+  and rotate notification credentials if an archive is ever exposed.
 - **What gets captured is decided by the container, not by recorded state.** A
   snapshot asks Docker what each container is actually doing at capture time, so
   an instance whose recorded status has drifted is still captured correctly. A
@@ -519,8 +527,8 @@ automatically after 7 days.
 > **You still need `master.key`, and it is deliberately *not* in the bucket** —
 > an archive and its key stored together would defeat the encryption of the
 > secrets inside. And remember that **snapshots themselves are not encrypted**:
-> they hold database contents and role password hashes in plaintext, so guard
-> bucket access accordingly.
+> they hold database contents, role password hashes and every configured
+> notification credential in plaintext, so guard bucket access accordingly.
 
 ### Offsite storage (S3)
 
@@ -720,6 +728,14 @@ oddk notify logs --limit 50
 
 Supported channels: Email, Slack, Telegram, Webhook. Health degraded/restored
 events are delivered automatically with configurable thresholds.
+
+> **Channel credentials are stored unencrypted** in `oddk.db` — the SMTP
+> password, the Slack webhook URL, the Telegram bot token, and any headers you
+> set on a webhook. The master key covers only instance passwords and the S3
+> secret key. Because every snapshot embeds `oddk.db` verbatim, these secrets
+> travel inside any archive you upload offsite. Prefer a credential you can
+> scope and rotate (a dedicated SMTP user, a per-deployment webhook) over one
+> that grants anything else.
 
 An instance left in `error` by a failed operation — an apply whose rollback also
 failed, a start that never reached readiness, a switch interrupted by a daemon
