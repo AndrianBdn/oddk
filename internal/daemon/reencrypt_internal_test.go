@@ -126,3 +126,40 @@ func TestReencryptLegacySecrets(t *testing.T) {
 		t.Errorf("second sweep should be a no-op")
 	}
 }
+
+// The daemon-side wiring of the notification sweep: a config written by an
+// ODDK <= 0.1.79 (plain JSON in the column) must be encrypted at the next
+// start, and reading it must be unaffected either way.
+func TestEncryptNotificationConfigsAtStartup(t *testing.T) {
+	st, _ := newTestStore(t)
+
+	const cleartext = `{"slackWebhookUrl":"https://hooks.slack.test/services/T/B/xoxb-secret"}`
+	_, err := st.Sqlx.Exec(
+		`INSERT INTO notifications (name, type, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		"slack", "slack", cleartext,
+		"2026-01-02T03:04:05.000000000Z", "2026-01-02T03:04:05.000000000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encryptNotificationConfigs(st)
+
+	var stored string
+	if err := st.Sqlx.QueryRow(`SELECT config FROM notifications WHERE name = 'slack'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(stored, crypto.ThreeNcrPrefix) {
+		t.Fatalf("startup sweep left the config unencrypted: %s", stored)
+	}
+	if strings.Contains(stored, "xoxb-secret") {
+		t.Fatalf("the Slack webhook URL is still in the clear: %s", stored)
+	}
+
+	got, err := st.Notifications.Get("slack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Config) != cleartext {
+		t.Fatalf("sweep changed the config: %s", got.Config)
+	}
+}

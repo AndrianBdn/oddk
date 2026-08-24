@@ -62,7 +62,7 @@ func TestMigration018UpgradePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st2, err := store.NewStore(dbPath, dir)
+	st2, err := store.NewStore(dbPath, dir, newTestMasterKey(t, dir))
 	if err != nil {
 		t.Fatalf("reopen (migrations must be idempotent): %v", err)
 	}

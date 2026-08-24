@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/store"
 )
 
@@ -18,7 +19,11 @@ func newTestStore(t *testing.T) (*store.Store, string) {
 	if err := os.MkdirAll(backupDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.NewStore(filepath.Join(dataDir, "oddk.db"), dataDir)
+	masterKey, err := crypto.GetOrCreateKeyFile(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.NewStore(filepath.Join(dataDir, "oddk.db"), dataDir, masterKey)
 	if err != nil {
 		t.Fatal(err)
 	}

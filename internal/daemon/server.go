@@ -80,7 +80,7 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 	dbPath := filepath.Join(dataDir, "oddk.db")
 	log.Printf("Database path: %s", dbPath)
 
-	store, err := store.NewStore(dbPath, dataDir)
+	store, err := store.NewStore(dbPath, dataDir, masterKey)
 	if err != nil {
 		return nil, fmt.Errorf("create store: %w", err)
 	}
@@ -107,12 +107,14 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 	}
 
 	// Reconcile stored instance state with Docker reality, sweep orphaned
-	// backup artifacts, and upgrade legacy ciphertexts — before anything can
-	// submit operations.
+	// backup artifacts, and converge stored secrets on the current encryption
+	// (legacy ciphertexts, then cleartext notification configs) — before
+	// anything can submit operations.
 	reconcileInstances(store, dockerClient)
 	sweepBackupDir(store, backupDir)
 	reconcileInterruptedSnapshotRuns(store)
 	reencryptLegacySecrets(store, masterKey)
+	encryptNotificationConfigs(store)
 
 	executor := operations.NewExecutor()
 	opDeps := &operations.Dependencies{

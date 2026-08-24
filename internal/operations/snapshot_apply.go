@@ -26,6 +26,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/rfc3339time"
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/instances"
+	notificationstore "github.com/andrianbdn/oddk/internal/store/notifications"
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 	"github.com/andrianbdn/oddk/internal/util"
 	"github.com/andrianbdn/oddk/internal/version"
@@ -466,7 +467,7 @@ func existingInstanceNames(dataDir string) ([]string, error) {
 // then globals.sql would overwrite the postgres role with the source's hash —
 // leaving an instance ODDK can never connect to again.
 func verifyMasterKeyAgainstSnapshot(snapshotDBPath string, masterKey []byte) error {
-	st, err := store.NewStore(snapshotDBPath, filepath.Dir(snapshotDBPath))
+	st, err := store.NewStore(snapshotDBPath, filepath.Dir(snapshotDBPath), masterKey)
 	if err != nil {
 		return fmt.Errorf("open snapshot store: %w", err)
 	}
@@ -485,8 +486,21 @@ func verifyMasterKeyAgainstSnapshot(snapshotDBPath string, masterKey []byte) err
 		}
 		return nil
 	}
-	// No instance carries a credential (an empty deployment) — nothing to
-	// verify against, and nothing that could be bricked either.
+
+	// No instance carries a credential (an empty deployment). Since 0.1.80 the
+	// notification configs are encrypted with the same key, so they are the
+	// second thing this key can be proved against — and they matter: an empty
+	// deployment can still have channels configured, and installing a key that
+	// cannot read them would leave the restored host unable to notify anyone,
+	// discovered only when something needed reporting. List() fails on the
+	// first row it cannot open; a nil error means either every config decrypted
+	// or there were none, and both are fine.
+	if _, err := st.Notifications.List(); err != nil {
+		if errors.Is(err, notificationstore.ErrConfigUndecryptable) {
+			return operr.Invalidf("master key mismatch: this key cannot decrypt the snapshot's stored notification credentials. Nothing was modified")
+		}
+		return fmt.Errorf("read snapshot notifications: %w", err)
+	}
 	return nil
 }
 
@@ -614,7 +628,7 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 
 	// 3. Reopen the freshly installed store. Migrations run here, which is what
 	//    lets an older snapshot land on a newer binary.
-	st, err := store.NewStore(dbPath, params.DataDir)
+	st, err := store.NewStore(dbPath, params.DataDir, plan.MasterKey)
 	if err != nil {
 		return nil, fmt.Errorf("open restored store: %w", err)
 	}

@@ -555,7 +555,7 @@ func checkRestorePortFree(deps *Dependencies, meta *InstanceMeta, existing *inst
 // so the cluster must be initialised with the very plaintext the source used, or
 // the restored postgres role authenticates nothing.
 func snapshotInstancePassword(snapshotDBPath, instanceName string, masterKey []byte) (string, error) {
-	st, err := store.NewStore(snapshotDBPath, filepath.Dir(snapshotDBPath))
+	st, err := store.NewStore(snapshotDBPath, filepath.Dir(snapshotDBPath), masterKey)
 	if err != nil {
 		return "", fmt.Errorf("open snapshot store: %w", err)
 	}

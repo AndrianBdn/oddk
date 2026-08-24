@@ -372,14 +372,17 @@ What you need to know:
   and a snapshot cannot be applied without it.
 - **Snapshots are not encrypted, and they carry more than your data.** The
   archive holds database contents and role password hashes in plaintext, and it
-  embeds `oddk.db` verbatim. The master key encrypts only two columns in there —
-  each instance's postgres password and the S3 secret access key. **Everything
-  else in that database is in the clear, including every notification
-  credential**: the SMTP password, the Slack webhook URL, the Telegram bot
-  token, and any `Authorization` header you configured on a webhook. So whoever
-  can read a snapshot can read those secrets, and that includes anyone with read
-  access to the offsite bucket you upload to. Restrict the bucket accordingly,
-  and rotate notification credentials if an archive is ever exposed.
+  embeds `oddk.db` verbatim. The master key encrypts three columns in there —
+  each instance's postgres password, the S3 secret access key, and (since
+  0.1.80) every notification config. Everything else in that database is in the
+  clear. So whoever can read a snapshot can read your databases, and that
+  includes anyone with read access to the offsite bucket you upload to; restrict
+  it accordingly.
+  **Archives written before 0.1.80 also carry your notification credentials in
+  the clear** — the SMTP password, the Slack webhook URL, the Telegram bot
+  token, and any `Authorization` header on a webhook. Encrypting the column
+  going forward does not unpublish what already shipped: if an older archive
+  has been anywhere you would not put a password, rotate those credentials.
 - **What gets captured is decided by the container, not by recorded state.** A
   snapshot asks Docker what each container is actually doing at capture time, so
   an instance whose recorded status has drifted is still captured correctly. A
@@ -527,8 +530,9 @@ automatically after 7 days.
 > **You still need `master.key`, and it is deliberately *not* in the bucket** —
 > an archive and its key stored together would defeat the encryption of the
 > secrets inside. And remember that **snapshots themselves are not encrypted**:
-> they hold database contents, role password hashes and every configured
-> notification credential in plaintext, so guard bucket access accordingly.
+> they hold database contents and role password hashes in plaintext, so guard
+> bucket access accordingly. (Notification credentials are encrypted since
+> 0.1.80; older archives carry them in the clear.)
 
 ### Offsite storage (S3)
 
@@ -729,13 +733,18 @@ oddk notify logs --limit 50
 Supported channels: Email, Slack, Telegram, Webhook. Health degraded/restored
 events are delivered automatically with configurable thresholds.
 
-> **Channel credentials are stored unencrypted** in `oddk.db` — the SMTP
-> password, the Slack webhook URL, the Telegram bot token, and any headers you
-> set on a webhook. The master key covers only instance passwords and the S3
-> secret key. Because every snapshot embeds `oddk.db` verbatim, these secrets
-> travel inside any archive you upload offsite. Prefer a credential you can
-> scope and rotate (a dedicated SMTP user, a per-deployment webhook) over one
-> that grants anything else.
+> **Channel credentials are encrypted with the master key** (since 0.1.80) —
+> the SMTP password, the Slack webhook URL, the Telegram bot token, and any
+> headers you set on a webhook. The whole config blob is encrypted, so a
+> credential in a webhook header is covered like any other. Configs written by
+> earlier versions are re-encrypted the next time the daemon starts.
+>
+> Two things it does *not* do. It does not protect a snapshot archive taken
+> **before** 0.1.80 — those carry these credentials in the clear, so rotate
+> anything that has ridden in one. And it does not protect against someone who
+> has both `oddk.db` and `master.key`, which is what an archive plus its key
+> amount to. Still prefer a credential you can scope and rotate (a dedicated
+> SMTP user, a per-deployment webhook) over one that grants anything else.
 
 An instance left in `error` by a failed operation — an apply whose rollback also
 failed, a start that never reached readiness, a switch interrupted by a daemon
@@ -790,9 +799,12 @@ go looking.
 
 ## Security
 
-- **Encrypted secrets at rest.** Postgres passwords and S3 keys are encrypted
-  with AES-256-GCM (self-describing `3ncr.org/1` format) using a 32-byte master
-  key at `{dataDir}/master.key` (mode `0600`). The key file is one
+- **Encrypted secrets at rest.** Postgres passwords, S3 keys and notification
+  channel configs are encrypted with AES-256-GCM (self-describing `3ncr.org/1`
+  format) using a 32-byte master key at `{dataDir}/master.key` (mode `0600`).
+  Notification configs joined the list in 0.1.80; configs written earlier are
+  re-encrypted the next time the daemon starts, and a snapshot archive taken
+  before then still carries them in the clear. The key file is one
   self-describing line so it can be identified wherever it ends up:
   `ODDK-SECRET-MASTER-KEY;V1;<base64url>;<checksum>`. The checksum is the first
   4 bytes of SHA-256 over the base64url text — `printf %s '<payload>' |

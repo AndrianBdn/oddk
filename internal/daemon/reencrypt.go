@@ -82,3 +82,24 @@ func reencryptLegacySecrets(st *store.Store, masterKey []byte) {
 		log.Printf("Ciphertext upgrade sweep: %d secret(s) re-encrypted to 3ncr.org/1, %d failed", upgraded, failed)
 	}
 }
+
+// encryptNotificationConfigs encrypts notification `config` blobs that are
+// still stored in cleartext, which is how every ODDK <= 0.1.79 wrote them.
+//
+// It runs at startup next to the legacy-ciphertext sweep, and for the same
+// reason: until a row is rewritten, the SMTP password / Slack webhook URL /
+// Telegram token / webhook Authorization header inside it is readable by anyone
+// who can read oddk.db — and oddk.db is embedded verbatim in every snapshot
+// archive, which is NOT encrypted and is uploaded to S3.
+//
+// Reads tolerate both forms, so this is convergence only and must never stop
+// the daemon: a row that cannot be rewritten is reported and left working.
+func encryptNotificationConfigs(st *store.Store) {
+	encrypted, errs := st.Notifications.EncryptStoredConfigs()
+	for _, err := range errs {
+		log.Printf("Warning: cannot encrypt notification config: %v", err)
+	}
+	if encrypted > 0 {
+		log.Printf("Encrypted %d notification config(s) previously stored in cleartext", encrypted)
+	}
+}

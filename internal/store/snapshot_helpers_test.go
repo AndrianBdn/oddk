@@ -20,7 +20,7 @@ func TestVacuumIntoProducesUsableCopy(t *testing.T) {
 
 	// The copy must be a fully usable store, not just bytes on disk: snapshot
 	// apply opens it directly.
-	reopened, err := store.NewStore(copyPath, dir)
+	reopened, err := store.NewStore(copyPath, dir, newTestMasterKey(t, dir))
 	if err != nil {
 		t.Fatalf("reopen vacuumed copy: %v", err)
 	}

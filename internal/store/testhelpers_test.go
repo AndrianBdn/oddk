@@ -4,8 +4,20 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/store"
 )
+
+// newTestMasterKey mints a real master.key in dir, exactly as the daemon does.
+// NewStore requires one because the notification store encrypts with it.
+func newTestMasterKey(t *testing.T, dir string) []byte {
+	t.Helper()
+	key, err := crypto.GetOrCreateKeyFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
 
 // newTestStore opens a fully migrated store in a fresh temp dir; the
 // connection is closed on test cleanup.
@@ -22,7 +34,7 @@ func newTestStore(t *testing.T) *store.Store {
 func newTestStoreDir(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir)
+	st, err := store.NewStore(filepath.Join(dir, "oddk.db"), dir, newTestMasterKey(t, dir))
 	if err != nil {
 		t.Fatal(err)
 	}

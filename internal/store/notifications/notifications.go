@@ -14,10 +14,14 @@ import (
 
 type NotificationStore struct {
 	db *sqlx.DB
+	// masterKey encrypts the `config` column. It is a constructor parameter
+	// rather than a per-call argument so that there is no way to build a
+	// NotificationStore whose writes land in cleartext — see crypto.go.
+	masterKey []byte
 }
 
-func NewNotificationStore(db *sqlx.DB) *NotificationStore {
-	return &NotificationStore{db: db}
+func NewNotificationStore(db *sqlx.DB, masterKey []byte) *NotificationStore {
+	return &NotificationStore{db: db, masterKey: masterKey}
 }
 
 func (s *NotificationStore) Create(name string, notifType NotificationType, config json.RawMessage) (*Notification, error) {
@@ -28,14 +32,18 @@ func (s *NotificationStore) Create(name string, notifType NotificationType, conf
 		return nil, err
 	}
 
+	encrypted, err := encryptConfig(config, s.masterKey)
+	if err != nil {
+		return nil, err
+	}
+
 	now := rfc3339time.Now()
 	query := `
 		INSERT INTO notifications (name, type, config, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)
 	`
 
-	_, err := s.db.Exec(query, name, notifType, string(config), now, now)
-	if err != nil {
+	if _, err := s.db.Exec(query, name, notifType, encrypted, now, now); err != nil {
 		return nil, fmt.Errorf("failed to create notification: %w", err)
 	}
 
@@ -61,7 +69,11 @@ func (s *NotificationStore) Get(name string) (*Notification, error) {
 		return nil, fmt.Errorf("failed to get notification: %w", err)
 	}
 
-	n.Config = json.RawMessage(configStr)
+	config, err := decryptConfig(name, configStr, s.masterKey)
+	if err != nil {
+		return nil, err
+	}
+	n.Config = config
 
 	return &n, nil
 }
@@ -83,7 +95,11 @@ func (s *NotificationStore) List() ([]Notification, error) {
 			return nil, fmt.Errorf("failed to scan notification: %w", err)
 		}
 
-		n.Config = json.RawMessage(configStr)
+		config, err := decryptConfig(n.Name, configStr, s.masterKey)
+		if err != nil {
+			return nil, err
+		}
+		n.Config = config
 		notifications = append(notifications, n)
 	}
 
@@ -98,6 +114,11 @@ func (s *NotificationStore) Update(name string, notifType NotificationType, conf
 		return nil, err
 	}
 
+	encrypted, err := encryptConfig(config, s.masterKey)
+	if err != nil {
+		return nil, err
+	}
+
 	now := rfc3339time.Now()
 	query := `
 		UPDATE notifications
@@ -105,7 +126,7 @@ func (s *NotificationStore) Update(name string, notifType NotificationType, conf
 		WHERE name = ?
 	`
 
-	result, err := s.db.Exec(query, notifType, string(config), now, name)
+	result, err := s.db.Exec(query, notifType, encrypted, now, name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update notification: %w", err)
 	}

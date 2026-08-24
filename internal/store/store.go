@@ -10,6 +10,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
 
+	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/store/auth"
 	"github.com/andrianbdn/oddk/internal/store/backup"
 	"github.com/andrianbdn/oddk/internal/store/cron"
@@ -43,7 +44,17 @@ type Store struct {
 	Snapshot      *snapshot.SnapshotStore
 }
 
-func NewStore(dbPath, dataDir string) (*Store, error) {
+// NewStore opens (creating if needed) the ODDK database and migrates it.
+//
+// masterKey is the 32-byte key from {dataDir}/master.key. It is required, not
+// optional: the notification store encrypts its `config` column with it, and a
+// store built without one could only fall back to writing those credentials in
+// cleartext — the failure this parameter exists to make impossible.
+func NewStore(dbPath, dataDir string, masterKey []byte) (*Store, error) {
+	if len(masterKey) != crypto.KeyFileSize {
+		return nil, fmt.Errorf("master key must be %d bytes, got %d", crypto.KeyFileSize, len(masterKey))
+	}
+
 	// Enable WAL mode for better concurrent read performance
 	dsn := fmt.Sprintf("%s?_journal_mode=WAL", dbPath)
 	sqx, err := sqlx.Open("sqlite", dsn)
@@ -71,7 +82,7 @@ func NewStore(dbPath, dataDir string) (*Store, error) {
 		Instances:     instances.NewInstanceStore(sqx),
 		Backup:        backup.NewBackupStore(sqx, dataDir),
 		Cron:          cron.NewCronStore(sqx),
-		Notifications: notifications.NewNotificationStore(sqx),
+		Notifications: notifications.NewNotificationStore(sqx, masterKey),
 		Parameters:    parameters.NewParameterStore(sqx),
 		Health:        health.NewHealthStore(sqx),
 		KV:            kvstore.NewKVStore(sqx),
