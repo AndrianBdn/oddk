@@ -144,6 +144,10 @@ any time — on an existing install it detects the service, swaps the binary in
 place, restarts, and keeps the previous binary as `oddk.prev` for instant
 rollback. There is no separate update step.
 
+Before updating, skim [CHANGELOG.md](./CHANGELOG.md). Most releases need nothing
+from you, but the entries marked **Action** do — a credential to rotate, or a
+schedule to resume after a disaster-recovery restore.
+
 ### Configuring the CLI for another user
 
 The CLI authenticates to the daemon with a bearer token. To set up `oddk` for an
@@ -815,6 +819,18 @@ go looking.
   read the new format, that first start also saves the previous file as
   `master.key.pre-v1` — if you roll the binary back, restore it with
   `mv master.key.pre-v1 master.key`.
+- **Secrets stay out of container metadata.** Since 0.1.81 an instance's
+  postgres password is never written into its container's Docker config, which
+  Docker keeps for the container's lifetime and hands to anything that can read
+  container metadata. A fresh cluster is initialised with a throwaway and the
+  real password is set over SQL once it is ready, so `docker inspect` shows a
+  value that authenticates nothing; recreating a container (`instance
+  apply`/`switch`/`update`) passes no password at all. Containers created before
+  0.1.81 keep their old value until their next recreate — clearing it sooner
+  would mean restarting the database purely to tidy metadata. Note this is
+  hygiene rather than a boundary: anyone who can read that metadata can also
+  `docker exec ... psql -U postgres`, which the cluster answers over its local
+  socket without a password.
 - **Tokenized API auth.** Tokens are Argon2-hashed and compared in constant
   time; the plaintext is shown only at creation.
 - **Loopback by default.** The API binds `127.0.0.1`. `--allow-remote` exists

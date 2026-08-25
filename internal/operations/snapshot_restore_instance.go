@@ -286,11 +286,13 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		emitLine(params.Progress, "  ✓ Parameter group %q restored from the snapshot", meta.ParameterGroup)
 	}
 
-	// 8. Re-encrypt under THIS host's key before writing anything. The plaintext
-	//    is what must reach POSTGRES_PASSWORD (it is the one matching
-	//    globals.sql's hash); the master key only decides what it is encrypted
-	//    under at rest. Doing this before the destructive phase means a key
-	//    problem cannot strand a torn-down instance.
+	// 8. Re-encrypt under THIS host's key before writing anything. The
+	//    plaintext is the one matching globals.sql's hash (and, on a physical
+	//    restore, the archived cluster's own postgres role), so it is what
+	//    every later connection must use — including the readiness probe. The
+	//    master key only decides what it is encrypted under at rest. Doing this
+	//    before the destructive phase means a key problem cannot strand a
+	//    torn-down instance.
 	encrypted, err := crypto.EncryptPassword(password, deps.MasterKey)
 	if err != nil {
 		return nil, fmt.Errorf("re-encrypt password under this host's key: %w", err)
@@ -391,8 +393,22 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		}
 	}
 
+	// Neither format gets the instance's real password: whatever is handed to
+	// the entrypoint stays in Docker's container config for the container's
+	// lifetime (see docker.containerEnv).
+	//   physical — the volume is filled BEFORE the first start, so the
+	//     entrypoint skips initdb and reads nothing; the restored cluster
+	//     brings the source's own postgres role with it.
+	//   logical  — initdb runs, so it needs a password: it gets a throwaway,
+	//     which the ALTER after readiness replaces with the real one (and
+	//     globals.sql then re-asserts the same value from the source's hash).
+	initdbPassword := ""
+	if !physical {
+		initdbPassword = newInitdbCredential()
+	}
+
 	containerID, err := deps.Docker.CreateContainer(
-		meta.Name, meta.Version, meta.Image, meta.Port, password,
+		meta.Name, meta.Version, meta.Image, meta.Port, initdbPassword,
 		meta.CPUCores, meta.RAMMB, meta.ParameterGroup, parameterGroup.Parameters,
 	)
 	if err != nil {
@@ -448,8 +464,11 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	}
 	emitLine(params.Progress, "  ✓ Volume and container created")
 
-	if err := waitForPostgresReady(ctx, meta.Port, password); err != nil {
+	if err := waitForPostgresReady(ctx, meta.Port, initdbPassword); err != nil {
 		return nil, fmt.Errorf("cluster did not become ready: %w", err)
+	}
+	if err := adoptPostgresPassword(ctx, meta.Port, initdbPassword, password); err != nil {
+		return nil, fmt.Errorf("set the instance password: %w", err)
 	}
 	emitLine(params.Progress, "  ✓ PostgreSQL ready")
 

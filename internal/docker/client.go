@@ -28,6 +28,36 @@ import (
 	"github.com/andrianbdn/oddk/internal/util"
 )
 
+// containerEnv builds an instance container's environment.
+//
+// POSTGRES_PASSWORD is included ONLY when the container's first start will run
+// initdb, which is the only time the entrypoint reads it: with a populated data
+// directory it prints "Skipping initialization" and discards the value
+// (verified against the postgres image's docker-entrypoint.sh, which also
+// `unset "${!POSTGRES_@}"`s before exec'ing postgres). Docker keeps Config.Env
+// for the container's whole lifetime and hands it to anything that can read
+// container metadata, so passing a credential the entrypoint cannot use is
+// exposure with no function.
+//
+// Omitting it also converts the one case that would otherwise be silent into a
+// loud one: if a recreate ever met an unexpectedly EMPTY volume, the entrypoint
+// now refuses to start ("You must specify POSTGRES_PASSWORD") instead of
+// running initdb and producing a healthy-looking empty cluster where the
+// instance's data should have been.
+//
+// This is not a confidentiality boundary against an attacker — anyone who can
+// read Config.Env can also `docker exec ... psql -U postgres`, which the data
+// directory's default `local all all trust` line answers without any password
+// at all. It removes a live credential from metadata that gets copied around
+// (support bundles, observability agents holding a read-only docker.sock).
+func containerEnv(password string) []string {
+	env := []string{"POSTGRES_USER=postgres"}
+	if password != "" {
+		env = append(env, fmt.Sprintf("POSTGRES_PASSWORD=%s", password))
+	}
+	return env
+}
+
 // ErrPreflight marks a RecreateContainer/CreateContainer failure that happened
 // before any existing container was removed. Callers must not roll back on it
 // — the previous container is still the one that is running.
@@ -300,11 +330,8 @@ func (c *Client) CreateContainer(name, version, image string, port int, password
 	}
 
 	config := &container.Config{
-		Image: imageName,
-		Env: []string{
-			fmt.Sprintf("POSTGRES_PASSWORD=%s", password),
-			"POSTGRES_USER=postgres",
-		},
+		Image:        imageName,
+		Env:          containerEnv(password),
 		Cmd:          cmd,
 		ExposedPorts: exposedPorts,
 		Labels: map[string]string{
@@ -372,7 +399,12 @@ func (c *Client) StartContainer(containerID string) error {
 // Cheap checks (image, parameter resolution, shared-memory fit, volume exists)
 // run BEFORE the old container is removed. Failures of those wrap ErrPreflight
 // so the caller knows the previous container is still the running one.
-func (c *Client) RecreateContainer(name, version, image string, port int, password string, cpuCores, ramMB int, parameterGroupName string, parameterGroupParams []parameters.Parameter, oldContainerID string) (string, error) {
+//
+// It deliberately takes NO password: the volume it reuses is populated by
+// construction (preflight refuses a missing one), so the entrypoint skips
+// initdb and would discard the value. Keeping the parameter off the signature
+// is what stops it being reintroduced. See containerEnv.
+func (c *Client) RecreateContainer(name, version, image string, port, cpuCores, ramMB int, parameterGroupName string, parameterGroupParams []parameters.Parameter, oldContainerID string) (string, error) {
 	volumeName := VolumeName(name)
 	containerName := ContainerName(name)
 	imageName := image
@@ -446,11 +478,8 @@ func (c *Client) RecreateContainer(name, version, image string, port int, passwo
 	}
 
 	config := &container.Config{
-		Image: imageName,
-		Env: []string{
-			fmt.Sprintf("POSTGRES_PASSWORD=%s", password),
-			"POSTGRES_USER=postgres",
-		},
+		Image:        imageName,
+		Env:          containerEnv(""),
 		Cmd:          cmd,
 		ExposedPorts: exposedPorts,
 		Labels: map[string]string{

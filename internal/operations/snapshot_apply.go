@@ -796,8 +796,23 @@ func rebuildInstanceFromSnapshot(
 		parameterGroup = group
 	}
 
+	physical := entryFormat(entry) == SnapshotFormatPhysical
+	// Neither format gets the instance's real password: whatever is handed to
+	// the entrypoint stays in Docker's container config for the container's
+	// lifetime (see docker.containerEnv).
+	//   physical — the volume is filled BEFORE the first start, so the
+	//     entrypoint skips initdb and reads nothing; the restored cluster
+	//     brings the source's own postgres role with it.
+	//   logical  — initdb runs, so it needs a password: it gets a throwaway,
+	//     which the ALTER after readiness replaces with the real one (and
+	//     globals.sql then re-asserts the same value from the source's hash).
+	initdbPassword := ""
+	if !physical {
+		initdbPassword = newInitdbCredential()
+	}
+
 	containerID, err := deps.Docker.CreateContainer(
-		meta.Name, meta.Version, meta.Image, meta.Port, password,
+		meta.Name, meta.Version, meta.Image, meta.Port, initdbPassword,
 		meta.CPUCores, meta.RAMMB, meta.ParameterGroup, parameterGroup.Parameters,
 	)
 	if err != nil {
@@ -809,7 +824,7 @@ func rebuildInstanceFromSnapshot(
 
 	instanceDir := filepath.Join(plan.ExtractedDir, snapshotInstancesDir, meta.Name)
 
-	if entryFormat(entry) == SnapshotFormatPhysical {
+	if physical {
 		// The volume must be filled BEFORE the container's first start: the
 		// entrypoint sees PG_VERSION and skips initdb, so the archived cluster
 		// — roles, per-database GUCs, ACLs, collation state and all — comes up
@@ -854,8 +869,11 @@ func rebuildInstanceFromSnapshot(
 	}
 	emitLine(progress, "  ✓ Volume and container created")
 
-	if err := waitForPostgresReady(ctx, meta.Port, password); err != nil {
+	if err := waitForPostgresReady(ctx, meta.Port, initdbPassword); err != nil {
 		return fmt.Errorf("cluster did not become ready: %w", err)
+	}
+	if err := adoptPostgresPassword(ctx, meta.Port, initdbPassword, password); err != nil {
+		return fmt.Errorf("set the instance password: %w", err)
 	}
 	emitLine(progress, "  ✓ PostgreSQL ready")
 

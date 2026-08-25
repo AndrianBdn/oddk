@@ -52,6 +52,26 @@ jobs:
           rm -f oddk-linux-amd64 oddk-linux-arm64
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
 
+      - name: Extract release notes
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # The release body is this tag's CHANGELOG section: everything between
+          # its "## <tag> — <date>" heading and the next "## " heading.
+          awk -v hdr="## $TAG " '
+            index($0, hdr) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          # A missing section fails the release, deliberately and for the same
+          # reason the version check above does: the recovery is identical
+          # (fix the commit, move the tag, re-push), and a release published
+          # with placeholder notes is one nobody ever goes back to write.
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $TAG (expected a '## $TAG — <date>' heading)"
+            exit 1
+          fi
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,7 +81,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "ODDK $TAG" \
-            --notes "ODDK $TAG" \
+            --notes-file notes.md \
             dist/oddk-linux-amd64.tar.gz \
             dist/oddk-linux-arm64.tar.gz \
             dist/SHA256SUMS

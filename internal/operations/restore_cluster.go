@@ -64,7 +64,7 @@ func RestoreClusterFromArchive(ctx context.Context, deps *Dependencies, p Restor
 	// Recreate + restore each database with ownership preserved.
 	jobs := min(max(p.CPUCores, 1), maxRestoreJobs)
 
-	conn, err := connectDirect(ctx, p.Port, p.Password, "postgres")
+	conn, err := connectDirect(ctx, p.Port, p.Password)
 	if err != nil {
 		return 0, fmt.Errorf("connect to target cluster: %w", err)
 	}

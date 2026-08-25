@@ -61,7 +61,7 @@ func classifyRecreateError(err error) error {
 // even when err != nil, so the caller can roll back against that id.
 func recreateStartReady(ctx context.Context, deps *Dependencies, spec clusterSpec, oldContainerID string) (string, error) {
 	id, err := deps.Docker.RecreateContainer(
-		spec.Name, spec.Version, spec.Image, spec.Port, spec.Password,
+		spec.Name, spec.Version, spec.Image, spec.Port,
 		spec.CPUCores, spec.RAMMB, spec.ParameterGroup, spec.Parameters,
 		oldContainerID,
 	)

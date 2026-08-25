@@ -22,6 +22,49 @@ func quotePostgresLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// newInitdbCredential returns the throwaway superuser password a fresh cluster
+// is initialised with.
+//
+// The instance's real password must never reach POSTGRES_PASSWORD, because
+// Docker keeps Config.Env for the container's whole lifetime (see
+// docker.containerEnv). But the entrypoint has to be given something to run
+// initdb with: its only alternative is POSTGRES_HOST_AUTH_METHOD=trust, which
+// would open the cluster to anything that can reach the bridge — a far worse
+// trade than a visible credential.
+//
+// So the cluster is initialised with a random value used exactly twice — the
+// readiness probe, and the ALTER that replaces it — and never again. What stays
+// visible in container metadata is then a password that authenticated for the
+// few seconds between initdb and readiness and authenticates nothing after.
+func newInitdbCredential() string {
+	return util.GenerateSecurePassword(24)
+}
+
+// adoptPostgresPassword replaces the cluster's throwaway superuser password
+// with the instance's real one, over a connection authenticated by the
+// throwaway.
+//
+// A failure here is fatal to the calling operation, and must stay that way: the
+// cluster is up but its superuser password is one ODDK has not stored, so
+// leaving it running would produce an instance the daemon can never connect to
+// and a health check that reports it broken forever. Every caller either rolls
+// the instance back or marks it "error".
+func adoptPostgresPassword(ctx context.Context, port int, initdbPassword, realPassword string) error {
+	conn, err := connectDirect(ctx, port, initdbPassword)
+	if err != nil {
+		return fmt.Errorf("connect to set the instance password: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	// PostgreSQL does not accept parameter binding for the PASSWORD clause, so
+	// the literal is escaped the same way every other ALTER ... PASSWORD here is.
+	stmt := "ALTER ROLE postgres WITH PASSWORD " + quotePostgresLiteral(realPassword)
+	if _, err := conn.Exec(ctx, stmt); err != nil {
+		return fmt.Errorf("set the instance password: %w", err)
+	}
+	return nil
+}
+
 // PostgreSQL connectivity status constants
 type PostgreSQLStatus int
 

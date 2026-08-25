@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -45,6 +46,41 @@ func testInstanceApply(h *TestHarness) error {
 		return fmt.Errorf("get password failed: %w", err)
 	}
 	password := strings.TrimSpace(passwordOutput)
+
+	// Test 4b: the freshly created container must not carry the instance's real
+	// password in its Docker config, which Docker keeps for the container's
+	// whole lifetime. initdb needs *a* password, so POSTGRES_PASSWORD is
+	// present — but it must be the throwaway create swapped out, not the
+	// credential the operator was just handed.
+	created, err := h.docker.ContainerInspect(context.Background(), "oddk-pg-"+instanceName)
+	if err != nil {
+		return fmt.Errorf("inspect container after create: %w", err)
+	}
+	if strings.Contains(strings.Join(created.Config.Env, "\n"), password) {
+		return fmt.Errorf("created container's Config.Env leaks the instance password: %v", created.Config.Env)
+	}
+	var envPassword string
+	for _, e := range created.Config.Env {
+		if v, ok := strings.CutPrefix(e, "POSTGRES_PASSWORD="); ok {
+			envPassword = v
+		}
+	}
+	if envPassword == "" {
+		return fmt.Errorf("expected initdb's throwaway in Config.Env, got %v", created.Config.Env)
+	}
+	// And it must be DEAD. Asserting only that the real password is absent
+	// would still pass if the swap had silently left a working credential
+	// behind; this is what proves the visible value authenticates nothing.
+	deadStr := fmt.Sprintf("postgresql://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable", envPassword, instancePort)
+	deadDB, err := sql.Open("postgres", deadStr)
+	if err != nil {
+		return fmt.Errorf("open connection with the throwaway: %w", err)
+	}
+	pingErr := deadDB.Ping()
+	_ = deadDB.Close()
+	if pingErr == nil {
+		return fmt.Errorf("the password left in Config.Env still authenticates: create did not replace initdb's throwaway")
+	}
 
 	// Test 5: Verify initial max_connections (from default group)
 	connStr := fmt.Sprintf("postgresql://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable", password, instancePort)
@@ -158,6 +194,27 @@ func testInstanceApply(h *TestHarness) error {
 	// Test 8: Wait for PostgreSQL to be ready again after reconfiguration
 	if err := h.waitForPostgreSQL(instancePort); err != nil {
 		return fmt.Errorf("PostgreSQL did not restart in time after apply: %w", err)
+	}
+
+	// Test 8b: the recreated container must NOT carry the postgres password in
+	// its Docker config. A recreate reuses a populated volume, so the
+	// entrypoint skips initdb and discards POSTGRES_PASSWORD — but Docker keeps
+	// Config.Env for the container's lifetime and hands it to anything that can
+	// read container metadata. This is the assertion that catches a
+	// reintroduction: inspecting the real container is the only thing that
+	// proves what shipped, exactly as reading the raw column is for an
+	// encrypted-at-rest check.
+	inspected, err := h.docker.ContainerInspect(context.Background(), "oddk-pg-"+instanceName)
+	if err != nil {
+		return fmt.Errorf("inspect container after apply: %w", err)
+	}
+	for _, env := range inspected.Config.Env {
+		if strings.HasPrefix(env, "POSTGRES_PASSWORD") {
+			return fmt.Errorf("recreated container must not carry POSTGRES_PASSWORD in Config.Env, found %q", env)
+		}
+	}
+	if strings.Contains(strings.Join(inspected.Config.Env, "\n"), password) {
+		return fmt.Errorf("recreated container's Config.Env leaks the postgres password: %v", inspected.Config.Env)
 	}
 
 	// Test 9: Verify max_connections changed to 75

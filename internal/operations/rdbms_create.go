@@ -110,12 +110,18 @@ func (op *CreateRDBMSOp) Execute(ctx context.Context) error {
 		return operr.Invalidf("get parameter group %s: %w", op.params.ParameterGroup, err)
 	}
 
+	// initdb is given a throwaway, never the instance's real password: the
+	// value handed to the entrypoint is kept in Docker's container config for
+	// the container's whole lifetime. The real one is set over SQL below, once
+	// the cluster is up. See newInitdbCredential.
+	initdbPassword := newInitdbCredential()
+
 	containerID, err := op.deps.Docker.CreateContainer(
 		op.params.Name,
 		op.params.Version,
 		image,
 		op.params.Port,
-		password,
+		initdbPassword,
 		op.params.CPUCores,
 		op.params.RAMMB,
 		op.params.ParameterGroup,
@@ -146,9 +152,18 @@ func (op *CreateRDBMSOp) Execute(ctx context.Context) error {
 	// mean the server is ready (first boot runs initdb), and reporting "running"
 	// early surfaced a transient "port is not accessible" to clients that
 	// connected immediately after create.
-	if err := waitForPostgresReady(ctx, op.params.Port, password); err != nil {
+	if err := waitForPostgresReady(ctx, op.params.Port, initdbPassword); err != nil {
 		op.cleanupFailedCreate(containerID)
 		return fmt.Errorf("wait for PostgreSQL readiness: %w", annotateReadyError(op.deps, containerID, err))
+	}
+
+	// Swap the throwaway for the password that was stored (encrypted) above.
+	// Rolling the whole instance back on failure is deliberate: the alternative
+	// is a running cluster whose superuser password ODDK does not know, which
+	// no later operation could repair.
+	if err := adoptPostgresPassword(ctx, op.params.Port, initdbPassword, password); err != nil {
+		op.cleanupFailedCreate(containerID)
+		return fmt.Errorf("set the instance password: %w", err)
 	}
 
 	if err := op.deps.Store.Instances.UpdateStatus(op.params.Name, instances.StatusRunning); err != nil {

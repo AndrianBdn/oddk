@@ -277,12 +277,18 @@ func (op *UpgradeRDBMSOp) replaceCluster(ctx context.Context, plan *upgradePlan,
 
 	// Create a fresh cluster at the target version. CreateContainer picks
 	// the correct data-dir mount target for the major automatically.
+	// The fresh target cluster is initialised with a throwaway; globals.sql
+	// will set the postgres role to the instance's own hash during the restore
+	// that follows. The ALTER below closes the window in between, so a restore
+	// that fails still leaves a cluster ODDK can connect to.
+	initdbPassword := newInitdbCredential()
+
 	newContainerID, err := op.deps.Docker.CreateContainer(
 		name,
 		plan.targetVersion,
 		plan.targetImage,
 		instance.Port,
-		plan.password,
+		initdbPassword,
 		instance.CPUCores,
 		instance.RAMMB,
 		instance.ParameterGroup,
@@ -303,9 +309,13 @@ func (op *UpgradeRDBMSOp) replaceCluster(ctx context.Context, plan *upgradePlan,
 		op.markError()
 		return fmt.Errorf("start target cluster: %w; %s", err, recoverHint)
 	}
-	if err := waitForPostgresReady(ctx, instance.Port, plan.password); err != nil {
+	if err := waitForPostgresReady(ctx, instance.Port, initdbPassword); err != nil {
 		op.markError()
 		return fmt.Errorf("target cluster did not become ready: %w; %s", annotateReadyError(op.deps, newContainerID, err), recoverHint)
+	}
+	if err := adoptPostgresPassword(ctx, instance.Port, initdbPassword, plan.password); err != nil {
+		op.markError()
+		return fmt.Errorf("set the instance password on the target cluster: %w; %s", err, recoverHint)
 	}
 	return nil
 }
@@ -382,10 +392,12 @@ func resolveTargetImage(currentImage, targetVersion, providedImage string) (stri
 	return "", operr.Invalidf("instance uses custom image %s; specify --image for the target version (e.g. --image <repo>:<tag> for PostgreSQL %s)", currentImage, targetVersion)
 }
 
-// connectDirect opens a PostgreSQL connection by port+password without checking
-// instance status (used during an upgrade when status is "upgrading").
-func connectDirect(ctx context.Context, port int, password, database string) (*pgx.Conn, error) {
-	return pgx.Connect(ctx, util.PostgresURI(password, port, database))
+// connectDirect opens a connection to the maintenance database by port+password
+// without checking instance status — needed wherever the row does not yet say
+// "running": during an upgrade, a restore, and between a fresh cluster's first
+// readiness and the password swap that follows it.
+func connectDirect(ctx context.Context, port int, password string) (*pgx.Conn, error) {
+	return pgx.Connect(ctx, util.PostgresURI(password, port, "postgres"))
 }
 
 // waitForPostgresReady polls until the cluster accepts connections or times out.
@@ -411,7 +423,7 @@ func waitForPostgresReady(ctx context.Context, port int, password string) error 
 // listUserDatabasesDirect returns the set of non-template databases on the
 // instance using a direct connection.
 func listUserDatabasesDirect(ctx context.Context, port int, password string) (map[string]bool, error) {
-	conn, err := connectDirect(ctx, port, password, "postgres")
+	conn, err := connectDirect(ctx, port, password)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
@@ -471,7 +483,7 @@ func verifyRolesPresent(ctx context.Context, port int, password string, expected
 	if len(expected) == 0 {
 		return nil
 	}
-	conn, err := connectDirect(ctx, port, password, "postgres")
+	conn, err := connectDirect(ctx, port, password)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
