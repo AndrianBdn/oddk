@@ -683,10 +683,10 @@ oddk instance switch app --image pgvector/pgvector:pg17-trixie
 oddk instance major-upgrade app --target-version 18 --yes
 ```
 
-> `create`, `switch`, and `update` pull the image automatically when needed —
-> `oddk pull` is optional, for pre-warming or CI. Quiesce writes before a major
-> upgrade; changes made after it starts are not migrated. Cross-major `switch` is
-> rejected up front — use `major-upgrade`.
+> `create`, `switch`, `update` and `major-upgrade` pull the image automatically
+> when needed — `oddk pull` is optional, for pre-warming or CI. Quiesce writes
+> before a major upgrade; changes made after it starts are not migrated.
+> Cross-major `switch` is rejected up front — use `major-upgrade`.
 
 ### Parameter groups (AWS-style tuning)
 

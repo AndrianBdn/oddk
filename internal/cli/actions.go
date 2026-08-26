@@ -975,6 +975,42 @@ func (c *Client) updateAction(ctx context.Context, cmd *cli.Command) error {
 	return c.streamProgress(ctx, "POST", "/api/rdbms/"+instanceName+"/update", body)
 }
 
+// worthPrefetchingUpgradeImage reports whether a major upgrade of instanceName
+// to targetVersion is worth pre-fetching an image for, by the one precondition
+// that is cheap to check and cannot be wrong: the target major must exceed the
+// instance's current one.
+//
+// It is a pre-fetch heuristic, NOT a second copy of the daemon's rules — the
+// daemon still decides every case, and this only chooses whether to warm the
+// image cache first. So it FAILS OPEN: anything it cannot read (an
+// unreachable daemon, an unparseable version) answers true, because a false
+// negative reinstates the two-step upgrade the pre-fetch exists to remove,
+// while a false positive costs one unused image.
+func (c *Client) worthPrefetchingUpgradeImage(instanceName, targetVersion string) bool {
+	target, err := strconv.Atoi(targetVersion)
+	if err != nil {
+		return true
+	}
+
+	respBody, err := c.request("GET", fmt.Sprintf("/api/rdbms/%s", instanceName), nil)
+	if err != nil {
+		return true
+	}
+
+	var instance struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(respBody, &instance); err != nil {
+		return true
+	}
+
+	current, err := strconv.Atoi(instance.Version)
+	if err != nil {
+		return true
+	}
+	return target > current
+}
+
 func (c *Client) majorUpgradeAction(ctx context.Context, cmd *cli.Command) error {
 	instanceName, err := requireInstanceName(cmd)
 	if err != nil {
@@ -1000,6 +1036,32 @@ func (c *Client) majorUpgradeAction(ctx context.Context, cmd *cli.Command) error
 		if !confirmed {
 			_, _ = fmt.Fprintln(c.out, "Cancelled")
 			return nil
+		}
+	}
+
+	// Pre-fetch the target image (pull only if missing, with live progress) so
+	// an upgrade runs in one step, the way create and switch already do — the
+	// daemon's upgrade op still requires it present, and stopping at the
+	// confirmation to send the operator away for a separate 'oddk pull' is a
+	// detour on the command most likely to be run under time pressure.
+	// Deliberately AFTER the confirmation, so a cancelled upgrade fetches
+	// nothing.
+	//
+	// Skipped when the daemon is going to refuse on version grounds anyway:
+	// downloading an image for an upgrade that cannot happen turns an instant
+	// "must be greater than current" into a long one, and a typo'd
+	// --target-version is exactly when a fast answer matters.
+	//
+	// With no --image this fetches postgres:<targetVersion>, which is what
+	// resolveTargetImage picks for an official-image instance. A CUSTOM-image
+	// instance given no --image therefore fetches an image the daemon then
+	// refuses to use ("specify --image"). That one is accepted rather than
+	// fixed here: naming the target image client-side means reimplementing
+	// resolveTargetImage against a GET, and two copies of a resolution rule
+	// drift. The cost is one cached image on a path that errors either way.
+	if c.worthPrefetchingUpgradeImage(instanceName, targetVersion) {
+		if err := c.ensureImage(ctx, targetVersion, image); err != nil {
+			return err
 		}
 	}
 

@@ -11,6 +11,37 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.82 — 2026-08-26
+
+### Fixed
+
+- **An instance left in `error` no longer displays as `stopped`.** `oddk list`,
+  `oddk instance status` and the per-instance header in `oddk checklist` derive
+  what they show from the container, which is what makes a database somebody
+  stopped out of band read `stopped` rather than `running`. But it also
+  overwrote `error` — the one status that is never cleared on its own — so an
+  operation that failed *and* whose rollback failed left the row saying `error`
+  while every list command said `stopped`, the word for an instance stopped on
+  purpose. The same `oddk checklist` run printed `instance_error:<name>` and a
+  failing health line two lines away from the header contradicting them, and
+  nothing cleared the row, so it read that way indefinitely. Health checks and
+  notifications were always driven by the stored value and were unaffected.
+
+### Changed
+
+- `oddk instance major-upgrade` now pulls the target image itself if it is
+  missing, like `create`, `switch` and `update` already did, instead of
+  stopping at the confirmation prompt to send you away for a separate
+  `oddk pull`. The pull happens after you confirm, so a cancelled upgrade
+  fetches nothing, and an upgrade that cannot happen on version grounds — a
+  downgrade, or the major the instance already runs — is still refused
+  instantly, without fetching anything.
+
+  One message changed with it: a `--target-version` whose image exists in no
+  registry now fails naming the image that could not be resolved, rather than
+  reporting it missing locally and advising a pull that would have failed the
+  same way.
+
 ## v0.1.81 — 2026-08-25
 
 ### Changed

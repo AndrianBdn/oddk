@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -251,13 +252,31 @@ func testMajorUpgrade(h *TestHarness) error {
 		return fmt.Errorf("expected mismatch rejection message, got: %v", err)
 	}
 
-	log.Println("Step 13: Verifying missing target image is rejected")
+	log.Println("Step 13: Verifying an unavailable target image is rejected")
+	// The CLI pre-fetches the target image (see worthPrefetchingUpgradeImage),
+	// so a version whose image exists in no registry now fails at the pull,
+	// naming the image that could not be resolved — instead of failing at the
+	// daemon with advice to run a pull that would fail exactly the same way.
+	// Asserted on the image name rather than on Docker's phrasing.
 	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", "19", "--yes")
 	if err == nil {
-		return fmt.Errorf("expected missing image to be rejected")
+		return fmt.Errorf("expected an unavailable target image to be rejected")
 	}
-	if !strings.Contains(err.Error(), "not found locally") {
-		return fmt.Errorf("expected image-not-found message, got: %v", err)
+	if !strings.Contains(err.Error(), "postgres:19") {
+		return fmt.Errorf("expected the failure to name the unavailable image, got: %v", err)
+	}
+
+	// The daemon's own guard still has to refuse a missing image BEFORE
+	// anything destructive happens — that is what protects a direct API client,
+	// and the CLI pre-fetch no longer reaches it, so assert it directly.
+	upgradeStatus, upgradeBody, err := h.request("POST", "/api/rdbms/"+instanceName+"/major-upgrade",
+		map[string]string{"targetVersion": "19"})
+	if err != nil {
+		return fmt.Errorf("major-upgrade request failed: %w", err)
+	}
+	if upgradeStatus != http.StatusBadRequest || !strings.Contains(string(upgradeBody), "not found locally") {
+		return fmt.Errorf("expected the daemon to refuse a missing image with 400 not-found-locally, got %d: %s",
+			upgradeStatus, upgradeBody)
 	}
 
 	log.Println("Step 14: Confirming instance is intact after rejected upgrades")

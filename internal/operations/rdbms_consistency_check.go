@@ -64,7 +64,13 @@ func (op *ConsistencyCheckOp) Type() OpType {
 // directly, the checklist and `oddk list` display the corrected status computed
 // here in memory, and an instance whose container really did stop now fails its
 // health check and alerts — which is the truthful outcome.
+//
+// The one status the container does NOT get to correct is "error" — see
+// deriveDisplayStatus.
 func (op *ConsistencyCheckOp) Execute(ctx context.Context) error {
+	// Sampled before anything below overwrites it.
+	stored := op.instance.Status
+
 	containerState, err := op.deps.Docker.GetContainerStatus(op.instance.ContainerID)
 	if err != nil {
 		op.status.ContainerExists = false
@@ -86,7 +92,7 @@ func (op *ConsistencyCheckOp) Execute(ctx context.Context) error {
 	} else {
 		op.status.ContainerRunning = false
 		op.status.Issues = append(op.status.Issues, fmt.Sprintf("container is %s, not running", containerState))
-		op.instance.Status = instances.InstanceStatus(containerState)
+		op.instance.Status = deriveDisplayStatus(stored, instances.InstanceStatus(containerState))
 	}
 
 	// Check PostgreSQL connectivity (only if container is running)
@@ -96,16 +102,16 @@ func (op *ConsistencyCheckOp) Execute(ctx context.Context) error {
 
 		switch pgStatus {
 		case PostgreSQLStatusOK:
-			op.instance.Status = instances.StatusRunning
+			op.instance.Status = deriveDisplayStatus(stored, instances.StatusRunning)
 		case PostgreSQLStatusBrokenPort:
 			op.status.Issues = append(op.status.Issues, "PostgreSQL port is not accessible")
-			op.instance.Status = instances.StatusBrokenPort
+			op.instance.Status = deriveDisplayStatus(stored, instances.StatusBrokenPort)
 		case PostgreSQLStatusBrokenAuth:
 			op.status.Issues = append(op.status.Issues, "PostgreSQL authentication failed")
-			op.instance.Status = instances.StatusBrokenAuth
+			op.instance.Status = deriveDisplayStatus(stored, instances.StatusBrokenAuth)
 		case PostgreSQLStatusOther:
 			op.status.Issues = append(op.status.Issues, "PostgreSQL connectivity issue (other)")
-			op.instance.Status = instances.StatusBroken
+			op.instance.Status = deriveDisplayStatus(stored, instances.StatusBroken)
 		}
 	}
 
@@ -115,6 +121,36 @@ func (op *ConsistencyCheckOp) Execute(ctx context.Context) error {
 		op.status.PostgreSQLReady
 
 	return nil
+}
+
+// deriveDisplayStatus resolves what a read command should SHOW for an instance,
+// given the status stored in its row and the one the container implies.
+//
+// "error" wins. It is terminal: it is only ever written by an operation that
+// failed, and only an explicit operation promotes out of it — reconciliation
+// deliberately never auto-clears it (see instances.StatusError and
+// daemon.decideReconcile). A container that exists, or is up, or even answers a
+// connect, does not refute it; that is the whole reason "restoring" resolves to
+// "error" rather than to whatever its half-restored server reports.
+//
+// Without this the row and the screen disagreed, permanently rather than
+// transiently: an apply whose rollback also failed stores "error", and `oddk
+// list` then rendered the exited container as a plain "stopped" — the word for
+// an instance somebody stopped on purpose — while the same `oddk checklist`
+// run printed "instance_error:<name>" and "health failing" two lines apart.
+// Nothing clears the row, so that read every time, forever.
+//
+// Every OTHER stored status still defers to the container, which is what this
+// file is for: a row saying "running" for a container somebody stopped out of
+// band must read "stopped". The interrupted statuses (creating, switching, ...)
+// defer too, and deliberately — from here a dead operation and a live one look
+// identical, which is exactly why reconciliation resolves those at startup,
+// where they don't.
+func deriveDisplayStatus(stored, fromContainer instances.InstanceStatus) instances.InstanceStatus {
+	if stored == instances.StatusError {
+		return instances.StatusError
+	}
+	return fromContainer
 }
 
 func (op *ConsistencyCheckOp) checkPostgreSQLConnectivity(ctx context.Context) PostgreSQLStatus {
