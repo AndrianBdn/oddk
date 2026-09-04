@@ -11,6 +11,91 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.83 — 2026-09-04
+
+### Added
+
+- **`oddk instance apply` now resizes and re-ports an instance, not only its
+  parameter group.** `--cpu`, `--ram` and `--port` can be given in any
+  combination with `--parameter-group`; flags you do not pass keep their
+  current value. The change goes through the same path as a group change: the
+  container is recreated (a brief restart, the data volume untouched), what can
+  be refused is refused before the running container is touched — more CPU or
+  RAM than the host has, a port another instance holds or something already
+  answers on, a group whose shared memory will not fit the *new* RAM — and a
+  container that comes up but never reaches readiness is rolled back to the
+  previous shape. Because parameter groups resolve against the instance's RAM,
+  a resize re-derives `shared_buffers` and friends automatically. Until now CPU,
+  RAM and port were fixed at `create` for the life of the instance, which was
+  the biggest gap against the "local RDS" positioning.
+  `PUT /api/rdbms/{name}/config` accepts the new fields (`cpuCores`, `ramMb`,
+  `port`, all optional); a body with only `parameterGroup` behaves as before.
+
+### Security
+
+- **Built with Go 1.27.1** (v0.1.82 was built with 1.26.5). A `govulncheck` of
+  the previous binary reported six standard-library vulnerabilities as
+  reachable: quadratic path resolution in `net/url`, unbounded post-handshake
+  messages in `crypto/tls`, two in `net/http` (the unencrypted HTTP/2 check
+  ignoring `ReadHeaderTimeout`, and Punycode label handling), and missing
+  recursion guards in `encoding/xml` and `encoding/asn1`. Exposure was limited
+  by design — the daemon listens on loopback and only talks to Docker over its
+  socket, to S3, and to the notification endpoints you configured — but fixing
+  all six costs one line. `golang.org/x/text` moves to 0.39.0 for the same
+  reason (an infinite loop on invalid input).
+
+### Changed
+
+- **The Docker client library is now `github.com/moby/moby/client`**, the
+  client Docker Engine 29 ships, replacing `github.com/docker/docker`. That
+  module stopped receiving releases at 28.5 and carries two Moby
+  plugin-authorization advisories with no fix on its import path. ODDK never
+  ran the affected code — it only talks to the daemon over its socket — but a
+  vulnerability report that can never go green is one nobody reads. Nothing
+  changes for a deployment: the same API calls are made, and the client still
+  negotiates the API version with whatever Docker Engine is installed.
+- Every direct dependency is on its current release. The notable jumps: the
+  SQLite driver (`modernc.org/sqlite` 1.38 → 1.58), the CLI framework
+  (`urfave/cli` 3.4 → 3.11), the AWS SDK's S3 client (1.97 → 1.110), `pgx`
+  5.9 → 5.10 and `klauspost/compress` 1.18 → 1.20. No behaviour change is
+  intended. If `oddk` misbehaves after this upgrade in a way these notes do not
+  explain, the SQLite driver bump is the first suspect.
+
+### Fixed
+
+- **An authentication failure is recognised by its SQLSTATE, not by the English
+  text of the server's message.** PostgreSQL localizes server messages through
+  `lc_messages`, which any parameter group can set, so on a cluster running
+  with a non-English locale the probe behind `oddk instance status` and the
+  checklist reported `PostgreSQL connectivity issue (other)` where it should
+  have said `PostgreSQL authentication failed`, and `add-db-user` on a missing
+  database returned a generic error instead of the 404 with the `create-db`
+  hint. S3 "no such object" and Docker "no such container" answers are now
+  recognised by their typed errors as well. Nothing changes where the messages
+  were English.
+- **`oddk snapshot apply` refuses a truncated `--logical` archive before it
+  replaces anything.** A logical archive missing its `databases.json` or
+  `globals.sql` was discovered only while rebuilding the instance, which is
+  after `oddk.db` and `master.key` had been installed — an apply that could
+  not simply be retried. The physical format already had this check in
+  preflight; the logical one now does too, and both `apply` and
+  `restore-instance` build a cluster through one shared function, so the two
+  cannot drift apart on this again.
+- `oddk backup remove-remote` and `oddk snapshot remove-remote` no longer fail
+  with a bare `EOF` when the S3 delete stalls past the daemon's 30-second
+  response deadline; the removal completed on the daemon either way. The rule
+  behind this and the `delete-db-user` fix below is now enforced by a test, so
+  a new long-running handler cannot ship without it.
+- `oddk instance delete-db-user` no longer fails with a bare `EOF` on a large
+  database. `REASSIGN OWNED BY` locks every object the user owns in one
+  transaction and could outlive the daemon's 30-second response deadline; the
+  operation then completed on the daemon while the CLI reported a connection
+  error, leaving you to check whether the user was actually gone. The handler
+  now clears the deadline like every other long-running operation.
+- `install.sh` no longer tells the owner of a legacy `/home/oddk` install to
+  run a relocation script that was retired in v0.1.45. It says what has to
+  move instead.
+
 ## v0.1.82 — 2026-08-26
 
 ### Fixed

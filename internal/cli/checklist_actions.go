@@ -165,7 +165,8 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 					cov.Snapshot.ID, cov.Snapshot.Timestamp, cov.Snapshot.Location))
 			case cov.State == "config-only" && cov.Snapshot != nil:
 				detail(glyphBad, "snapshot coverage", fmt.Sprintf(
-					"configuration-only in #%d — NO data captured", cov.Snapshot.ID))
+					"configuration-only in #%d — NO data captured", cov.Snapshot.ID,
+				))
 			case cov.State == "not-captured":
 				detail(glyphTodo, "snapshot coverage", "not yet captured (newer than the newest snapshot)")
 			default: // "no-snapshots", or an unknown state from a newer daemon
@@ -178,7 +179,8 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 			if inst.LegacyBackupCron != nil {
 				detail(glyphTodo, "legacy backups", fmt.Sprintf(
 					"daily backup cron at %02d:00 UTC still scheduled — migrate: oddk snapshot migrate-from-backups",
-					inst.LegacyBackupCron.UTCHour))
+					inst.LegacyBackupCron.UTCHour,
+				))
 			}
 		}
 	}
@@ -241,7 +243,8 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 	}
 	if snap.Total > 0 {
 		_, _ = fmt.Fprintf(out, "    stored: %s\n", formatStoredCopies(
-			snap.Total, snap.Copies.LocalAndRemote, snap.Copies.RemoteOnly, snap.Copies.LocalOnly, snap.Copies.None))
+			snap.Total, snap.Copies.LocalAndRemote, snap.Copies.RemoteOnly, snap.Copies.LocalOnly, snap.Copies.None,
+		))
 	}
 	if len(snap.PausedBackupCrons) > 0 {
 		_, _ = fmt.Fprintf(out, "  %s paused backup schedules: %s (oddk backup setup-cron --instance <name> --resume)\n",

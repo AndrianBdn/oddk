@@ -2,12 +2,14 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/andrianbdn/oddk/internal/operr"
 	"github.com/andrianbdn/oddk/internal/util"
@@ -110,6 +112,47 @@ func ConnectToRunningInstance(ctx context.Context, deps *Dependencies, instanceN
 	return conn, nil
 }
 
+// SQLSTATE codes this package classifies connection failures by. They are
+// matched on the CODE, never on the message: PostgreSQL localizes server
+// messages through lc_messages, which any parameter group can set, so
+// "password authentication failed" is not a stable string — on a de_DE
+// cluster it is "Passwort-Authentifizierung ... fehlgeschlagen", and a probe
+// matching the English text would have reported that instance as "other"
+// rather than broken-auth.
+const (
+	sqlstateInvalidPassword                   = "28P01" // wrong password
+	sqlstateInvalidAuthorizationSpecification = "28000" // no such role, or no matching pg_hba line
+	sqlstateInvalidCatalogName                = "3D000" // database does not exist
+)
+
+// pgErrorCode returns the SQLSTATE of the PostgreSQL error inside err, or ""
+// when err did not come from the server (a refused TCP connection, a timeout).
+// pgx wraps the server's error in a *pgconn.ConnectError for connection
+// attempts, and errors.AsType walks through that.
+func pgErrorCode(err error) string {
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok {
+		return ""
+	}
+	return pgErr.Code
+}
+
+// isAuthFailure reports whether a connection reached the server and was
+// refused at authentication.
+func isAuthFailure(err error) bool {
+	switch pgErrorCode(err) {
+	case sqlstateInvalidPassword, sqlstateInvalidAuthorizationSpecification:
+		return true
+	}
+	return false
+}
+
+// isUndefinedDatabase reports whether the server refused a connection because
+// the requested database does not exist.
+func isUndefinedDatabase(err error) bool {
+	return pgErrorCode(err) == sqlstateInvalidCatalogName
+}
+
 // TestPostgreSQLConnectivity tests PostgreSQL connectivity and returns detailed status
 func TestPostgreSQLConnectivity(ctx context.Context, deps *Dependencies, instanceName string) PostgreSQLStatus {
 	// Set a reasonable timeout for health check
@@ -130,11 +173,7 @@ func TestPostgreSQLConnectivity(ctx context.Context, deps *Dependencies, instanc
 	pgConn, err := pgx.Connect(checkCtx, util.PostgresURI(password, instance.Port, "postgres"))
 	if err != nil {
 		// Connection failed, determine the reason
-
-		// Check if this is an authentication error
-		if strings.Contains(err.Error(), "password authentication failed") ||
-			strings.Contains(err.Error(), "authentication failed") ||
-			strings.Contains(err.Error(), "role") && strings.Contains(err.Error(), "does not exist") {
+		if isAuthFailure(err) {
 			return PostgreSQLStatusBrokenAuth
 		}
 
@@ -168,8 +207,7 @@ func TestPostgreSQLConnectivityWithPassword(ctx context.Context, port int, passw
 
 	pgConn, err := pgx.Connect(checkCtx, util.PostgresURI(password, port, "postgres"))
 	if err != nil {
-		if strings.Contains(err.Error(), "password authentication failed") ||
-			strings.Contains(err.Error(), "authentication failed") {
+		if isAuthFailure(err) {
 			return fmt.Errorf("authentication failed with provided password")
 		}
 

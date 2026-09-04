@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -45,8 +44,7 @@ func AddDatabaseUser(ctx context.Context, deps *Dependencies, params AddDatabase
 	// Connect directly to the target database - if it doesn't exist, we'll get an error
 	conn, err := ConnectToRunningInstance(ctx, deps, params.InstanceName, ConnectOptions{Database: params.DatabaseName})
 	if err != nil {
-		// Check if it's a database not found error
-		if strings.Contains(err.Error(), "database") && strings.Contains(err.Error(), "does not exist") {
+		if isUndefinedDatabase(err) {
 			return nil, operr.NotFoundf("database %s does not exist", params.DatabaseName)
 		}
 		return nil, err

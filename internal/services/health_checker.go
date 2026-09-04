@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/api/types/volume"
 	"github.com/jackc/pgx/v5"
+	"github.com/moby/moby/client"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/load"
 
@@ -187,7 +187,7 @@ func (hc *HealthChecker) checkDocker(ctx context.Context) bool {
 	infoCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	_, err := dockerClient.Info(infoCtx)
+	_, err := dockerClient.Info(infoCtx, client.InfoOptions{})
 	return err == nil
 }
 
@@ -226,13 +226,13 @@ func (hc *HealthChecker) checkDiskSpace(ctx context.Context) string {
 func (hc *HealthChecker) getDockerVolumeMountpoints(ctx context.Context) ([]string, error) {
 	dockerClient := hc.docker.GetDockerClient()
 
-	volumes, err := dockerClient.VolumeList(ctx, volume.ListOptions{})
+	volumes, err := dockerClient.VolumeList(ctx, client.VolumeListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	var mountpoints []string
-	for _, vol := range volumes.Volumes {
+	for _, vol := range volumes.Items {
 		if vol.Mountpoint != "" {
 			mountpoints = append(mountpoints, vol.Mountpoint)
 		}

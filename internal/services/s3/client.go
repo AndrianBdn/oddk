@@ -3,8 +3,10 @@ package s3
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -13,6 +15,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/andrianbdn/oddk/internal/store/offsite"
 )
@@ -396,7 +401,7 @@ func (c *Client) StatFile(ctx context.Context, key string) (*ObjectInfo, error) 
 		Key:    aws.String(fullKey),
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") {
+		if isNotFound(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("check S3 object: %w", err)
@@ -422,12 +427,40 @@ func (c *Client) FileExists(ctx context.Context, key string) (bool, error) {
 		Key:    aws.String(fullKey),
 	})
 	if err != nil {
-		// Check if it's a "not found" error
-		if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") {
+		if isNotFound(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("check S3 object existence: %w", err)
 	}
 
 	return true, nil
+}
+
+// isNotFound reports whether an S3 error means "no such object" — the one
+// answer StatFile and FileExists turn into a nil result rather than an error.
+//
+// Matched on the SDK's typed errors and the HTTP status, never on the message
+// text. HeadObject answers a missing key with a bare 404 and no error body,
+// which the SDK models as *types.NotFound; object reads carry a NoSuchKey
+// code; and an S3-compatible server that sends neither still sends the 404.
+// Anything else — a denied request, a wrong region, a network failure —
+// stays an error, because retention's remote checks treat "cannot tell" as
+// "present" and must never be handed a false "absent".
+func isNotFound(err error) bool {
+	if _, ok := errors.AsType[*types.NotFound](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*types.NoSuchKey](err); ok {
+		return true
+	}
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey":
+			return true
+		}
+	}
+	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
+		return respErr.HTTPStatusCode() == http.StatusNotFound
+	}
+	return false
 }

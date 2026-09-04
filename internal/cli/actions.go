@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/jmoiron/sqlx"
+	"github.com/moby/moby/client/pkg/jsonmessage"
 	"github.com/moby/term"
 	"github.com/urfave/cli/v3"
 
@@ -678,8 +679,11 @@ func (c *Client) addDatabaseUserAction(ctx context.Context, cmd *cli.Command) er
 	resp, err := c.request("POST", fmt.Sprintf("/api/rdbms/%s/databases/%s/users", instanceName, database), req)
 	if err != nil {
 		// The one-shot create-db hint makes the user the database OWNER, so
-		// never suggest it when read-only access was requested.
-		if !readonly && strings.Contains(err.Error(), "does not exist") {
+		// never suggest it when read-only access was requested. The daemon has
+		// no error codes, so the message is still the contract — but only a 404
+		// can be the missing database (a missing instance says "not found").
+		apiErr, isAPIErr := errors.AsType[*apiError](err)
+		if !readonly && isAPIErr && apiErr.Status == http.StatusNotFound && strings.Contains(apiErr.Message, "does not exist") {
 			return fmt.Errorf("%w\nHint: to create the database together with its user in one step, use:\n  oddk instance create-db %s --database %s --username %s\n(note: this makes the user the database owner)",
 				err, instanceName, database, username)
 		}
@@ -886,16 +890,45 @@ func (c *Client) streamLogs(ctx context.Context, name, tail string) error {
 func (c *Client) applyAction(ctx context.Context, cmd *cli.Command) error {
 	instanceName := cmd.Args().First()
 	if instanceName == "" {
-		return fmt.Errorf("instance name is required\n\nUsage: oddk instance apply <instance-name> --parameter-group <group>")
+		return fmt.Errorf("instance name is required\n\nUsage: oddk instance apply <instance-name> [--parameter-group <group>] [--cpu <cores>] [--ram <size>] [--port <port>]")
 	}
 
-	parameterGroup := cmd.String("parameter-group")
-
-	reqBody := map[string]string{
-		"parameterGroup": parameterGroup,
+	// Only the flags actually given are sent: an absent field keeps the
+	// instance's current value on the daemon, so moving the port cannot
+	// silently reset the RAM.
+	reqBody := map[string]any{}
+	var changes []string
+	if cmd.IsSet("parameter-group") {
+		group := cmd.String("parameter-group")
+		if group == "" {
+			return fmt.Errorf("--parameter-group must not be empty")
+		}
+		reqBody["parameterGroup"] = group
+		changes = append(changes, "parameter group "+group)
+	}
+	if cmd.IsSet("cpu") {
+		cpu := cmd.Int("cpu")
+		reqBody["cpuCores"] = cpu
+		changes = append(changes, fmt.Sprintf("%d CPU cores", cpu))
+	}
+	if cmd.IsSet("ram") {
+		ramMB, err := util.ParseRAMString(cmd.String("ram"))
+		if err != nil {
+			return fmt.Errorf("invalid RAM value: %w", err)
+		}
+		reqBody["ramMb"] = ramMB
+		changes = append(changes, fmt.Sprintf("%d MB RAM", ramMB))
+	}
+	if cmd.IsSet("port") {
+		port := cmd.Int("port")
+		reqBody["port"] = port
+		changes = append(changes, fmt.Sprintf("port %d", port))
+	}
+	if len(reqBody) == 0 {
+		return fmt.Errorf("nothing to change: pass at least one of --parameter-group, --cpu, --ram, --port")
 	}
 
-	_, _ = fmt.Fprintf(c.out, "Reconfiguring instance %s with parameter group %s...\n", instanceName, parameterGroup)
+	_, _ = fmt.Fprintf(c.out, "Reconfiguring instance %s with %s...\n", instanceName, strings.Join(changes, ", "))
 
 	respBody, err := c.request("PUT", "/api/rdbms/"+instanceName+"/config", reqBody)
 	if err != nil {
@@ -906,6 +939,9 @@ func (c *Client) applyAction(ctx context.Context, cmd *cli.Command) error {
 		Name           string `json:"name"`
 		ParameterGroup string `json:"parameterGroup"`
 		Status         string `json:"status"`
+		Port           int    `json:"port"`
+		CPUCores       int    `json:"cpuCores"`
+		RAMMB          int    `json:"ramMb"`
 	}
 	if err := json.Unmarshal(respBody, &instance); err != nil {
 		return fmt.Errorf("parse response: %w", err)
@@ -913,6 +949,7 @@ func (c *Client) applyAction(ctx context.Context, cmd *cli.Command) error {
 
 	_, _ = fmt.Fprintf(c.out, "Instance %s reconfigured successfully.\n", instance.Name)
 	_, _ = fmt.Fprintf(c.out, "Parameter group: %s\n", instance.ParameterGroup)
+	_, _ = fmt.Fprintf(c.out, "Resources: %d CPU cores, %d MB RAM, port %d\n", instance.CPUCores, instance.RAMMB, instance.Port)
 	_, _ = fmt.Fprintf(c.out, "Status: %s\n", instance.Status)
 
 	return nil

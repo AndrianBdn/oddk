@@ -68,7 +68,8 @@ func decryptConfig(name, stored string, masterKey []byte) (json.RawMessage, erro
 		return nil, fmt.Errorf(
 			"decrypt config of notification %q: %w: %w (restoring oddk.db by hand needs its matching master.key; "+
 				"use `oddk snapshot apply`, which pairs them)",
-			name, ErrConfigUndecryptable, err)
+			name, ErrConfigUndecryptable, err,
+		)
 	}
 	return json.RawMessage(plaintext), nil
 }

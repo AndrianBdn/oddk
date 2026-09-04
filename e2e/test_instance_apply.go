@@ -7,9 +7,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/lib/pq"
 )
@@ -52,7 +55,7 @@ func testInstanceApply(h *TestHarness) error {
 	// whole lifetime. initdb needs *a* password, so POSTGRES_PASSWORD is
 	// present — but it must be the throwaway create swapped out, not the
 	// credential the operator was just handed.
-	created, err := h.docker.ContainerInspect(context.Background(), "oddk-pg-"+instanceName)
+	created, err := h.inspectContainer(context.Background(), "oddk-pg-"+instanceName)
 	if err != nil {
 		return fmt.Errorf("inspect container after create: %w", err)
 	}
@@ -204,7 +207,7 @@ func testInstanceApply(h *TestHarness) error {
 	// reintroduction: inspecting the real container is the only thing that
 	// proves what shipped, exactly as reading the raw column is for an
 	// encrypted-at-rest check.
-	inspected, err := h.docker.ContainerInspect(context.Background(), "oddk-pg-"+instanceName)
+	inspected, err := h.inspectContainer(context.Background(), "oddk-pg-"+instanceName)
 	if err != nil {
 		return fmt.Errorf("inspect container after apply: %w", err)
 	}
@@ -275,6 +278,104 @@ func testInstanceApply(h *TestHarness) error {
 		return fmt.Errorf("applying non-existent parameter group should fail")
 	}
 
+	// Test 13b: resize and move the port in place. The data must survive, the
+	// container must carry the new limits and binding, and the row must record
+	// the new shape while keeping the parameter group applied above.
+	newPort := instancePort + 1
+	probeDSN := func(port int) string {
+		return fmt.Sprintf("postgresql://postgres:%s@10.88.0.1:%d/postgres?sslmode=disable", password, port)
+	}
+	if err := execSQL(probeDSN(instancePort),
+		"CREATE TABLE reconfigure_probe(v text)", "INSERT INTO reconfigure_probe VALUES ('kept')"); err != nil {
+		return fmt.Errorf("write probe row before reconfigure: %w", err)
+	}
+	out, err := h.runCLI("instance", "apply", instanceName, "--ram", "1536M", "--port", strconv.Itoa(newPort))
+	if err != nil {
+		return fmt.Errorf("apply --ram --port failed: %w", err)
+	}
+	if !strings.Contains(out, "reconfigured successfully") || !strings.Contains(out, fmt.Sprintf("port %d", newPort)) {
+		return fmt.Errorf("apply output should report success on the new port: %s", out)
+	}
+	if err := h.waitForPostgreSQL(newPort); err != nil {
+		return fmt.Errorf("PostgreSQL did not come up on the new port: %w", err)
+	}
+	if conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("10.88.0.1:%d", instancePort), time.Second); dialErr == nil {
+		_ = conn.Close()
+		return fmt.Errorf("old port %d still answers after the move", instancePort)
+	}
+	var row struct {
+		Port           int    `json:"port"`
+		CPUCores       int    `json:"cpuCores"`
+		RAMMB          int    `json:"ramMb"`
+		ParameterGroup string `json:"parameterGroup"`
+		Status         string `json:"status"`
+	}
+	if code, body, reqErr := h.request("GET", "/api/rdbms/"+instanceName, nil); reqErr != nil || code != 200 {
+		return fmt.Errorf("get instance after reconfigure: code %d err %v", code, reqErr)
+	} else if err := json.Unmarshal(body, &row); err != nil {
+		return fmt.Errorf("parse instance after reconfigure: %w", err)
+	}
+	if row.Port != newPort || row.RAMMB != 1536 || row.CPUCores != 1 || row.ParameterGroup != "apply-test-group" || row.Status != "running" {
+		return fmt.Errorf("instance row after reconfigure = %+v, want port %d, ram 1536, cpu 1, group apply-test-group, running", row, newPort)
+	}
+	resized, err := h.inspectContainer(context.Background(), "oddk-pg-"+instanceName)
+	if err != nil {
+		return fmt.Errorf("inspect container after reconfigure: %w", err)
+	}
+	if want := int64(1536) << 20; resized.HostConfig.Memory != want || resized.HostConfig.ShmSize != want/4 {
+		return fmt.Errorf("container limits after reconfigure: memory %d shm %d, want %d / %d",
+			resized.HostConfig.Memory, resized.HostConfig.ShmSize, want, want/4)
+	}
+	boundPorts := map[string]bool{}
+	for _, bindings := range resized.HostConfig.PortBindings {
+		for _, b := range bindings {
+			boundPorts[b.HostPort] = true
+		}
+	}
+	if !boundPorts[strconv.Itoa(newPort)] || boundPorts[strconv.Itoa(instancePort)] {
+		return fmt.Errorf("container port bindings after reconfigure = %v, want only %d", boundPorts, newPort)
+	}
+	if got, err := querySQL(probeDSN(newPort), "SELECT v FROM reconfigure_probe"); err != nil || got != "kept" {
+		return fmt.Errorf("probe row after reconfigure = %q, err %v; the data volume must survive a resize", got, err)
+	}
+
+	// Test 13c: a refused change costs nothing. Both refusals happen before the
+	// running container is touched: a size the host cannot honour, and a port
+	// something on the host already answers on (a listener on the gateway,
+	// exactly what a stray process would look like).
+	if _, err := h.runCLI("instance", "apply", instanceName, "--cpu", "100000"); err == nil {
+		return fmt.Errorf("apply --cpu 100000 should be refused")
+	} else if !strings.Contains(err.Error(), "CPU cores") {
+		return fmt.Errorf("refusal should name the CPU bound: %v", err)
+	}
+	squatter, err := net.Listen("tcp", fmt.Sprintf("10.88.0.1:%d", newPort+1))
+	if err != nil {
+		return fmt.Errorf("listen on the gateway to simulate a port squatter: %w", err)
+	}
+	_, err = h.runCLI("instance", "apply", instanceName, "--port", strconv.Itoa(newPort+1))
+	_ = squatter.Close()
+	if err == nil {
+		return fmt.Errorf("apply --port onto a listening port should be refused")
+	} else if !strings.Contains(err.Error(), "already in use on this host") {
+		return fmt.Errorf("refusal should say the host port is taken: %v", err)
+	}
+	if code, body, reqErr := h.request("GET", "/api/rdbms/"+instanceName, nil); reqErr != nil || code != 200 {
+		return fmt.Errorf("get instance after refused reconfigure: code %d err %v", code, reqErr)
+	} else if err := json.Unmarshal(body, &row); err != nil {
+		return fmt.Errorf("parse instance after refused reconfigure: %w", err)
+	}
+	if row.Port != newPort || row.RAMMB != 1536 || row.Status != "running" {
+		return fmt.Errorf("a refused reconfigure changed the row: %+v", row)
+	}
+	if got, err := querySQL(probeDSN(newPort), "SELECT v FROM reconfigure_probe"); err != nil || got != "kept" {
+		return fmt.Errorf("instance must keep serving after a refused reconfigure: %q, %v", got, err)
+	}
+
+	// Test 13d: no flags at all is refused, not silently a no-op.
+	if _, err := h.runCLI("instance", "apply", instanceName); err == nil || !strings.Contains(err.Error(), "nothing to change") {
+		return fmt.Errorf("apply with no flags should be refused with 'nothing to change': %v", err)
+	}
+
 	// Test 14: Clean up
 	_, err = h.stopInstanceCLI(instanceName)
 	if err != nil {
@@ -292,4 +393,34 @@ func testInstanceApply(h *TestHarness) error {
 	}
 
 	return nil
+}
+
+// execSQL runs statements against dsn with the lib/pq driver, one connection,
+// stopping at the first failure.
+func execSQL(dsn string, statements ...string) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("%s: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
+// querySQL runs a single-value query against dsn.
+func querySQL(dsn, query string) (string, error) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = db.Close() }()
+	var v string
+	if err := db.QueryRow(query).Scan(&v); err != nil {
+		return "", err
+	}
+	return v, nil
 }

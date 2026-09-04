@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/andrianbdn/oddk/internal/operations"
@@ -126,6 +127,12 @@ func (s *Server) handleDeleteDatabaseUser(w http.ResponseWriter, r *http.Request
 		InstanceName: name,
 		Username:     username,
 	}
+
+	// REASSIGN OWNED BY locks every object the user owns in one transaction and
+	// can outlive the server's WriteTimeout on a large database. Without this
+	// the operation completed on the daemon while the CLI read a bare EOF and
+	// reported a failure for a user that was, in fact, gone.
+	s.clearWriteDeadline(w, fmt.Sprintf("delete-db-user %s/%s", name, username))
 
 	result, err := s.executor.DeleteDatabaseUserOp(context.Background(), s.opDeps, params)
 	if err != nil {

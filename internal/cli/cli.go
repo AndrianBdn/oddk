@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,7 +47,7 @@ func Run(args, env []string, out io.Writer) error {
 	client, err := NewClient(env, out)
 	if err != nil {
 		// If it's just missing auth token, don't fail but print help
-		if strings.Contains(err.Error(), "auth token not configured") {
+		if errors.Is(err, errAuthTokenNotConfigured) {
 			// Continue with nil client for help display
 			client = &Client{out: out, envMap: parseEnv(env)}
 		} else {
@@ -156,7 +157,7 @@ func NewClient(env []string, out io.Writer) (*Client, error) {
   "daemonUrl": "http://localhost:5442",
   "authToken": "YOUR_TOKEN_HERE"
 }`)
-		return nil, fmt.Errorf("auth token not configured")
+		return nil, errAuthTokenNotConfigured
 	}
 
 	return &Client{
@@ -177,12 +178,27 @@ func parseEnv(env []string) map[string]string {
 	return result
 }
 
+// errAuthTokenNotConfigured is returned by NewClient when no CLI config holds a
+// token. Run matches it to keep --help working without one.
+var errAuthTokenNotConfigured = errors.New("auth token not configured")
+
+// apiError is a refusal from the daemon: the HTTP status plus the message from
+// the response body. Its text is exactly the daemon's message, so nothing the
+// operator sees changes; it exists so an action that adds a hint for one kind
+// of refusal can check the status instead of only the wording.
+type apiError struct {
+	Status  int
+	Message string
+}
+
+func (e *apiError) Error() string { return e.Message }
+
 func (c *Client) request(method, path string, body any) ([]byte, error) {
 	// Run() builds a config-less client when no auth token is found so that
 	// --help still works; any command that actually reaches the daemon must
 	// fail cleanly here instead of dereferencing a nil config.
 	if c.config == nil {
-		return nil, fmt.Errorf("auth token not configured (see ~/.config/oddk/cli.json)")
+		return nil, fmt.Errorf("%w (see ~/.config/oddk/cli.json)", errAuthTokenNotConfigured)
 	}
 
 	url := c.config.DaemonURL + path
@@ -224,9 +240,12 @@ func (c *Client) request(method, path string, body any) ([]byte, error) {
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-			return nil, fmt.Errorf("%s", errResp.Error)
+			return nil, &apiError{Status: resp.StatusCode, Message: errResp.Error}
 		}
-		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, respBody)
+		return nil, &apiError{
+			Status:  resp.StatusCode,
+			Message: fmt.Sprintf("request failed with status %d: %s", resp.StatusCode, respBody),
+		}
 	}
 
 	return respBody, nil

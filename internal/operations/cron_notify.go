@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -169,7 +170,7 @@ func (r *cronRunReporter) notify(ctx context.Context, subject, body string) {
 	// "no notifications configured" is the common case on a fresh install and is
 	// not a problem worth a warning every night — the run itself is unaffected
 	// either way, so no notification failure may ever fail the cron task.
-	if strings.Contains(err.Error(), "no notifications configured") {
+	if errors.Is(err, services.ErrNoNotificationsConfigured) {
 		return
 	}
 	log.Printf("Warning: cron: could not send the %q notification for %s: %v", subject, r.label, err)

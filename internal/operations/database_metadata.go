@@ -148,7 +148,7 @@ func buildCreateDatabaseSQL(targetName string, m DatabaseMeta, withOwner bool) s
 // parseMajorVersion extracts the leading integer major version from strings
 // like "17", "17.2", or "18".
 func parseMajorVersion(v string) (int, bool) {
-	major := strings.SplitN(strings.TrimSpace(v), ".", 2)[0]
+	major, _, _ := strings.Cut(strings.TrimSpace(v), ".")
 	n, err := strconv.Atoi(major)
 	if err != nil {
 		return 0, false

@@ -390,13 +390,24 @@ func instanceCommands(client *Client) *cli.Command {
 			},
 			{
 				Name:      "apply",
-				Usage:     "Apply a new parameter group to instance",
+				Usage:     "Reconfigure an instance in place: parameter group, CPU, RAM and/or port (recreates the container; the data volume is kept)",
 				ArgsUsage: "<instance-name>",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
-						Name:     "parameter-group",
-						Required: true,
-						Usage:    "Parameter group name to apply",
+						Name:  "parameter-group",
+						Usage: "Parameter group name to apply",
+					},
+					&cli.IntFlag{
+						Name:  "cpu",
+						Usage: "New CPU core count",
+					},
+					&cli.StringFlag{
+						Name:  "ram",
+						Usage: "New RAM in GB (default) or with suffix M/MB/MiB for megabytes",
+					},
+					&cli.IntFlag{
+						Name:  "port",
+						Usage: "New port number",
 					},
 				},
 				Action: client.applyAction,

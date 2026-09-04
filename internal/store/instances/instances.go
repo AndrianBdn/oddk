@@ -152,7 +152,8 @@ func (s *InstanceStore) UpdateResources(name string, port, cpuCores, ramMB int) 
 	now := rfc3339time.Now()
 	result, err := s.db.Exec(
 		`UPDATE rdbms_instances SET port = ?, cpu_cores = ?, ram_mb = ?, updated_at = ? WHERE name = ?`,
-		port, cpuCores, ramMB, now, name)
+		port, cpuCores, ramMB, now, name,
+	)
 	if err != nil {
 		return fmt.Errorf("update resources: %w", err)
 	}

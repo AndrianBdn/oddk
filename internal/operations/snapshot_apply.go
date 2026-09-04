@@ -84,6 +84,12 @@ type SnapshotApplyPlan struct {
 	Instances    []*InstanceMeta
 	Checks       []PreflightCheck
 
+	// LogicalInputs holds, per logically captured instance, what its dumps
+	// declare (databases.json, the roles in globals.sql). Read in preflight so
+	// a truncated logical archive is refused before oddk.db and master.key are
+	// replaced, and carried into the rebuild so it is read exactly once.
+	LogicalInputs map[string]*logicalRestoreInputs
+
 	// ExistingKeyPath is set when the target already has a master.key that
 	// will be displaced (the normal case: the installer started the daemon,
 	// which generated one).
@@ -284,13 +290,26 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 	if err != nil {
 		return fail("Instance configuration is readable", "", err)
 	}
+	plan.LogicalInputs = make(map[string]*logicalRestoreInputs)
 	for _, entry := range manifest.Instances {
-		if !entry.HasData || entryFormat(entry) != SnapshotFormatPhysical {
+		if !entry.HasData {
 			continue
 		}
-		if err := verifyPhysicalStaging(filepath.Join(extractedDir, snapshotInstancesDir, entry.Name), entry.Name); err != nil {
+		instanceDir := filepath.Join(extractedDir, snapshotInstancesDir, entry.Name)
+		if entryFormat(entry) == SnapshotFormatPhysical {
+			if err := verifyPhysicalStaging(instanceDir, entry.Name); err != nil {
+				return fail("Instance configuration is readable", "", err)
+			}
+			continue
+		}
+		// Logical entries prove the same thing through their dumps' metadata.
+		// It used to be read after the master key had been replaced, which
+		// turned a truncated archive into an apply that could not be retried.
+		inputs, err := readLogicalRestoreInputs(instanceDir, entry.Name)
+		if err != nil {
 			return fail("Instance configuration is readable", "", err)
 		}
+		plan.LogicalInputs[entry.Name] = inputs
 	}
 	plan.Instances = instances
 
@@ -328,13 +347,24 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 // ODDK's own state rather than the host in general.
 const noChangesSuffix = "No ODDK state on this host was modified."
 
+// noChangesError is a preflight refusal carrying the promise. It wraps the
+// refusal so operr markers still classify it, and appendNoChanges recognises it
+// by type rather than by searching the message.
+type noChangesError struct{ err error }
+
+func (e *noChangesError) Error() string { return e.err.Error() + ". " + noChangesSuffix }
+func (e *noChangesError) Unwrap() error { return e.err }
+
 // appendNoChanges guarantees the promise appears on EVERY refusal path rather
 // than only the ones someone remembered to write it into.
 func appendNoChanges(err error) error {
-	if err == nil || strings.Contains(err.Error(), noChangesSuffix) {
+	if err == nil {
+		return nil
+	}
+	if _, already := errors.AsType[*noChangesError](err); already {
 		return err
 	}
-	return fmt.Errorf("%w. %s", err, noChangesSuffix)
+	return &noChangesError{err: err}
 }
 
 // ReadSnapshotManifestFromArchive streams the archive only as far as its
@@ -451,6 +481,8 @@ func existingInstanceNames(dataDir string) ([]string, error) {
 	if err := db.Select(&names, `SELECT name FROM rdbms_instances ORDER BY name`); err != nil {
 		// A database with no rdbms_instances table is not a usable ODDK store;
 		// treat it as an empty deployment rather than blocking recovery on it.
+		// Matched on the text because SQLite reports it as the generic
+		// SQLITE_ERROR (code 1) — there is no specific code to test.
 		if strings.Contains(err.Error(), "no such table") {
 			return nil, nil
 		}
@@ -534,15 +566,9 @@ func checkPortsAvailable(instances []*InstanceMeta) error {
 		}
 		seen[meta.Port] = meta.Name
 
-		// Instances bind the bridge gateway, which is host-local. If the bridge
-		// does not exist yet the dial simply fails, which is the correct answer:
-		// nothing can be listening there.
-		addr := net.JoinHostPort(util.GatewayIP, strconv.Itoa(meta.Port))
-		conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return operr.Conflictf("instance %q needs port %d but something already answers on %s; free it, or destroy whatever holds it. Nothing was modified",
-				meta.Name, meta.Port, addr)
+		if hostPortAnswers(meta.Port) {
+			return operr.Conflictf("instance %q needs port %d but something already answers on %s:%d; free it, or destroy whatever holds it. Nothing was modified",
+				meta.Name, meta.Port, util.GatewayIP, meta.Port)
 		}
 	}
 	return nil
@@ -731,16 +757,16 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 	return result, nil
 }
 
-// rebuildInstanceFromSnapshot creates the instance's volume and container with
-// the password recorded in the restored store, waits for readiness, and
-// restores its data — replaying dumps for a logical entry, streaming the
-// archived cluster into the volume for a physical one.
+// rebuildInstanceFromSnapshot marks the instance restoring, resolves what the
+// rebuild needs from the restored store (the password, the parameter group),
+// and hands the cluster build to rebuildInstanceCluster — the same function
+// restore-instance uses, so the two cannot diverge on the destructive part.
 //
-// The password is the crux either way: a logical rebuild initialises the
-// cluster with the very plaintext the source host used (so globals.sql's ALTER
-// ROLE postgres is a no-op), and a physical rebuild arrives with the source's
-// password hash inside pg_authid, so only that same plaintext authenticates.
-// That is the whole reason the master key is required.
+// The password is the crux: a logical rebuild initialises the cluster with the
+// very plaintext the source host used (so globals.sql's ALTER ROLE postgres is
+// a no-op), and a physical rebuild arrives with the source's password hash
+// inside pg_authid, so only that same plaintext authenticates. That is the
+// whole reason the master key is required.
 func rebuildInstanceFromSnapshot(
 	ctx context.Context,
 	deps *Dependencies,
@@ -796,119 +822,16 @@ func rebuildInstanceFromSnapshot(
 		parameterGroup = group
 	}
 
-	physical := entryFormat(entry) == SnapshotFormatPhysical
-	// Neither format gets the instance's real password: whatever is handed to
-	// the entrypoint stays in Docker's container config for the container's
-	// lifetime (see docker.containerEnv).
-	//   physical — the volume is filled BEFORE the first start, so the
-	//     entrypoint skips initdb and reads nothing; the restored cluster
-	//     brings the source's own postgres role with it.
-	//   logical  — initdb runs, so it needs a password: it gets a throwaway,
-	//     which the ALTER after readiness replaces with the real one (and
-	//     globals.sql then re-asserts the same value from the source's hash).
-	initdbPassword := ""
-	if !physical {
-		initdbPassword = newInitdbCredential()
-	}
-
-	containerID, err := deps.Docker.CreateContainer(
-		meta.Name, meta.Version, meta.Image, meta.Port, initdbPassword,
-		meta.CPUCores, meta.RAMMB, meta.ParameterGroup, parameterGroup.Parameters,
-	)
-	if err != nil {
-		return fmt.Errorf("create container: %w", err)
-	}
-	if err := deps.Store.Instances.UpdateContainerID(meta.Name, containerID); err != nil {
-		return fmt.Errorf("record container id: %w", err)
-	}
-
-	instanceDir := filepath.Join(plan.ExtractedDir, snapshotInstancesDir, meta.Name)
-
-	if physical {
-		// The volume must be filled BEFORE the container's first start: the
-		// entrypoint sees PG_VERSION and skips initdb, so the archived cluster
-		// — roles, per-database GUCs, ACLs, collation state and all — comes up
-		// as-is, recovered to consistency by PostgreSQL itself.
-		if err := restorePhysicalIntoCreatedContainer(ctx, deps, containerID, meta.Version, instanceDir); err != nil {
-			return err
-		}
-		emitLine(progress, "  ✓ Volume created and cluster files restored")
-		if err := deps.Docker.StartContainer(containerID); err != nil {
-			return fmt.Errorf("start container: %w", err)
-		}
-		if err := waitForPostgresReady(ctx, meta.Port, password); err != nil {
-			return fmt.Errorf("restored cluster did not become ready: %w", err)
-		}
-		count, countErr := countUserDatabases(ctx, meta.Port, password)
-		if countErr != nil {
-			return fmt.Errorf("verify restored cluster: %w", countErr)
-		}
-		emitLine(progress, "  ✓ PostgreSQL recovered; serving %d database(s)", count)
-
-		if entry.CaptureMode == captureModeCold {
-			// The instance was STOPPED when captured; reproduce that. It was
-			// still started once above — deliberately, because a restore whose
-			// cluster has never reached readiness is not a verified restore.
-			if err := deps.Docker.StopContainer(containerID); err != nil {
-				return fmt.Errorf("stop cold-captured instance after verification: %w", err)
-			}
-			if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusStopped); err != nil {
-				return fmt.Errorf("mark instance stopped: %w", err)
-			}
-			emitLine(progress, "  ✓ Instance left stopped, matching its state when the snapshot was taken")
-			return nil
-		}
-		if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
-			return fmt.Errorf("mark instance running: %w", err)
-		}
-		return nil
-	}
-
-	if err := deps.Docker.StartContainer(containerID); err != nil {
-		return fmt.Errorf("start container: %w", err)
-	}
-	emitLine(progress, "  ✓ Volume and container created")
-
-	if err := waitForPostgresReady(ctx, meta.Port, initdbPassword); err != nil {
-		return fmt.Errorf("cluster did not become ready: %w", err)
-	}
-	if err := adoptPostgresPassword(ctx, meta.Port, initdbPassword, password); err != nil {
-		return fmt.Errorf("set the instance password: %w", err)
-	}
-	emitLine(progress, "  ✓ PostgreSQL ready")
-
-	dbs, found, err := readDatabaseMetadata(instanceDir)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return fmt.Errorf("archive has no %s for instance %s", databaseMetadataFile, meta.Name)
-	}
-
-	roleNames, err := roleNamesFromGlobals(filepath.Join(instanceDir, "globals.sql"))
-	if err != nil {
-		return err
-	}
-
-	restored, err := RestoreClusterFromArchive(ctx, deps, RestoreClusterParams{
-		InstanceName:  meta.Name,
-		Image:         meta.Image,
-		Port:          meta.Port,
-		Password:      password,
-		CPUCores:      meta.CPUCores,
-		ExtractedDir:  instanceDir,
-		Databases:     dbs,
-		ExpectedRoles: roleNames,
+	_, err = rebuildInstanceCluster(ctx, deps, instanceRebuild{
+		meta:        meta,
+		entry:       entry,
+		parameters:  parameterGroup.Parameters,
+		password:    password,
+		instanceDir: filepath.Join(plan.ExtractedDir, snapshotInstancesDir, meta.Name),
+		logical:     plan.LogicalInputs[meta.Name],
+		progress:    progress,
 	})
-	if err != nil {
-		return err // the deferred handler records "error"
-	}
-	emitLine(progress, "  ✓ Roles and %d database(s) restored", restored)
-
-	if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
-		return fmt.Errorf("mark instance running: %w", err)
-	}
-	return nil
+	return err
 }
 
 // checkSnapshotArch refuses a snapshot with physical data captured on a
@@ -925,7 +848,8 @@ func checkSnapshotArch(manifest *SnapshotManifest) error {
 	}
 	return operr.Invalidf(
 		"snapshot holds physical data directories captured on %s, but this host is %s; physical clusters are not portable across architectures. Restore on a %s host, or take a --logical snapshot on the source",
-		manifest.SourceArch, runtime.GOARCH, manifest.SourceArch)
+		manifest.SourceArch, runtime.GOARCH, manifest.SourceArch,
+	)
 }
 
 // manifestHasPhysicalData reports whether any entry carries a physical capture.

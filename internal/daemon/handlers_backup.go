@@ -295,6 +295,11 @@ func (s *Server) handleRemoveRemoteBackup(w http.ResponseWriter, r *http.Request
 		result: &result,
 	}
 
+	// One S3 DeleteObject is short in the normal case, but it is a network
+	// call with no bound of its own; a stall must not surface as a bare EOF
+	// while the daemon completes the removal behind it.
+	s.clearWriteDeadline(w, "backup remove-remote")
+
 	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeOpError(w, err)
 		return

@@ -17,15 +17,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/client"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/andrianbdn/oddk/internal/cli"
 	"github.com/andrianbdn/oddk/internal/daemon"
@@ -105,10 +102,7 @@ func setupTestHarness(testName string, kvMap map[string]string, runFakeS3 bool) 
 		panic(fmt.Sprintf("Server didn't start in time: %v", err))
 	}
 
-	dockerClient, err := client.NewClientWithOpts(
-		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
-	)
+	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create Docker client: %v", err))
 	}
@@ -243,20 +237,18 @@ func (h *TestHarness) cleanupTestContainersAndVolumes(verbose bool) {
 	ctx := context.Background()
 
 	// List containers with our test prefix
-	containers, err := h.docker.ContainerList(ctx, container.ListOptions{
-		All: true,
-		Filters: filters.NewArgs(
-			filters.Arg("name", testPrefix),
-		),
+	containers, err := h.docker.ContainerList(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: make(client.Filters).Add("name", testPrefix),
 	})
 	if err != nil {
 		fmt.Printf("Warning: Failed to list containers for cleanup: %v\n", err)
 		return
 	}
 
-	for _, c := range containers {
+	for _, c := range containers.Items {
 		// Force remove container
-		if err := h.docker.ContainerRemove(ctx, c.ID, container.RemoveOptions{
+		if _, err := h.docker.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{
 			Force:         true,
 			RemoveVolumes: true,
 		}); err != nil {
@@ -267,15 +259,15 @@ func (h *TestHarness) cleanupTestContainersAndVolumes(verbose bool) {
 	}
 
 	// List all volumes
-	volumes, err := h.docker.VolumeList(ctx, volume.ListOptions{})
+	volumes, err := h.docker.VolumeList(ctx, client.VolumeListOptions{})
 	if err != nil {
 		fmt.Printf("Warning: Failed to list volumes for cleanup: %v\n", err)
 		return
 	}
 
-	for _, vol := range volumes.Volumes {
+	for _, vol := range volumes.Items {
 		if strings.Contains(vol.Name, testPrefix) {
-			if err := h.docker.VolumeRemove(ctx, vol.Name, true); err != nil {
+			if _, err := h.docker.VolumeRemove(ctx, vol.Name, client.VolumeRemoveOptions{Force: true}); err != nil {
 				fmt.Printf("Warning: Failed to remove volume %s: %v\n", vol.Name, err)
 			} else if verbose {
 				fmt.Printf("Cleaned up volume: %s\n", vol.Name)
@@ -286,10 +278,7 @@ func (h *TestHarness) cleanupTestContainersAndVolumes(verbose bool) {
 
 // cleanupAllTestContainers is a standalone function for global cleanup
 func cleanupAllTestContainers() error {
-	dockerClient, err := client.NewClientWithOpts(
-		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
-	)
+	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		return fmt.Errorf("failed to create Docker client: %w", err)
 	}
@@ -552,13 +541,20 @@ func (h *TestHarness) updateInstanceWithImageCLI(instanceName, image string) (st
 // retagImage points a local tag at the same image another tag/name resolves to
 // (docker tag), used to simulate a re-pulled patch (same tag, new image ID).
 func (h *TestHarness) retagImage(source, target string) error {
-	return h.docker.ImageTag(context.Background(), source, target)
+	_, err := h.docker.ImageTag(context.Background(), client.ImageTagOptions{Source: source, Target: target})
+	return err
+}
+
+// inspectContainer returns a container's inspect data by name or ID.
+func (h *TestHarness) inspectContainer(ctx context.Context, nameOrID string) (container.InspectResponse, error) {
+	res, err := h.docker.ContainerInspect(ctx, nameOrID, client.ContainerInspectOptions{})
+	return res.Container, err
 }
 
 // removeImage force-removes a local image (best-effort), used to force a real
 // download path. A missing image is not an error.
 func (h *TestHarness) removeImage(ref string) {
-	_, _ = h.docker.ImageRemove(context.Background(), ref, image.RemoveOptions{Force: true})
+	_, _ = h.docker.ImageRemove(context.Background(), ref, client.ImageRemoveOptions{Force: true})
 }
 
 // waitForTCP waits for a TCP port to be accessible
@@ -598,8 +594,7 @@ func (h *TestHarness) waitForPostgreSQL(port int) error {
 		cancel()
 		lastErr = err
 
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) {
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 			switch pgErr.Code {
 			case "57P03", "57P02", "57P01": // starting up / in recovery / shutting down
 				// not ready yet — keep waiting
@@ -614,11 +609,11 @@ func (h *TestHarness) waitForPostgreSQL(port int) error {
 
 // imageExists reports whether an image tag is present locally.
 func (h *TestHarness) imageExists(tag string) (string, bool) {
-	images, err := h.docker.ImageList(context.Background(), image.ListOptions{All: true})
+	images, err := h.docker.ImageList(context.Background(), client.ImageListOptions{All: true})
 	if err != nil {
 		return "", false
 	}
-	for _, img := range images {
+	for _, img := range images.Items {
 		if slices.Contains(img.RepoTags, tag) {
 			return img.ID, true
 		}

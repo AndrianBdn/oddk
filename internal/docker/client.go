@@ -7,22 +7,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/go-connections/nat"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 
 	"github.com/andrianbdn/oddk/internal/store/parameters"
 	"github.com/andrianbdn/oddk/internal/util"
@@ -108,17 +106,15 @@ func NewClient() (*Client, error) {
 		return nil, fmt.Errorf("docker socket not found")
 	}
 
-	cli, err := client.NewClientWithOpts(
-		client.WithHost("unix://"+dockerSocket),
-		client.WithAPIVersionNegotiation(),
-	)
+	// API-version negotiation with the daemon is the client's default.
+	cli, err := client.New(client.WithHost("unix://" + dockerSocket))
 	if err != nil {
 		return nil, fmt.Errorf("create docker client: %w", err)
 	}
 
 	ctx := context.Background()
 
-	if _, err := cli.Ping(ctx); err != nil {
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
 		return nil, fmt.Errorf("docker daemon not responding: %w", err)
 	}
 
@@ -135,25 +131,25 @@ func NewClient() (*Client, error) {
 }
 
 func (c *Client) ensureNetwork() error {
-	networks, err := c.cli.NetworkList(c.ctx, network.ListOptions{})
+	networks, err := c.cli.NetworkList(c.ctx, client.NetworkListOptions{})
 	if err != nil {
 		return fmt.Errorf("list networks: %w", err)
 	}
 
-	for _, net := range networks {
+	for _, net := range networks.Items {
 		if net.Name == util.OddkNetworkName {
 			log.Println("Network oddk-bridge already exists")
 			return nil
 		}
 	}
 
-	_, err = c.cli.NetworkCreate(c.ctx, util.OddkNetworkName, network.CreateOptions{
+	_, err = c.cli.NetworkCreate(c.ctx, util.OddkNetworkName, client.NetworkCreateOptions{
 		Driver: "bridge",
 		IPAM: &network.IPAM{
 			Config: []network.IPAMConfig{
 				{
-					Subnet:  util.OddkSubnet,
-					Gateway: util.GatewayIP,
+					Subnet:  netip.MustParsePrefix(util.OddkSubnet),
+					Gateway: netip.MustParseAddr(util.GatewayIP),
 				},
 			},
 		},
@@ -175,18 +171,18 @@ func (c *Client) ensureNetwork() error {
 // keeping every instance container attached is what protects oddk-bridge
 // from 'docker network prune'. Returns true if a connect was performed.
 func (c *Client) EnsureContainerOnNetwork(containerID string) (bool, error) {
-	inspect, err := c.cli.ContainerInspect(c.ctx, containerID)
+	inspect, err := c.cli.ContainerInspect(c.ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return false, fmt.Errorf("inspect container: %w", err)
 	}
 
-	if inspect.NetworkSettings != nil {
-		if _, attached := inspect.NetworkSettings.Networks[util.OddkNetworkName]; attached {
+	if inspect.Container.NetworkSettings != nil {
+		if _, attached := inspect.Container.NetworkSettings.Networks[util.OddkNetworkName]; attached {
 			return false, nil
 		}
 	}
 
-	if err := c.cli.NetworkConnect(c.ctx, util.OddkNetworkName, containerID, nil); err != nil {
+	if _, err := c.cli.NetworkConnect(c.ctx, util.OddkNetworkName, client.NetworkConnectOptions{Container: containerID}); err != nil {
 		return false, fmt.Errorf("connect container to oddk-bridge: %w", err)
 	}
 	return true, nil
@@ -246,12 +242,12 @@ func ParsePGMajorEnv(env []string) (int, bool) {
 // variable: the volume mount target for PG <= 17, <target>/<major>/docker for
 // PG 18+.
 func (c *Client) ContainerPGData(containerID, version string) (string, error) {
-	inspect, err := c.cli.ContainerInspect(c.ctx, containerID)
+	inspect, err := c.cli.ContainerInspect(c.ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return "", fmt.Errorf("inspect container: %w", err)
 	}
-	if inspect.Config != nil {
-		for _, env := range inspect.Config.Env {
+	if inspect.Container.Config != nil {
+		for _, env := range inspect.Container.Config.Env {
 			if value, ok := strings.CutPrefix(env, "PGDATA="); ok && value != "" {
 				return value, nil
 			}
@@ -264,9 +260,100 @@ func (c *Client) ContainerPGData(containerID, version string) (string, error) {
 	return target, nil
 }
 
+// pgPort is the port PostgreSQL listens on inside every instance container.
+var pgPort = network.MustParsePort("5432/tcp")
+
+// instanceContainerSpec is everything Docker needs to create an instance
+// container. buildInstanceContainer produces it for both create and recreate,
+// so the two paths cannot drift apart on a limit, a label or a log setting.
+type instanceContainerSpec struct {
+	config     *container.Config
+	hostConfig *container.HostConfig
+	networking *network.NetworkingConfig
+}
+
+func buildInstanceContainer(name, version, imageName string, port, cpuCores, ramMB int, password, parameterGroupName string, resolvedParams []parameters.ResolvedParameter) instanceContainerSpec {
+	// Convert RAM MB to bytes
+	memLimit := int64(ramMB * 1024 * 1024)
+
+	// Calculate CPU shares based on core count (1024 per core is Docker's default)
+	cpuShares := int64(cpuCores * 1024)
+
+	// Set shared memory size as a percentage of RAM (typically 25% of RAM for PostgreSQL)
+	shmSize := memLimit / 4
+
+	cmd := []string{"postgres"}
+	for _, param := range resolvedParams {
+		if param.Type == "postgres_cli_arg" {
+			cmd = append(cmd, "-c", fmt.Sprintf("%s=%s", param.Name, param.Value))
+		}
+	}
+
+	config := &container.Config{
+		Image:        imageName,
+		Env:          containerEnv(password),
+		Cmd:          cmd,
+		ExposedPorts: network.PortSet{pgPort: struct{}{}},
+		Labels: map[string]string{
+			"io.hpsq.oddk.instancename": name,
+			"io.hpsq.oddk.pgroup":       parameterGroupName,
+		},
+	}
+
+	hostConfig := &container.HostConfig{
+		PortBindings: network.PortMap{
+			pgPort: []network.PortBinding{
+				{
+					HostIP:   netip.MustParseAddr(util.GatewayIP),
+					HostPort: strconv.Itoa(port),
+				},
+			},
+		},
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeVolume,
+				Source: VolumeName(name),
+				Target: pgDataMountTarget(version),
+			},
+		},
+		Memory:    memLimit,
+		CPUShares: cpuShares,
+		RestartPolicy: container.RestartPolicy{
+			Name: container.RestartPolicyUnlessStopped,
+		},
+		ShmSize: shmSize,
+		LogConfig: container.LogConfig{
+			Type: "json-file",
+			Config: map[string]string{
+				"max-size": "5m",
+				"max-file": "2",
+			},
+		},
+	}
+
+	networking := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			util.OddkNetworkName: {},
+		},
+	}
+	return instanceContainerSpec{config: config, hostConfig: hostConfig, networking: networking}
+}
+
+func (c *Client) createContainer(name string, spec instanceContainerSpec) (string, error) {
+	resp, err := c.cli.ContainerCreate(c.ctx, client.ContainerCreateOptions{
+		Config:           spec.config,
+		HostConfig:       spec.hostConfig,
+		NetworkingConfig: spec.networking,
+		Name:             ContainerName(name),
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
+}
+
 func (c *Client) CreateContainer(name, version, image string, port int, password string, cpuCores, ramMB int, parameterGroupName string, parameterGroupParams []parameters.Parameter) (string, error) {
 	volumeName := VolumeName(name)
-	containerName := ContainerName(name)
 	imageName := image
 
 	// Verify the image exists locally
@@ -288,103 +375,32 @@ func (c *Client) CreateContainer(name, version, image string, port int, password
 	}
 
 	// Check if volume already exists - we don't support adopting existing volumes
-	_, err = c.cli.VolumeInspect(c.ctx, volumeName)
+	_, err = c.cli.VolumeInspect(c.ctx, volumeName, client.VolumeInspectOptions{})
 	if err == nil {
 		return "", preflightErrorf("volume %s already exists. ODDK does not support adopting existing volumes. Please remove the existing volume or use a different instance name", volumeName)
 	}
+	if !cerrdefs.IsNotFound(err) {
+		return "", preflightErrorf("inspect volume %s: %w", volumeName, err)
+	}
 
-	_, err = c.cli.VolumeCreate(c.ctx, volume.CreateOptions{
-		Name: volumeName,
-	})
-	if err != nil {
+	if _, err := c.cli.VolumeCreate(c.ctx, client.VolumeCreateOptions{Name: volumeName}); err != nil {
 		return "", fmt.Errorf("create volume: %w", err)
 	}
 
-	// Convert RAM MB to bytes
-	memLimit := int64(ramMB * 1024 * 1024)
-
-	// Calculate CPU shares based on core count (1024 per core is Docker's default)
-	cpuShares := int64(cpuCores * 1024)
-
-	// Set shared memory size as a percentage of RAM (typically 25% of RAM for PostgreSQL)
-	shmSize := memLimit / 4
-
-	exposedPorts := nat.PortSet{
-		"5432/tcp": struct{}{},
-	}
-
-	portBindings := nat.PortMap{
-		"5432/tcp": []nat.PortBinding{
-			{
-				HostIP:   util.GatewayIP,
-				HostPort: fmt.Sprintf("%d", port),
-			},
-		},
-	}
-
-	cmd := []string{"postgres"}
-	for _, param := range resolvedParams {
-		if param.Type == "postgres_cli_arg" {
-			cmd = append(cmd, "-c", fmt.Sprintf("%s=%s", param.Name, param.Value))
-		}
-	}
-
-	config := &container.Config{
-		Image:        imageName,
-		Env:          containerEnv(password),
-		Cmd:          cmd,
-		ExposedPorts: exposedPorts,
-		Labels: map[string]string{
-			"io.hpsq.oddk.instancename": name,
-			"io.hpsq.oddk.pgroup":       parameterGroupName,
-		},
-	}
-
-	hostConfig := &container.HostConfig{
-		PortBindings: portBindings,
-		Mounts: []mount.Mount{
-			{
-				Type:   mount.TypeVolume,
-				Source: volumeName,
-				Target: pgDataMountTarget(version),
-			},
-		},
-		Resources: container.Resources{
-			Memory:    memLimit,
-			CPUShares: cpuShares,
-		},
-		RestartPolicy: container.RestartPolicy{
-			Name: "unless-stopped",
-		},
-		ShmSize: shmSize,
-		LogConfig: container.LogConfig{
-			Type: "json-file",
-			Config: map[string]string{
-				"max-size": "5m",
-				"max-file": "2",
-			},
-		},
-	}
-
-	networkConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			util.OddkNetworkName: {},
-		},
-	}
-
-	resp, err := c.cli.ContainerCreate(c.ctx, config, hostConfig, networkConfig, nil, containerName)
+	spec := buildInstanceContainer(name, version, imageName, port, cpuCores, ramMB, password, parameterGroupName, resolvedParams)
+	containerID, err := c.createContainer(name, spec)
 	if err != nil {
-		if rmErr := c.cli.VolumeRemove(c.ctx, volumeName, true); rmErr != nil {
+		if _, rmErr := c.cli.VolumeRemove(c.ctx, volumeName, client.VolumeRemoveOptions{Force: true}); rmErr != nil {
 			log.Printf("Error removing volume after container creation failure: %v", rmErr)
 		}
 		return "", fmt.Errorf("create container: %w", err)
 	}
 
-	return resp.ID, nil
+	return containerID, nil
 }
 
 func (c *Client) StartContainer(containerID string) error {
-	if err := c.cli.ContainerStart(c.ctx, containerID, container.StartOptions{}); err != nil {
+	if _, err := c.cli.ContainerStart(c.ctx, containerID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("start container: %w", err)
 	}
 
@@ -423,7 +439,7 @@ func (c *Client) RecreateContainer(name, version, image string, port, cpuCores, 
 		return "", preflightErrorf("%w", err)
 	}
 
-	if _, err := c.cli.VolumeInspect(c.ctx, volumeName); err != nil {
+	if _, err := c.cli.VolumeInspect(c.ctx, volumeName, client.VolumeInspectOptions{}); err != nil {
 		return "", preflightErrorf("volume %s not found: %w", volumeName, err)
 	}
 
@@ -448,89 +464,18 @@ func (c *Client) RecreateContainer(name, version, image string, port, cpuCores, 
 		return "", fmt.Errorf("remove leftover container %s: %w", containerName, err)
 	}
 
-	// Convert RAM MB to bytes
-	memLimit := int64(ramMB * 1024 * 1024)
-
-	// Calculate CPU shares based on core count (1024 per core is Docker's default)
-	cpuShares := int64(cpuCores * 1024)
-
-	// Set shared memory size as a percentage of RAM (typically 25% of RAM for PostgreSQL)
-	shmSize := memLimit / 4
-
-	exposedPorts := nat.PortSet{
-		"5432/tcp": struct{}{},
-	}
-
-	portBindings := nat.PortMap{
-		"5432/tcp": []nat.PortBinding{
-			{
-				HostIP:   util.GatewayIP,
-				HostPort: fmt.Sprintf("%d", port),
-			},
-		},
-	}
-
-	cmd := []string{"postgres"}
-	for _, param := range resolvedParams {
-		if param.Type == "postgres_cli_arg" {
-			cmd = append(cmd, "-c", fmt.Sprintf("%s=%s", param.Name, param.Value))
-		}
-	}
-
-	config := &container.Config{
-		Image:        imageName,
-		Env:          containerEnv(""),
-		Cmd:          cmd,
-		ExposedPorts: exposedPorts,
-		Labels: map[string]string{
-			"io.hpsq.oddk.instancename": name,
-			"io.hpsq.oddk.pgroup":       parameterGroupName,
-		},
-	}
-
-	hostConfig := &container.HostConfig{
-		PortBindings: portBindings,
-		Mounts: []mount.Mount{
-			{
-				Type:   mount.TypeVolume,
-				Source: volumeName,
-				Target: pgDataMountTarget(version),
-			},
-		},
-		Resources: container.Resources{
-			Memory:    memLimit,
-			CPUShares: cpuShares,
-		},
-		RestartPolicy: container.RestartPolicy{
-			Name: "unless-stopped",
-		},
-		ShmSize: shmSize,
-		LogConfig: container.LogConfig{
-			Type: "json-file",
-			Config: map[string]string{
-				"max-size": "5m",
-				"max-file": "2",
-			},
-		},
-	}
-
-	networkConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			util.OddkNetworkName: {},
-		},
-	}
-
-	resp, err := c.cli.ContainerCreate(c.ctx, config, hostConfig, networkConfig, nil, containerName)
+	spec := buildInstanceContainer(name, version, imageName, port, cpuCores, ramMB, "", parameterGroupName, resolvedParams)
+	containerID, err := c.createContainer(name, spec)
 	if err != nil {
 		return "", fmt.Errorf("create container: %w", err)
 	}
 
-	return resp.ID, nil
+	return containerID, nil
 }
 
 func (c *Client) StopContainer(containerID string) error {
 	timeout := 30
-	if err := c.cli.ContainerStop(c.ctx, containerID, container.StopOptions{
+	if _, err := c.cli.ContainerStop(c.ctx, containerID, client.ContainerStopOptions{
 		Timeout: &timeout,
 	}); err != nil {
 		return fmt.Errorf("stop container: %w", err)
@@ -539,10 +484,10 @@ func (c *Client) StopContainer(containerID string) error {
 }
 
 func (c *Client) RemoveContainer(containerID string) error {
-	if err := c.cli.ContainerRemove(c.ctx, containerID, container.RemoveOptions{
+	if _, err := c.cli.ContainerRemove(c.ctx, containerID, client.ContainerRemoveOptions{
 		Force: true,
 	}); err != nil {
-		if !strings.Contains(err.Error(), "No such container") {
+		if !cerrdefs.IsNotFound(err) {
 			return fmt.Errorf("remove container: %w", err)
 		}
 	}
@@ -556,21 +501,18 @@ func (c *Client) RemoveContainer(containerID string) error {
 // Single-host single-daemon deployment is assumed. If a second ODDK daemon is
 // running on the same host, this will rip out its in-flight helper containers.
 func (c *Client) RemoveHelperContainers() (int, error) {
-	f := filters.NewArgs()
-	f.Add("label", "oddk.helper=true")
-
-	containers, err := c.cli.ContainerList(c.ctx, container.ListOptions{
+	containers, err := c.cli.ContainerList(c.ctx, client.ContainerListOptions{
 		All:     true,
-		Filters: f,
+		Filters: make(client.Filters).Add("label", "oddk.helper=true"),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("list helper containers: %w", err)
 	}
 
 	removed := 0
-	for _, ctr := range containers {
-		if err := c.cli.ContainerRemove(c.ctx, ctr.ID, container.RemoveOptions{Force: true}); err != nil {
-			if !strings.Contains(err.Error(), "No such container") {
+	for _, ctr := range containers.Items {
+		if _, err := c.cli.ContainerRemove(c.ctx, ctr.ID, client.ContainerRemoveOptions{Force: true}); err != nil {
+			if !cerrdefs.IsNotFound(err) {
 				log.Printf("Warning: failed to remove orphaned helper %s: %v", ctr.ID[:12], err)
 				continue
 			}
@@ -581,8 +523,8 @@ func (c *Client) RemoveHelperContainers() (int, error) {
 }
 
 func (c *Client) RemoveVolume(volumeName string) error {
-	if err := c.cli.VolumeRemove(c.ctx, volumeName, true); err != nil {
-		if !strings.Contains(err.Error(), "no such volume") {
+	if _, err := c.cli.VolumeRemove(c.ctx, volumeName, client.VolumeRemoveOptions{Force: true}); err != nil {
+		if !cerrdefs.IsNotFound(err) {
 			return fmt.Errorf("remove volume: %w", err)
 		}
 	}
@@ -591,14 +533,14 @@ func (c *Client) RemoveVolume(volumeName string) error {
 
 // CheckImageExists checks if a Docker image exists locally and returns its tags
 func (c *Client) CheckImageExists(imageName string) ([]string, bool) {
-	images, err := c.cli.ImageList(c.ctx, image.ListOptions{})
+	images, err := c.cli.ImageList(c.ctx, client.ImageListOptions{})
 	if err != nil {
 		log.Printf("Error listing images: %v", err)
 		return nil, false
 	}
 
 	var tags []string
-	for _, img := range images {
+	for _, img := range images.Items {
 		for _, tag := range img.RepoTags {
 			if tag == imageName {
 				tags = append(tags, tag)
@@ -618,12 +560,12 @@ func (c *Client) CheckImageExists(imageName string) ([]string, bool) {
 // moving tag (e.g. postgres:18) this reflects the newest patch, which can be
 // compared against a container's image ID to detect a pending update.
 func (c *Client) GetImageID(imageName string) (string, bool) {
-	images, err := c.cli.ImageList(c.ctx, image.ListOptions{})
+	images, err := c.cli.ImageList(c.ctx, client.ImageListOptions{})
 	if err != nil {
 		log.Printf("Error listing images: %v", err)
 		return "", false
 	}
-	for _, img := range images {
+	for _, img := range images.Items {
 		if slices.Contains(img.RepoTags, imageName) {
 			return img.ID, true
 		}
@@ -634,11 +576,11 @@ func (c *Client) GetImageID(imageName string) (string, bool) {
 // GetContainerImageID returns the ID (sha256:...) of the image a container was
 // created from. Comparable with GetImageID's result.
 func (c *Client) GetContainerImageID(containerID string) (string, error) {
-	inspect, err := c.cli.ContainerInspect(c.ctx, containerID)
+	inspect, err := c.cli.ContainerInspect(c.ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return "", fmt.Errorf("inspect container: %w", err)
 	}
-	return inspect.Image, nil
+	return inspect.Container.Image, nil
 }
 
 // PullImageProgress pulls a Docker image from the registry, streaming the raw
@@ -656,7 +598,7 @@ func (c *Client) GetContainerImageID(containerID string) (string, error) {
 // by client disconnect by design.
 func (c *Client) PullImageProgress(ctx context.Context, imageName string, progress io.Writer) error {
 	log.Printf("Pulling image %s...", imageName)
-	reader, err := c.cli.ImagePull(ctx, imageName, image.PullOptions{})
+	reader, err := c.cli.ImagePull(ctx, imageName, client.ImagePullOptions{})
 	if err != nil {
 		return fmt.Errorf("pull image: %w", err)
 	}
@@ -675,7 +617,7 @@ func (c *Client) PullImageProgress(ctx context.Context, imageName string, progre
 	// goes away mid-stream.
 	dec := json.NewDecoder(io.TeeReader(reader, &tolerantWriter{w: progress}))
 	for {
-		var msg jsonmessage.JSONMessage
+		var msg jsonstream.Message
 		if err := dec.Decode(&msg); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -710,12 +652,16 @@ func (t *tolerantWriter) Write(p []byte) (int, error) {
 }
 
 func (c *Client) GetContainerStatus(containerID string) (string, error) {
-	inspect, err := c.cli.ContainerInspect(c.ctx, containerID)
+	inspect, err := c.cli.ContainerInspect(c.ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
-		if strings.Contains(err.Error(), "No such container") {
+		if cerrdefs.IsNotFound(err) {
 			return "not found", nil
 		}
 		return "", fmt.Errorf("inspect container: %w", err)
+	}
+	state := inspect.Container.State
+	if state == nil {
+		return "", fmt.Errorf("inspect container: no state reported for %s", containerID)
 	}
 
 	// ORDER MATTERS: Docker reports State.Running == true for a PAUSED container
@@ -725,13 +671,13 @@ func (c *Client) GetContainerStatus(containerID string) (string, error) {
 	// branch on "paused" (snapshot capture, startup reconciliation) never saw
 	// it, and a base backup against a paused server would hang rather than
 	// degrade. Check the more specific states first.
-	if inspect.State.Paused {
+	if state.Paused {
 		return "paused", nil
 	}
-	if inspect.State.Restarting {
+	if state.Restarting {
 		return "restarting", nil
 	}
-	if inspect.State.Running {
+	if state.Running {
 		return "running", nil
 	}
 
@@ -741,7 +687,7 @@ func (c *Client) GetContainerStatus(containerID string) (string, error) {
 // GetContainerLogs returns the last N lines of logs from a container.
 // Both stdout and stderr are merged into a single string.
 func (c *Client) GetContainerLogs(containerID, tail string) (string, error) {
-	reader, err := c.cli.ContainerLogs(c.ctx, containerID, container.LogsOptions{
+	reader, err := c.cli.ContainerLogs(c.ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       tail,
@@ -762,7 +708,7 @@ func (c *Client) GetContainerLogs(containerID, tail string) (string, error) {
 
 // StreamContainerLogs streams container logs to w until ctx is cancelled or the container stops.
 func (c *Client) StreamContainerLogs(ctx context.Context, containerID, tail string, w io.Writer) error {
-	reader, err := c.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+	reader, err := c.cli.ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,

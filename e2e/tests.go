@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 func testFullLifecycle(h *TestHarness) error {
@@ -122,7 +122,7 @@ func testConsistencyChecks(h *TestHarness) error {
 	// Manually stop the container to simulate inconsistency
 	ctx := context.Background()
 	containerName := "oddk-pg-" + instanceName
-	if err := h.docker.ContainerStop(ctx, containerName, container.StopOptions{}); err != nil {
+	if _, err := h.docker.ContainerStop(ctx, containerName, client.ContainerStopOptions{}); err != nil {
 		return fmt.Errorf("failed to stop container manually: %w", err)
 	}
 

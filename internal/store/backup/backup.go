@@ -440,7 +440,8 @@ func (s *BackupStore) ReconcileLocalLocations(backupDir string) (repointed, clea
 		if _, statErr := os.Stat(candidate); statErr == nil {
 			if candidate != r.LocalLocation.String {
 				if _, execErr := s.db.Exec(
-					`UPDATE backup_history SET local_location = ? WHERE id = ?`, candidate, r.ID); execErr != nil {
+					`UPDATE backup_history SET local_location = ? WHERE id = ?`, candidate, r.ID,
+				); execErr != nil {
 					return repointed, cleared, danglingAfter, fmt.Errorf("re-point backup %d: %w", r.ID, execErr)
 				}
 				repointed++
@@ -457,7 +458,8 @@ func (s *BackupStore) ReconcileLocalLocations(backupDir string) (repointed, clea
 			continue
 		}
 		if _, execErr := s.db.Exec(
-			`UPDATE backup_history SET local_location = NULL WHERE id = ?`, r.ID); execErr != nil {
+			`UPDATE backup_history SET local_location = NULL WHERE id = ?`, r.ID,
+		); execErr != nil {
 			return repointed, cleared, danglingAfter, fmt.Errorf("clear local location of backup %d: %w", r.ID, execErr)
 		}
 		cleared++

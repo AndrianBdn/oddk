@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -202,6 +203,11 @@ func (s *NotificationSender) sendNotification(ctx context.Context, notification 
 	return nil
 }
 
+// ErrNoNotificationsConfigured is what SendToAll returns when there is no
+// channel to send to. It is the common case on a fresh install, so callers
+// that report on a best-effort basis match it with errors.Is and stay quiet.
+var ErrNoNotificationsConfigured = errors.New("no notifications configured")
+
 func (s *NotificationSender) SendToAll(ctx context.Context, subject, body string) error {
 	notifications, err := s.store.List()
 	if err != nil {
@@ -209,7 +215,7 @@ func (s *NotificationSender) SendToAll(ctx context.Context, subject, body string
 	}
 
 	if len(notifications) == 0 {
-		return fmt.Errorf("no notifications configured")
+		return ErrNoNotificationsConfigured
 	}
 
 	var errors []string

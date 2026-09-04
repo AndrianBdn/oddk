@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/image"
+	"github.com/moby/moby/client"
 )
 
 // setHermeticAWSEnv pins the AWS default credential chain for the test
@@ -344,7 +344,7 @@ func testSnapshotApplyFromS3(h *TestHarness) error {
 	}
 	log.Println("Step 2b: Removing the PostgreSQL image to simulate an empty image cache")
 	if _, err := h.docker.ImageRemove(context.Background(), "postgres:17",
-		image.RemoveOptions{Force: true, PruneChildren: false}); err != nil {
+		client.ImageRemoveOptions{Force: true, PruneChildren: false}); err != nil {
 		return fmt.Errorf("remove image: %w", err)
 	}
 

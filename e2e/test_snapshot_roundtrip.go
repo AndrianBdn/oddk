@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/image"
+	"github.com/moby/moby/client"
 )
 
 // testSnapshotRoundTrip is the test the whole snapshot feature exists for:
@@ -149,7 +149,7 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	// return. This is the step whose absence hid exactly that bug.
 	log.Println("Step 3b: Removing the PostgreSQL image to simulate an empty image cache")
 	if _, err := h.docker.ImageRemove(context.Background(), "postgres:17",
-		image.RemoveOptions{Force: true, PruneChildren: false}); err != nil {
+		client.ImageRemoveOptions{Force: true, PruneChildren: false}); err != nil {
 		return fmt.Errorf("remove image to simulate a fresh host: %w", err)
 	}
 

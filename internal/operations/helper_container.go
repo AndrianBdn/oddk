@@ -10,10 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 
 	"github.com/andrianbdn/oddk/internal/util"
 )
@@ -88,7 +89,12 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 	}
 
 	cli := deps.Docker.GetDockerClient()
-	resp, err := cli.ContainerCreate(ctx, config, hostConfig, networkConfig, nil, spec.ContainerName)
+	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           config,
+		HostConfig:       hostConfig,
+		NetworkingConfig: networkConfig,
+		Name:             spec.ContainerName,
+	})
 	if err != nil {
 		return fmt.Errorf("create %s container: %w", tool, err)
 	}
@@ -97,20 +103,20 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 		// running; the daemon-startup sweep is the backstop.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true})
+		_, _ = cli.ContainerRemove(cleanupCtx, resp.ID, client.ContainerRemoveOptions{Force: true})
 	}()
 
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("start %s container: %w", tool, err)
 	}
 
-	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	wait := cli.ContainerWait(ctx, resp.ID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
-	case err := <-errCh:
+	case err := <-wait.Error:
 		if err != nil {
 			return fmt.Errorf("wait for %s container: %w", tool, err)
 		}
-	case status := <-statusCh:
+	case status := <-wait.Result:
 		if status.StatusCode != 0 {
 			out, logErr := getContainerLogs(ctx, deps, resp.ID)
 			logs := out.String()
@@ -129,7 +135,7 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 	}
 
 	if spec.CaptureStdout != nil {
-		reader, err := cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{
+		reader, err := cli.ContainerLogs(ctx, resp.ID, client.ContainerLogsOptions{
 			ShowStdout: true,
 			ShowStderr: false,
 		})
@@ -188,7 +194,7 @@ func (o helperOutput) String() string {
 
 // getContainerLogs fetches a container's stdout/stderr, demultiplexed.
 func getContainerLogs(ctx context.Context, deps *Dependencies, containerID string) (helperOutput, error) {
-	reader, err := deps.Docker.GetDockerClient().ContainerLogs(ctx, containerID, container.LogsOptions{
+	reader, err := deps.Docker.GetDockerClient().ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 	})

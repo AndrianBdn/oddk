@@ -7,7 +7,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/moby/moby/api/types/jsonstream"
 
 	"github.com/andrianbdn/oddk/internal/operations"
 )
@@ -132,8 +132,8 @@ func (s *Server) beginProgressStream(w http.ResponseWriter) http.Flusher {
 // logged server-side.
 func (s *Server) writeStreamError(w http.ResponseWriter, flusher http.Flusher, what string, err error) {
 	log.Printf("%s stream error: %v", what, err)
-	_ = json.NewEncoder(w).Encode(jsonmessage.JSONMessage{
-		Error: &jsonmessage.JSONError{Message: err.Error()},
+	_ = json.NewEncoder(w).Encode(jsonstream.Message{
+		Error: &jsonstream.Error{Message: err.Error()},
 	})
 	if flusher != nil {
 		flusher.Flush()

@@ -84,7 +84,8 @@ func (c *Client) backupDangerouslyDropAllAction(ctx context.Context, cmd *cli.Co
 	if report.RecordsTotal > 0 && !cmd.Bool("yes") {
 		confirmed, err := c.cliConfirm(fmt.Sprintf(
 			"\nDelete ALL %d backup record(s) listed above — local archives, offsite copies, and history? [y/N]: ",
-			report.RecordsTotal))
+			report.RecordsTotal,
+		))
 		if err != nil {
 			return err
 		}

@@ -161,7 +161,8 @@ func newSnapshotFetchClient(ctx context.Context, deps *Dependencies, spec *Remot
 				"no credentials for s3://%s: %s, the request carried none, and this host has no EC2 instance role. "+
 					"Run the CLI where AWS credentials are available (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, "+
 					"a ~/.aws profile via --aws-profile, or an EC2 instance role) so it can pass them to the daemon",
-				bucket, offsiteNote)
+				bucket, offsiteNote,
+			)
 		}
 		return client, key, credSourceInstanceRole, nil
 	}
@@ -622,7 +623,8 @@ func FetchSnapshotForApply(ctx context.Context, spec *RemoteSnapshotSpec, backup
 			"no AWS credentials found: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, configure a profile "+
 				"(--aws-profile or AWS_PROFILE), or run on a host with an EC2 instance role. "+
 				"Note: sudo strips AWS_* variables — use sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION -u oddk ... (%v)",
-			err))
+			err,
+		))
 	}
 
 	fetch, err := FetchRemoteSnapshot(ctx, client, spec.URI, key, SnapshotDownloadsDir(backupDir), progress)

@@ -139,8 +139,13 @@ fi
 #
 # This script only ever uses the FHS layout (/usr/local/bin + /var/lib/oddk).
 # A fresh install creates it; an update replaces the binary in place. A legacy
-# /home/oddk installation is NOT updated here - it must first be relocated with
-# scripts/remote/oddk-migrate.sh, after which this script handles it normally.
+# /home/oddk installation is NOT updated here. The one-time relocation script
+# (oddk-migrate.sh) was retired in v0.1.45; relocate such an install by hand:
+# stop the service, move the binary to /usr/local/bin/oddk and the data and
+# backups directories under /var/lib/oddk, point the oddk user's home and the
+# unit's ExecStart at them, then re-run this script. Backup catalogue rows that
+# still name the old backup path are dropped at the next daemon start (the
+# archive files are kept and reported, never deleted).
 
 MODE="install"
 TARGET_BINARY="$FHS_BINARY"
@@ -151,7 +156,9 @@ if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE}\.service"; then
     if [ "$INSTALLED_BINARY" != "$FHS_BINARY" ]; then
         print_msg "$RED" "Non-FHS installation detected (binary at: ${INSTALLED_BINARY:-unknown})"
         print_msg "$YELLOW" "This installer manages the FHS layout ($FHS_BINARY)."
-        print_msg "$YELLOW" "Relocate the existing install first with oddk-migrate.sh, then re-run."
+        print_msg "$YELLOW" "Relocate it by hand first: stop the service, move the binary to $FHS_BINARY and the"
+        print_msg "$YELLOW" "data/backups directories under /var/lib/oddk, update the oddk user's home and the"
+        print_msg "$YELLOW" "unit's ExecStart, then re-run."
         exit 1
     fi
     if [ ! -f "$TARGET_BINARY" ]; then

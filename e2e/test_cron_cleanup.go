@@ -319,7 +319,8 @@ func (h *TestHarness) listS3Backups() ([]string, error) {
 					URL:           h.fakeS3URL,
 					SigningRegion: "us-east-1",
 				}, nil
-			})),
+			},
+		)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create S3 config: %w", err)

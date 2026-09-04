@@ -148,7 +148,8 @@ func (c *Client) snapshotMigrateFromBackupsAction(ctx context.Context, cmd *cli.
 	}
 	if !cmd.Bool("yes") {
 		confirmed, err := c.cliConfirm(fmt.Sprintf(
-			"Adopt this snapshot schedule and remove %d backup schedule(s)? [y/N]: ", len(plans)))
+			"Adopt this snapshot schedule and remove %d backup schedule(s)? [y/N]: ", len(plans),
+		))
 		if err != nil {
 			return err
 		}

@@ -7,6 +7,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -51,7 +52,7 @@ func (s *Server) handleDebugBackupTimeShift(w http.ResponseWriter, r *http.Reque
 
 	op := operations.NewBackupTimeShiftOp(s.opDeps, req.BackupID, req.DaysBack)
 
-	if err := s.executor.Execute(r.Context(), op); err != nil {
+	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to shift backup time: %v", err))
 		return
 	}

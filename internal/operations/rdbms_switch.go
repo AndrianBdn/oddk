@@ -66,7 +66,8 @@ func (op *SwitchRDBMSOp) Execute(ctx context.Context) error {
 	if curOK && newOK && newMajor != curMajor {
 		return operr.Invalidf(
 			"cannot switch instance from PostgreSQL %d to %d: 'switch' only changes the image within the same major version; use 'oddk instance major-upgrade %s --target-version %d' for a major-version upgrade",
-			curMajor, newMajor, op.params.Name, newMajor)
+			curMajor, newMajor, op.params.Name, newMajor,
+		)
 	}
 
 	_, exists := op.deps.Docker.CheckImageExists(newImage)

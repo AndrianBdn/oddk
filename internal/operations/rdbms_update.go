@@ -7,7 +7,7 @@ import (
 	"io"
 	"log"
 
-	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/moby/moby/api/types/jsonstream"
 
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
@@ -79,7 +79,8 @@ func (op *UpdateRDBMSOp) Execute(ctx context.Context) error {
 	if curOK && newOK && newMajor != curMajor {
 		return operr.Invalidf(
 			"cannot update instance from PostgreSQL %d to %d: 'update' stays within the same major version; use 'oddk instance major-upgrade %s --target-version %d'",
-			curMajor, newMajor, op.params.Name, newMajor)
+			curMajor, newMajor, op.params.Name, newMajor,
+		)
 	}
 
 	// Re-pull the tag (streaming progress). A moving tag fetches the newest
@@ -122,7 +123,7 @@ func emitStatus(w io.Writer, format string, args ...any) {
 	if w == nil {
 		return
 	}
-	if err := json.NewEncoder(w).Encode(jsonmessage.JSONMessage{Status: fmt.Sprintf(format, args...)}); err != nil {
+	if err := json.NewEncoder(w).Encode(jsonstream.Message{Status: fmt.Sprintf(format, args...)}); err != nil {
 		log.Printf("emit update status: %v", err)
 	}
 }

@@ -48,8 +48,14 @@ type UpdateStateRequest struct {
 	State string `json:"state"`
 }
 
+// ReconfigureRequest is the body of PUT /api/rdbms/{name}/config. Every field
+// is optional and an absent one keeps the instance's current value; at least
+// one must be present.
 type ReconfigureRequest struct {
-	ParameterGroup string `json:"parameterGroup"`
+	ParameterGroup string `json:"parameterGroup,omitempty"`
+	CPUCores       *int   `json:"cpuCores,omitempty"`
+	RAMMB          *int   `json:"ramMb,omitempty"`
+	Port           *int   `json:"port,omitempty"`
 }
 
 // handleListRDBMS handles GET /api/rdbms
@@ -226,8 +232,8 @@ func (s *Server) handleReconfigureRDBMS(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if req.ParameterGroup == "" {
-		s.writeError(w, http.StatusBadRequest, "parameterGroup is required")
+	if req.ParameterGroup == "" && req.CPUCores == nil && req.RAMMB == nil && req.Port == nil {
+		s.writeError(w, http.StatusBadRequest, "nothing to change: pass parameterGroup, cpuCores, ramMb and/or port")
 		return
 	}
 
@@ -242,6 +248,9 @@ func (s *Server) handleReconfigureRDBMS(w http.ResponseWriter, r *http.Request) 
 	params := operations.ReconfigureRDBMSParams{
 		Name:           name,
 		ParameterGroup: req.ParameterGroup,
+		CPUCores:       req.CPUCores,
+		RAMMB:          req.RAMMB,
+		Port:           req.Port,
 	}
 
 	op := operations.NewReconfigureRDBMSOp(s.opDeps, params)

@@ -137,7 +137,8 @@ func TestEncryptNotificationConfigsAtStartup(t *testing.T) {
 	_, err := st.Sqlx.Exec(
 		`INSERT INTO notifications (name, type, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
 		"slack", "slack", cleartext,
-		"2026-01-02T03:04:05.000000000Z", "2026-01-02T03:04:05.000000000Z")
+		"2026-01-02T03:04:05.000000000Z", "2026-01-02T03:04:05.000000000Z",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

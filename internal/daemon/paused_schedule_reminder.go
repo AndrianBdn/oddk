@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -63,7 +64,7 @@ func (s *Server) remindIfSchedulesPaused(ctx context.Context) {
 	if err := sender.SendToAll(ctx, subject, body); err != nil {
 		// "no notifications configured" is the common case on a fresh install
 		// and is not a failure worth shouting about.
-		if !strings.Contains(err.Error(), "no notifications configured") {
+		if !errors.Is(err, services.ErrNoNotificationsConfigured) {
 			log.Printf("Warning: could not send paused-schedule reminder: %v", err)
 		}
 	}

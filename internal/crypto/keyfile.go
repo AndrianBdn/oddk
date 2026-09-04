@@ -199,7 +199,8 @@ func parseKeyFile(raw []byte, path string) (key []byte, legacy bool, err error) 
 		return nil, false, fmt.Errorf(
 			"master key %s fails its checksum (recorded %s, computed %s): the file is corrupted or was edited. "+
 				"This is not the same as a wrong key — restore this file from your key backup rather than looking for a different key",
-			path, sum, want)
+			path, sum, want,
+		)
 	}
 
 	key, err = decodeKeyPayload(payload, path)

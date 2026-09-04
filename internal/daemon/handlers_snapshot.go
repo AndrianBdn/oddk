@@ -259,7 +259,8 @@ func (op *snapshotRestoreInstanceOp) Type() operations.OpType {
 
 func (op *snapshotRestoreInstanceOp) Execute(ctx context.Context) error {
 	archivePath, foreign, origin, err := operations.ResolveRestoreInstanceArchive(
-		ctx, op.deps, op.src, op.params.BackupDir, op.params.Progress)
+		ctx, op.deps, op.src, op.params.BackupDir, op.params.Progress,
+	)
 	if err != nil {
 		return err
 	}
@@ -384,7 +385,8 @@ func (s *Server) handleCronSnapshotSet(w http.ResponseWriter, r *http.Request) {
 	if !slices.Contains(validSnapshotIntervals, req.IntervalHours) {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf(
 			"intervalHours must divide 24 evenly (one of %v); anything else drifts across midnight and would not honour the interval you asked for",
-			validSnapshotIntervals))
+			validSnapshotIntervals,
+		))
 		return
 	}
 	if req.CleanupLocalDays == 0 {
@@ -565,6 +567,11 @@ func (s *Server) handleSnapshotRemoveRemote(w http.ResponseWriter, r *http.Reque
 		name: "RemoveSnapshotRemote",
 		run:  func(ctx context.Context) error { return operations.RemoveSnapshotRemote(ctx, s.opDeps, id) },
 	}
+	// One S3 DeleteObject is short in the normal case, but it is a network
+	// call with no bound of its own; a stall must not surface as a bare EOF
+	// while the daemon completes the removal behind it.
+	s.clearWriteDeadline(w, "snapshot remove-remote")
+
 	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeOpError(w, err)
 		return

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/mount"
+	"github.com/moby/moby/api/types/mount"
 
 	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/crypto"

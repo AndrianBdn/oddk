@@ -134,7 +134,8 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	if physical && entry.HasData && manifest.SourceArch != "" && manifest.SourceArch != runtime.GOARCH {
 		return nil, operr.Invalidf(
 			"instance %q was captured physically on %s, but this host is %s; physical clusters are not portable across architectures. Restore on a %s host, or take a --logical snapshot on the source",
-			params.InstanceName, manifest.SourceArch, runtime.GOARCH, manifest.SourceArch)
+			params.InstanceName, manifest.SourceArch, runtime.GOARCH, manifest.SourceArch,
+		)
 	}
 	if !entry.HasData {
 		// A configuration-only entry has instance.json but no databases. Building
@@ -142,7 +143,8 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		// and has silently lost its data — the same trap apply refuses.
 		return nil, operr.Invalidf(
 			"instance %q was captured configuration-only (%s), so the snapshot holds no data for it; restoring would create an empty cluster that looks healthy",
-			params.InstanceName, entrySkipReason(entry))
+			params.InstanceName, entrySkipReason(entry),
+		)
 	}
 
 	// 2. Does it exist here? Decides create-vs-replace, and the port check below.
@@ -202,7 +204,8 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	if meta.Name != params.InstanceName {
 		return nil, operr.Invalidf(
 			"archive is inconsistent: instances/%s/%s declares the instance name %q",
-			params.InstanceName, instanceMetadataFile, meta.Name)
+			params.InstanceName, instanceMetadataFile, meta.Name,
+		)
 	}
 
 	// 5. Resolve the key that decrypts the SNAPSHOT's stored credential. The
@@ -237,8 +240,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	// refusal is still free. The locale-provider check applies only to logical
 	// restores: a physical cluster carries its collation state byte-for-byte
 	// and no CREATE DATABASE is ever issued.
-	var dbs []DatabaseMeta
-	var roleNames []string
+	var logical *logicalRestoreInputs
 	if physical {
 		if err := verifyPhysicalStaging(instanceDir, params.InstanceName); err != nil {
 			return nil, err
@@ -247,15 +249,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		if err := checkLocaleProviders(extractedDir, metas); err != nil {
 			return nil, err
 		}
-		var dbsFound bool
-		dbs, dbsFound, err = readDatabaseMetadata(instanceDir)
-		if err != nil {
-			return nil, err
-		}
-		if !dbsFound {
-			return nil, operr.Invalidf("archive has no %s for instance %s", databaseMetadataFile, params.InstanceName)
-		}
-		roleNames, err = roleNamesFromGlobals(filepath.Join(instanceDir, "globals.sql"))
+		logical, err = readLogicalRestoreInputs(instanceDir, params.InstanceName)
 		if err != nil {
 			return nil, err
 		}
@@ -360,7 +354,8 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 			return
 		}
 		if backdateErr := deps.Store.Instances.BackdateCreatedAt(
-			meta.Name, rfc3339time.Time{Time: manifest.CreatedAt}); backdateErr != nil {
+			meta.Name, rfc3339time.Time{Time: manifest.CreatedAt},
+		); backdateErr != nil {
 			emitLine(params.Progress,
 				"  (warning: could not backdate %s for snapshot coverage: %v)", meta.Name, backdateErr)
 		}
@@ -393,104 +388,20 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		}
 	}
 
-	// Neither format gets the instance's real password: whatever is handed to
-	// the entrypoint stays in Docker's container config for the container's
-	// lifetime (see docker.containerEnv).
-	//   physical — the volume is filled BEFORE the first start, so the
-	//     entrypoint skips initdb and reads nothing; the restored cluster
-	//     brings the source's own postgres role with it.
-	//   logical  — initdb runs, so it needs a password: it gets a throwaway,
-	//     which the ALTER after readiness replaces with the real one (and
-	//     globals.sql then re-asserts the same value from the source's hash).
-	initdbPassword := ""
-	if !physical {
-		initdbPassword = newInitdbCredential()
-	}
-
-	containerID, err := deps.Docker.CreateContainer(
-		meta.Name, meta.Version, meta.Image, meta.Port, initdbPassword,
-		meta.CPUCores, meta.RAMMB, meta.ParameterGroup, parameterGroup.Parameters,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create container: %w", err)
-	}
-	if err := deps.Store.Instances.UpdateContainerID(meta.Name, containerID); err != nil {
-		return nil, fmt.Errorf("record container id: %w", err)
-	}
-
-	if physical {
-		// Fill the volume BEFORE the container's first start: the entrypoint
-		// then sees PG_VERSION, skips initdb, and the archived cluster comes up
-		// as-is, recovered to consistency by PostgreSQL.
-		if err := restorePhysicalIntoCreatedContainer(ctx, deps, containerID, meta.Version, instanceDir); err != nil {
-			return nil, err
-		}
-		emitLine(params.Progress, "  ✓ Volume created and cluster files restored")
-		if err := deps.Docker.StartContainer(containerID); err != nil {
-			return nil, fmt.Errorf("start container: %w", err)
-		}
-		if err := waitForPostgresReady(ctx, meta.Port, password); err != nil {
-			return nil, fmt.Errorf("restored cluster did not become ready: %w", err)
-		}
-		count, countErr := countUserDatabases(ctx, meta.Port, password)
-		if countErr != nil {
-			return nil, fmt.Errorf("verify restored cluster: %w", countErr)
-		}
-		result.Databases = count
-		emitLine(params.Progress, "  ✓ PostgreSQL recovered; serving %d database(s)", count)
-
-		if entry.CaptureMode == captureModeCold {
-			// The instance was STOPPED when captured; reproduce that state.
-			// It was still started once above so the restore is verified, not
-			// assumed.
-			if err := deps.Docker.StopContainer(containerID); err != nil {
-				return nil, fmt.Errorf("stop cold-captured instance after verification: %w", err)
-			}
-			if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusStopped); err != nil {
-				return nil, fmt.Errorf("mark instance stopped: %w", err)
-			}
-			result.FinalStatus = "stopped"
-			emitLine(params.Progress, "  ✓ Instance left stopped, matching its state when the snapshot was taken")
-			return result, nil
-		}
-		if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
-			return nil, fmt.Errorf("mark instance running: %w", err)
-		}
-		return result, nil
-	}
-
-	if err := deps.Docker.StartContainer(containerID); err != nil {
-		return nil, fmt.Errorf("start container: %w", err)
-	}
-	emitLine(params.Progress, "  ✓ Volume and container created")
-
-	if err := waitForPostgresReady(ctx, meta.Port, initdbPassword); err != nil {
-		return nil, fmt.Errorf("cluster did not become ready: %w", err)
-	}
-	if err := adoptPostgresPassword(ctx, meta.Port, initdbPassword, password); err != nil {
-		return nil, fmt.Errorf("set the instance password: %w", err)
-	}
-	emitLine(params.Progress, "  ✓ PostgreSQL ready")
-
-	restored, err := RestoreClusterFromArchive(ctx, deps, RestoreClusterParams{
-		InstanceName:  meta.Name,
-		Image:         meta.Image,
-		Port:          meta.Port,
-		Password:      password,
-		CPUCores:      meta.CPUCores,
-		ExtractedDir:  instanceDir,
-		Databases:     dbs,
-		ExpectedRoles: roleNames,
+	built, err := rebuildInstanceCluster(ctx, deps, instanceRebuild{
+		meta:        meta,
+		entry:       entry,
+		parameters:  parameterGroup.Parameters,
+		password:    password,
+		instanceDir: instanceDir,
+		logical:     logical,
+		progress:    params.Progress,
 	})
 	if err != nil {
 		return nil, err // the deferred handler records "error"
 	}
-	result.Databases = restored
-	emitLine(params.Progress, "  ✓ Roles and %d database(s) restored", restored)
-
-	if err := deps.Store.Instances.UpdateStatus(meta.Name, instances.StatusRunning); err != nil {
-		return nil, fmt.Errorf("mark instance running: %w", err)
-	}
+	result.Databases = built.databases
+	result.FinalStatus = string(built.finalStatus)
 	return result, nil
 }
 
@@ -595,7 +506,8 @@ func snapshotInstancePassword(snapshotDBPath, instanceName string, masterKey []b
 	if err != nil {
 		return "", operr.Invalidf(
 			"master key mismatch: this key cannot decrypt the snapshot's credential for %q. Restoring with the wrong key would create a cluster whose postgres password ODDK cannot recover. Pass the source host's key with --master-key",
-			instanceName)
+			instanceName,
+		)
 	}
 	return password, nil
 }

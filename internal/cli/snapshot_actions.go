@@ -11,7 +11,7 @@ import (
 	"sync"
 	"text/tabwriter"
 
-	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/moby/moby/client/pkg/jsonmessage"
 	"github.com/moby/term"
 	"github.com/urfave/cli/v3"
 
@@ -496,7 +496,8 @@ func (c *Client) snapshotRemoveCopy(cmd *cli.Command, which string) error {
 
 	if !cmd.Bool("force") {
 		confirmed, err := c.cliConfirm(fmt.Sprintf(
-			"Remove the %s copy of snapshot %s? (if it is the only copy, the record is removed too) [y/N]: ", which, id))
+			"Remove the %s copy of snapshot %s? (if it is the only copy, the record is removed too) [y/N]: ", which, id,
+		))
 		if err != nil {
 			return err
 		}

@@ -89,7 +89,8 @@ func TestCleanupOldLogs_RetentionBoundary(t *testing.T) {
 			table: "cron_logs",
 			insert: func(raw *sqlx.DB, at rfc3339time.Time) error {
 				_, err := raw.Exec(
-					`INSERT INTO cron_logs (instance_name, started_at) VALUES (?, ?)`, "app", at)
+					`INSERT INTO cron_logs (instance_name, started_at) VALUES (?, ?)`, "app", at,
+				)
 				return err
 			},
 			clean: func(st *store.Store) (int64, error) { return st.Cron.CleanupOldLogs(retention) },
@@ -99,7 +100,8 @@ func TestCleanupOldLogs_RetentionBoundary(t *testing.T) {
 			insert: func(raw *sqlx.DB, at rfc3339time.Time) error {
 				_, err := raw.Exec(
 					`INSERT INTO notification_logs (notification_name, status, created_at) VALUES (?, ?, ?)`,
-					"alerts", "sent", at)
+					"alerts", "sent", at,
+				)
 				return err
 			},
 			clean: func(st *store.Store) (int64, error) {
@@ -111,7 +113,8 @@ func TestCleanupOldLogs_RetentionBoundary(t *testing.T) {
 			insert: func(raw *sqlx.DB, at rfc3339time.Time) error {
 				_, err := raw.Exec(
 					`INSERT INTO offsite_logs (event, offsite_settings_id, object, success, created_at)
-					 VALUES (?, ?, ?, ?, ?)`, "upload", 1, "backup.tar.zst", 1, at)
+					 VALUES (?, ?, ?, ?, ?)`, "upload", 1, "backup.tar.zst", 1, at,
+				)
 				return err
 			},
 			clean: func(st *store.Store) (int64, error) { return st.Offsite.CleanupOldLogs(retention) },

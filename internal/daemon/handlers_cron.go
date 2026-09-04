@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -73,7 +74,7 @@ func (s *Server) handleCronBackupCreate(w http.ResponseWriter, r *http.Request) 
 
 	op := operations.NewCronBackupCreateOp(s.opDeps, req.InstanceName, utcHour, cleanupLocal, cleanupRemote)
 
-	if err := s.executor.Execute(r.Context(), op); err != nil {
+	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create cron backup: %v", err))
 		return
 	}
@@ -127,7 +128,7 @@ func (s *Server) handleCronBackupDelete(w http.ResponseWriter, r *http.Request) 
 
 	op := operations.NewCronBackupDeleteOp(s.opDeps, instanceName)
 
-	if err := s.executor.Execute(r.Context(), op); err != nil {
+	if err := s.executor.Execute(context.Background(), op); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete cron backup: %v", err))
 		return
 	}

@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
 	"github.com/klauspost/compress/zstd"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
@@ -82,7 +82,8 @@ func stagePhysicalBasebackup(
 	if err := TestPostgreSQLConnectivityWithPassword(ctx, instance.Port, password); err != nil {
 		return operr.Invalidf(
 			"the stored postgres password for instance %s no longer authenticates (changed outside ODDK?): %v. A physical snapshot would embed a credential that cannot be used after restore. Fix it with 'oddk instance set-postgres-password %s' and retry",
-			instance.Name, err, instance.Name)
+			instance.Name, err, instance.Name,
+		)
 	}
 
 	bbDir := filepath.Join(instanceDir, snapshotBasebackupDir)
@@ -174,7 +175,8 @@ func refuseUnexpectedBasebackupFiles(bbDir string) error {
 	if len(unexpected) > 0 {
 		return operr.Invalidf(
 			"pg_basebackup produced unexpected files (%s) — the instance appears to use tablespaces, which physical snapshots do not support; use --logical",
-			strings.Join(unexpected, ", "))
+			strings.Join(unexpected, ", "),
+		)
 	}
 	return nil
 }
@@ -222,10 +224,11 @@ func stagePhysicalCold(ctx context.Context, deps *Dependencies, instance *instan
 	}
 
 	cli := deps.Docker.GetDockerClient()
-	reader, _, err := cli.CopyFromContainer(ctx, instance.ContainerID, pgdata)
+	res, err := cli.CopyFromContainer(ctx, instance.ContainerID, client.CopyFromContainerOptions{SourcePath: pgdata})
 	if err != nil {
 		return fmt.Errorf("read data directory %s from container: %w", pgdata, err)
 	}
+	reader := res.Content
 	defer func() { _ = reader.Close() }()
 
 	outPath := filepath.Join(bbDir, physicalBaseTarZst)
@@ -278,7 +281,8 @@ func writeColdCopy(src io.Reader, dst io.Writer) error {
 		}
 		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
 			return operr.Invalidf(
-				"data directory contains a link (%s); tablespaces and hand-placed symlinks are not supported by physical snapshots — use --logical", hdr.Name)
+				"data directory contains a link (%s); tablespaces and hand-placed symlinks are not supported by physical snapshots — use --logical", hdr.Name,
+			)
 		}
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeDir {
 			return fmt.Errorf("unsupported entry %q (type %v) in data directory stream", hdr.Name, hdr.Typeflag)
@@ -433,7 +437,8 @@ func restorePhysicalIntoCreatedContainer(ctx context.Context, deps *Dependencies
 	if recordedMajor, ok := parseMajorVersion(version); ok && archiveMajor != recordedMajor {
 		return operr.Invalidf(
 			"archive holds a PostgreSQL %d data directory but the instance is recorded as PostgreSQL %s; a %d server cannot start on it. The snapshot's instance.json and its data disagree — restore with a matching image, or use a --logical snapshot",
-			archiveMajor, version, recordedMajor)
+			archiveMajor, version, recordedMajor,
+		)
 	}
 
 	// A live capture carries the backup window's WAL separately; a cold copy
@@ -515,7 +520,7 @@ func streamTarFileIntoContainer(
 		produceErr <- err
 	}()
 
-	copyErr := deps.Docker.GetDockerClient().CopyToContainer(ctx, containerID, destPath, pr, container.CopyToContainerOptions{})
+	_, copyErr := deps.Docker.GetDockerClient().CopyToContainer(ctx, containerID, client.CopyToContainerOptions{DestinationPath: destPath, Content: pr})
 	_ = pr.Close() // unblock the producer if the copy aborted early
 	prodErr := <-produceErr
 
@@ -618,7 +623,8 @@ func checkPhysicalImageMajor(dockerClient *docker.Client, entry SnapshotInstance
 	if imageMajor != recordedMajor {
 		return operr.Invalidf(
 			"image %s now serves PostgreSQL %d but instance %q was captured on PostgreSQL %s; a physical data directory only starts on its own major. Pin the image to the captured major, or restore a --logical snapshot",
-			entry.Image, imageMajor, entry.Name, entry.Version)
+			entry.Image, imageMajor, entry.Name, entry.Version,
+		)
 	}
 	return nil
 }

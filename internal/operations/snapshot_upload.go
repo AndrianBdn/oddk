@@ -79,7 +79,8 @@ func UploadSnapshot(ctx context.Context, deps *Dependencies, id int) (*UploadSna
 	if info.Size() > maxPutObjectBytes {
 		return nil, operr.Invalidf(
 			"snapshot %d is %.1f GiB, above the %d GiB limit for a single S3 PutObject, and ODDK does not do multipart uploads. Copy it offsite by other means, or reduce what the deployment holds",
-			id, float64(info.Size())/(1024*1024*1024), maxPutObjectBytes/(1024*1024*1024))
+			id, float64(info.Size())/(1024*1024*1024), maxPutObjectBytes/(1024*1024*1024),
+		)
 	}
 
 	s3Client, err := s3service.NewClient(ctx, settings)

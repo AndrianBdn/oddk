@@ -696,17 +696,26 @@ oddk parameters get --name default:2025-08-27         # inspect one
 oddk parameters put custom --file params.json         # create/update
 oddk create --name app --version 17 --port 5432 --cpu 4 --ram 8 --parameter-group custom
 oddk instance apply app --parameter-group custom      # reconfigure in place
+oddk instance apply app --cpu 8 --ram 16              # resize in place (data kept)
+oddk instance apply app --port 5433                   # move the port
 ```
+
+`instance apply` changes any combination of parameter group, CPU, RAM and port.
+Flags you do not pass keep their current value. The container is recreated (a
+brief restart; the data volume is untouched), and because parameter groups
+resolve against the instance's RAM, a resize re-derives `shared_buffers` and
+friends and re-checks that they fit the new size.
 
 Parameters support expression evaluation against the instance's resources, e.g.
 `"{expr}DBContainerMemoryMB / 4{/expr} MB"` for `shared_buffers`.
 
-**Getting a group wrong does not cost you the instance.** `oddk instance apply`
-— and `create`, `instance switch`, `instance update`, which rebuild the
-container the same way — checks what it can *before* the running container is
-touched: a missing image, a group that will not resolve, or one whose
-shared-memory arena cannot fit the instance's RAM is refused outright and the
-old container keeps serving. If the new container is built but PostgreSQL never
+**Getting a group — or a size — wrong does not cost you the instance.** `oddk
+instance apply` — and `create`, `instance switch`, `instance update`, which
+rebuild the container the same way — checks what it can *before* the running
+container is touched: a missing image, a group that will not resolve, one whose
+shared-memory arena cannot fit the instance's RAM, a port another instance
+holds, or more CPU or RAM than the host has is refused outright and the old
+container keeps serving. If the new container is built but PostgreSQL never
 comes up, ODDK stops it, puts the previous configuration back, and reports the
 failure — the instance stays up. The stored group changes only once PostgreSQL
 is accepting connections, so a failed apply can be retried with the *same*

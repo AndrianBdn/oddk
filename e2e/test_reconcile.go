@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 // testStartupReconciliation verifies that a restarted daemon reconciles stored
@@ -72,15 +72,15 @@ func testStartupReconciliation(h *TestHarness) error {
 
 	// Manipulate containers behind the daemon's back, then restart it.
 	ctx := context.Background()
-	if err := h.docker.ContainerStop(ctx, "oddk-pg-"+instanceA, container.StopOptions{}); err != nil {
+	if _, err := h.docker.ContainerStop(ctx, "oddk-pg-"+instanceA, client.ContainerStopOptions{}); err != nil {
 		return fmt.Errorf("stop container of %s out-of-band: %w", instanceA, err)
 	}
-	if err := h.docker.ContainerStart(ctx, "oddk-pg-"+instanceB, container.StartOptions{}); err != nil {
+	if _, err := h.docker.ContainerStart(ctx, "oddk-pg-"+instanceB, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("start container of %s out-of-band: %w", instanceB, err)
 	}
 	// Simulate a container that ended up off the ODDK network (e.g. recreated
 	// manually during disaster recovery): detach A's container from oddk-bridge.
-	if err := h.docker.NetworkDisconnect(ctx, "oddk-bridge", "oddk-pg-"+instanceA, true); err != nil {
+	if _, err := h.docker.NetworkDisconnect(ctx, "oddk-bridge", client.NetworkDisconnectOptions{Container: "oddk-pg-" + instanceA, Force: true}); err != nil {
 		return fmt.Errorf("disconnect container of %s from oddk-bridge: %w", instanceA, err)
 	}
 
@@ -89,7 +89,7 @@ func testStartupReconciliation(h *TestHarness) error {
 	}
 
 	// Startup must have re-attached A's container to oddk-bridge.
-	inspectA, err := h.docker.ContainerInspect(ctx, "oddk-pg-"+instanceA)
+	inspectA, err := h.inspectContainer(ctx, "oddk-pg-"+instanceA)
 	if err != nil {
 		return fmt.Errorf("inspect container of %s after restart: %w", instanceA, err)
 	}
