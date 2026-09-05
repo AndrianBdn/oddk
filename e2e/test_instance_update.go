@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/moby/moby/client"
 )
 
 // instanceImageInfo fetches an instance's current image/version/status via the API.
@@ -28,6 +31,63 @@ func (h *TestHarness) instanceImageInfo(name string) (image, version, status str
 		return "", "", "", fmt.Errorf("unmarshal instance: %w", err)
 	}
 	return inst.Image, inst.Version, inst.Status, nil
+}
+
+// testImageRollback moves the instance's tag onto an image Docker cannot
+// start. Rollback must use the old container's image ID, not the moved tag.
+func testImageRollback(h *TestHarness) error {
+	const port = 15478
+	name := testPrefix + "-rollback"
+	tag := testPrefix + "-rollback:16"
+	if _, err := h.pullImageCLI("16"); err != nil {
+		return err
+	}
+	if err := h.retagImage("postgres:16", tag); err != nil {
+		return err
+	}
+	defer h.removeImage(tag)
+	if out, err := h.createInstanceWithImageCLI(name, port, tag, "16"); err != nil {
+		return fmt.Errorf("create instance: %w (%s)", err, out)
+	}
+	if _, err := h.createDatabaseCLI(name, "rollback_marker"); err != nil {
+		return err
+	}
+	ctx := context.Background()
+	old, err := h.inspectContainer(ctx, "oddk-pg-"+name)
+	if err != nil {
+		return err
+	}
+	_, err = h.docker.ContainerCommit(ctx, old.ID, client.ContainerCommitOptions{
+		Reference: tag,
+		Changes:   []string{`ENTRYPOINT ["/oddk-test-missing-entrypoint"]`},
+		NoPause:   true,
+	})
+	if err != nil {
+		return fmt.Errorf("prepare failing patch: %w", err)
+	}
+	out, err := h.switchInstanceCLI(name, tag)
+	if err == nil || !strings.Contains(out+err.Error(), "rolled back") {
+		return fmt.Errorf("expected failed switch with successful rollback, got %v (%s)", err, out)
+	}
+	actual, err := h.inspectContainer(ctx, "oddk-pg-"+name)
+	if err != nil {
+		return err
+	}
+	if actual.Image != old.Image || actual.ID == old.ID || !actual.State.Running {
+		return fmt.Errorf("rollback did not recreate the original running image: before=%s after=%s running=%v", old.Image, actual.Image, actual.State.Running)
+	}
+	image, _, status, err := h.instanceImageInfo(name)
+	if err != nil {
+		return err
+	}
+	if image != tag || status != "running" {
+		return fmt.Errorf("rollback changed recorded configuration: image=%s status=%s", image, status)
+	}
+	databases, err := h.listDatabasesCLI(name)
+	if err != nil || !strings.Contains(databases, "rollback_marker") {
+		return fmt.Errorf("database did not survive rollback: %v (%s)", err, databases)
+	}
+	return nil
 }
 
 // testInstanceUpdate exercises `oddk instance update` against real registry tags:

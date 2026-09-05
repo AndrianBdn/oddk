@@ -253,6 +253,10 @@ oddk instance reset-db-user-password app --username appuser
 oddk instance delete-db-user app --username appuser
 ```
 
+`add-db-user` creates the role, grants access, and applies any requested ownership
+changes in one transaction. A failed grant or ownership transfer rolls all of them
+back. Ownership transfer includes public-schema functions and stored procedures.
+
 `delete-db-user` first reassigns everything the user owns to `postgres`, then
 revokes its grants and drops the role. If that reassignment fails the command
 aborts and leaves the user in place — it will not proceed to a step that would
@@ -260,6 +264,11 @@ drop the objects instead of the grants. On a very large database the reassign
 can exhaust the shared lock table (`out of shared memory ... increase
 max_locks_per_transaction`); raise `max_locks_per_transaction` with a parameter
 group and retry.
+
+Concurrent application DDL is also guarded: if a new object would be deleted
+during privilege cleanup, the command aborts and rolls back that database's
+cleanup, preserving the object and the user. Stop the application's DDL and
+retry. Cleanup already completed in other databases is not rolled back.
 
 ### Passwords
 

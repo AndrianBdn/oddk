@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	s3service "github.com/andrianbdn/oddk/internal/services/s3"
@@ -471,18 +470,4 @@ func (op *SnapshotCronTaskOp) runRemoteCleanup(ctx context.Context) error {
 		log.Printf("Snapshot remote cleanup: removed %d archive(s) older than %d days", deleted, plan.CleanupRemoteDays)
 	}
 	return nil
-}
-
-// parseS3Location splits an s3://bucket/key location.
-func parseS3Location(location string) (bucket, key string, err error) {
-	const scheme = "s3://"
-	if !strings.HasPrefix(location, scheme) {
-		return "", "", fmt.Errorf("not an s3:// location")
-	}
-	rest := strings.TrimPrefix(location, scheme)
-	bucket, key, found := strings.Cut(rest, "/")
-	if !found {
-		return "", "", fmt.Errorf("no key in location")
-	}
-	return bucket, key, nil
 }

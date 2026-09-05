@@ -112,25 +112,6 @@ func validateDownloadableBackup(deps *Dependencies, params DownloadBackupParams)
 	return record, nil
 }
 
-// parseRemoteS3Location extracts the object key from an s3://bucket/key
-// location and verifies the bucket matches the active offsite configuration.
-func parseRemoteS3Location(s3Location, configuredBucket string) (string, error) {
-	if !strings.HasPrefix(s3Location, "s3://") {
-		return "", fmt.Errorf("invalid S3 location format: %s", s3Location)
-	}
-
-	parts := strings.SplitN(strings.TrimPrefix(s3Location, "s3://"), "/", 2)
-	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid S3 location format: %s", s3Location)
-	}
-
-	if parts[0] != configuredBucket {
-		return "", fmt.Errorf("backup S3 bucket (%s) doesn't match current configuration (%s)",
-			parts[0], configuredBucket)
-	}
-	return parts[1], nil
-}
-
 // streamToLocalFile streams the S3 object to localPath (the client verifies the
 // byte count against the response's ContentLength), fsyncs it, and checks the
 // Close. The partial file is removed on any failure.

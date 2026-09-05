@@ -11,6 +11,39 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.84 — 2026-09-05
+
+### Fixed
+
+- **Deleting a database user no longer risks deleting objects created during
+  ownership reassignment.** Each database's reassignment and privilege cleanup
+  now run in a transaction that refuses object deletion. If concurrent DDL would
+  cause data loss, the command preserves the object and the role and asks you to
+  stop the application's DDL before retrying. Cleanup already completed in other
+  databases is not rolled back.
+- **Container rollback uses the previous image's immutable ID.** If an update
+  or image switch moves a tag to a broken image, rollback restores the image the
+  old container actually used instead of retrying the broken tag. The previous
+  image is checked before the existing container is removed.
+- **Adding a database user is atomic.** Role creation, grants, and optional
+  ownership transfer now share one transaction. A failed grant or ownership
+  change no longer leaves a partially configured user or changed database owner
+  behind without returning the generated password.
+- **`add-db-user --owner` handles stored procedures and aggregates**, as well as
+  functions. Ownership statements explicitly name the public schema, so a
+  customized `search_path` cannot redirect them.
+
+### Changed
+
+- Parameter-file decoding is shared by the CLI and API; both still accept a
+  bare array or the object emitted by `parameters get --json`. S3-location
+  parsing is shared by backup and snapshot operations and rejects locations
+  with an empty bucket or object key.
+- Removed the E2E runner's unused `-v` and `-parallel` flags.
+
+**Action:** Upgrade ODDK and restart its daemon before managing database users
+or changing instance images. No database migration is required.
+
 ## v0.1.83 — 2026-09-04
 
 ### Added

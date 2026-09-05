@@ -78,24 +78,6 @@ func DeleteDatabaseUser(ctx context.Context, deps *Dependencies, params DeleteDa
 
 	// Process each database to reassign ownership and revoke privileges
 	for _, dbName := range databases {
-		// Check if user owns this database
-		var dbOwner string
-		ownerQuery := "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1"
-		if err := conn.QueryRow(ctx, ownerQuery, dbName).Scan(&dbOwner); err != nil {
-			log.Printf("Warning: failed to check database owner for %s: %v", dbName, err)
-			continue
-		}
-
-		// If user owns the database, reassign to postgres
-		if dbOwner == params.Username {
-			alterDBQuery := fmt.Sprintf("ALTER DATABASE %s OWNER TO postgres",
-				pgx.Identifier{dbName}.Sanitize())
-			if _, err := conn.Exec(ctx, alterDBQuery); err != nil {
-				return nil, fmt.Errorf("failed to reassign database %s ownership: %w", dbName, err)
-			}
-			log.Printf("Reassigned database %s ownership from %s to postgres", dbName, params.Username)
-		}
-
 		// Connect to the database to handle object ownership
 		dbConn, err := ConnectToRunningInstance(ctx, deps, params.InstanceName, ConnectOptions{Database: dbName})
 		if err != nil {
@@ -103,34 +85,11 @@ func DeleteDatabaseUser(ctx context.Context, deps *Dependencies, params DeleteDa
 			continue
 		}
 
-		// Reassign all owned objects in this database to postgres.
-		//
-		// This MUST succeed before DROP OWNED BY runs below. DROP OWNED BY drops
-		// every object the role still owns, so treating a failed reassign as a
-		// warning and falling through would destroy user tables instead of merely
-		// revoking privileges. Abort the whole operation instead: the role still
-		// owns objects, so the closing DROP USER could not succeed anyway.
-		//
-		// The realistic failure is a large database. REASSIGN OWNED locks every
-		// object it touches in a single transaction, so a database holding more
-		// relations than the shared lock pool
-		// (max_locks_per_transaction * max_connections) exhausts it and errors.
-		reassignQuery := fmt.Sprintf("REASSIGN OWNED BY %s TO postgres",
-			pgx.Identifier{params.Username}.Sanitize())
-		if _, err := dbConn.Exec(ctx, reassignQuery); err != nil {
+		if err := reassignAndRevokeDatabaseUser(ctx, dbConn, params.Username); err != nil {
 			_ = dbConn.Close(ctx)
-			return nil, fmt.Errorf("reassign objects owned by %s in database %s (user was NOT deleted; "+
-				"on an out-of-shared-memory error raise max_locks_per_transaction): %w",
+			return nil, fmt.Errorf("preserve objects and revoke privileges for %s in database %s (user was NOT deleted; "+
+				"on an out-of-shared-memory error raise max_locks_per_transaction; on concurrent object creation stop the application's DDL and retry): %w",
 				params.Username, dbName, err)
-		}
-
-		// Drop privileges granted to the user. The reassign above succeeded, so
-		// the role owns nothing here and this revokes grants without dropping
-		// objects.
-		dropOwnedQuery := fmt.Sprintf("DROP OWNED BY %s",
-			pgx.Identifier{params.Username}.Sanitize())
-		if _, err := dbConn.Exec(ctx, dropOwnedQuery); err != nil {
-			log.Printf("Warning: failed to drop privileges in database %s: %v", dbName, err)
 		}
 
 		_ = dbConn.Close(ctx)
@@ -147,4 +106,62 @@ func DeleteDatabaseUser(ctx context.Context, deps *Dependencies, params DeleteDa
 		Username: params.Username,
 		Message:  fmt.Sprintf("User %s deleted successfully (owned objects reassigned to postgres)", params.Username),
 	}, nil
+}
+
+// reassignAndRevokeDatabaseUser preserves objects even if another session
+// creates one after REASSIGN OWNED's scan. A transaction alone cannot prevent
+// that race: DROP OWNED would see the new object and delete it. The sql_drop
+// guard aborts that transaction instead. It exists only inside this transaction
+// and is removed before commit, so other sessions never acquire the guard.
+func reassignAndRevokeDatabaseUser(ctx context.Context, conn *pgx.Conn, username string) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	// Default ACLs and user mappings belong to the departing role and are
+	// deliberately not reassigned by PostgreSQL. They are privilege metadata;
+	// every other object deletion must roll back, including dependent objects.
+	_, err = tx.Exec(ctx, `
+		DO $$ BEGIN
+			IF current_setting('event_triggers', true) IS NOT NULL THEN
+				PERFORM set_config('event_triggers', 'on', true);
+			END IF;
+		END $$;
+		CREATE FUNCTION pg_temp.oddk_preserve_owned_objects() RETURNS event_trigger
+		LANGUAGE plpgsql AS $$
+		DECLARE dropped record;
+		BEGIN
+			FOR dropped IN SELECT * FROM pg_catalog.pg_event_trigger_dropped_objects()
+			LOOP
+				IF dropped.classid NOT IN ('pg_catalog.pg_default_acl'::regclass, 'pg_catalog.pg_user_mapping'::regclass) THEN
+					RAISE EXCEPTION 'concurrent object creation: refusing to delete % %',
+						dropped.object_type, dropped.object_identity;
+				END IF;
+			END LOOP;
+		END $$;
+		CREATE EVENT TRIGGER oddk_preserve_owned_objects ON sql_drop
+			WHEN TAG IN ('DROP OWNED') EXECUTE FUNCTION pg_temp.oddk_preserve_owned_objects();
+		ALTER EVENT TRIGGER oddk_preserve_owned_objects ENABLE ALWAYS;
+	`)
+	if err != nil {
+		return fmt.Errorf("install object preservation guard: %w", err)
+	}
+	user := pgx.Identifier{username}.Sanitize()
+	// This also reassigns shared objects (databases and tablespaces), keeping
+	// their ownership changes inside the same rollback as the local objects.
+	if _, err := tx.Exec(ctx, "REASSIGN OWNED BY "+user+" TO postgres"); err != nil {
+		return fmt.Errorf("reassign ownership: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "DROP OWNED BY "+user); err != nil {
+		return fmt.Errorf("revoke privileges: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		DROP EVENT TRIGGER oddk_preserve_owned_objects;
+		DROP FUNCTION pg_temp.oddk_preserve_owned_objects();
+	`); err != nil {
+		return fmt.Errorf("remove object preservation guard: %w", err)
+	}
+	return tx.Commit(ctx)
 }

@@ -7,6 +7,8 @@ import (
 	"log"
 	"strings"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
 	"github.com/andrianbdn/oddk/internal/store/instances"
@@ -109,6 +111,27 @@ func annotateReadyError(deps *Dependencies, containerID string, readyErr error) 
 // No container id is returned: every store write this function is responsible
 // for has already happened by the time it returns.
 func applyClusterChange(ctx context.Context, deps *Dependencies, next, prev clusterSpec, oldContainerID string) (rolledBack bool, err error) {
+	// A pull may already have moved prev.Image to the new patch. Pin the
+	// image the old container actually used before removing it. Try its name
+	// too, since a previous crash may have left the stored ID stale.
+	for _, ref := range []string{oldContainerID, docker.ContainerName(prev.Name)} {
+		if ref == "" {
+			continue
+		}
+		imageID, inspectErr := deps.Docker.GetContainerImageID(ref)
+		if cerrdefs.IsNotFound(inspectErr) {
+			continue
+		}
+		if inspectErr != nil {
+			return false, classifyRecreateError(fmt.Errorf("%w: resolve rollback image: %w", docker.ErrPreflight, inspectErr))
+		}
+		if _, exists := deps.Docker.CheckImageExists(imageID); !exists {
+			return false, classifyRecreateError(fmt.Errorf("%w: previous image %s is unavailable for rollback", docker.ErrPreflight, imageID))
+		}
+		prev.Image = imageID
+		break
+	}
+
 	id, err := recreateStartReady(ctx, deps, next, oldContainerID)
 	if err != nil {
 		if errors.Is(err, docker.ErrPreflight) {

@@ -42,7 +42,7 @@ func recreateInstanceOnImage(ctx context.Context, deps *Dependencies, instance *
 
 	rolledBack, err := applyClusterChange(ctx, deps, next, prev, instance.ContainerID)
 	if rolledBack {
-		return nil, fmt.Errorf("image %s could not start: %w (rolled back to %s)", newImage, err, instance.Image)
+		return nil, fmt.Errorf("image %s could not start: %w (rolled back to the previous container image)", newImage, err)
 	}
 	if err != nil {
 		if prevStatus != instances.StatusError && errors.Is(err, operr.ErrInvalid) {

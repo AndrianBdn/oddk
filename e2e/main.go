@@ -5,7 +5,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"time"
 )
@@ -23,24 +22,15 @@ const (
 )
 
 func main() {
-	var (
-		cleanup  = flag.Bool("cleanup", false, "Clean up all test containers and exit")
-		verbose  = flag.Bool("v", false, "Verbose output")
-		parallel = flag.Int("parallel", 1, "Number of tests to run in parallel")
-	)
+	cleanup := flag.Bool("cleanup", false, "Clean up all test containers and exit")
 	flag.Parse()
-
-	runner := &TestRunner{
-		verbose:  *verbose,
-		parallel: *parallel,
-	}
 
 	fmt.Printf("%s🧪 ODDK End-to-End Tests%s\n", colorCyan, colorReset)
 	fmt.Printf("═══════════════════════════════\n\n")
 
 	if *cleanup {
 		fmt.Printf("%s🧹 Cleaning up all test containers...%s\n", colorBlue, colorReset)
-		if err := runner.cleanupAllTestContainers(); err != nil {
+		if err := cleanupAllTestContainers(); err != nil {
 			fmt.Printf("%s❌ Cleanup failed: %v%s\n", colorRed, err, colorReset)
 			os.Exit(1)
 		}
@@ -61,6 +51,8 @@ func main() {
 		{Name: "BackupRemovalOperations", Fn: testBackupRemovalOperations},
 		{Name: "PasswordOperations", Fn: testPasswordOperations},
 		{Name: "DatabaseManagement", Fn: testDatabaseManagement},
+		{Name: "DatabaseUserAtomicity", Fn: testDatabaseUserAtomicity},
+		{Name: "DeleteUserConcurrentDDL", Fn: testDeleteUserConcurrentDDL},
 		{Name: "CronCRUD", Fn: testCronCRUD},
 		{Name: "CronValidation", Fn: testCronValidation},
 		{Name: "CronMultipleInstances", Fn: testCronMultipleInstances},
@@ -101,6 +93,7 @@ func main() {
 		{Name: "CreateAutoPull", Fn: testCreateAutoPull},
 		{Name: "InstanceUpdate", Fn: testInstanceUpdate},
 		{Name: "ImageRepullSwitch", Fn: testImageRepullSwitch},
+		{Name: "ImageRollback", Fn: testImageRollback},
 		{Name: "SnapshotMake", Fn: testSnapshotMake},
 		{Name: "SnapshotRoundTrip", Fn: testSnapshotRoundTrip},
 		{Name: "SnapshotRestoreInstance", Fn: testSnapshotRestoreInstance},
@@ -168,7 +161,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	results := runner.runTests(tests)
+	results := runTests(tests)
 
 	duration := time.Since(start)
 
@@ -215,12 +208,7 @@ type TestResult struct {
 	Error    string
 }
 
-type TestRunner struct {
-	verbose  bool
-	parallel int
-}
-
-func (r *TestRunner) runTests(tests []Test) []TestResult {
+func runTests(tests []Test) []TestResult {
 	results := make([]TestResult, len(tests))
 
 	for i, test := range tests {
@@ -261,9 +249,4 @@ func (r *TestRunner) runTests(tests []Test) []TestResult {
 	}
 
 	return results
-}
-
-func (r *TestRunner) cleanupAllTestContainers() error {
-	log.Printf("Cleaning up all test containers...")
-	return cleanupAllTestContainers()
 }

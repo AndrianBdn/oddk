@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -531,28 +530,17 @@ func (c *Client) RemoveVolume(volumeName string) error {
 	return nil
 }
 
-// CheckImageExists checks if a Docker image exists locally and returns its tags
+// CheckImageExists accepts tags, digests and image IDs, including untagged
+// images retained for rollback, and returns the image's current tags.
 func (c *Client) CheckImageExists(imageName string) ([]string, bool) {
-	images, err := c.cli.ImageList(c.ctx, client.ImageListOptions{})
+	image, err := c.cli.ImageInspect(c.ctx, imageName)
 	if err != nil {
-		log.Printf("Error listing images: %v", err)
+		if !cerrdefs.IsNotFound(err) {
+			log.Printf("Error inspecting image %s: %v", imageName, err)
+		}
 		return nil, false
 	}
-
-	var tags []string
-	for _, img := range images.Items {
-		for _, tag := range img.RepoTags {
-			if tag == imageName {
-				tags = append(tags, tag)
-			}
-		}
-	}
-
-	if len(tags) > 0 {
-		return tags, true
-	}
-
-	return nil, false
+	return image.RepoTags, true
 }
 
 // GetImageID returns the local image ID (sha256:...) that an image tag/name
@@ -560,17 +548,14 @@ func (c *Client) CheckImageExists(imageName string) ([]string, bool) {
 // moving tag (e.g. postgres:18) this reflects the newest patch, which can be
 // compared against a container's image ID to detect a pending update.
 func (c *Client) GetImageID(imageName string) (string, bool) {
-	images, err := c.cli.ImageList(c.ctx, client.ImageListOptions{})
+	image, err := c.cli.ImageInspect(c.ctx, imageName)
 	if err != nil {
-		log.Printf("Error listing images: %v", err)
+		if !cerrdefs.IsNotFound(err) {
+			log.Printf("Error inspecting image %s: %v", imageName, err)
+		}
 		return "", false
 	}
-	for _, img := range images.Items {
-		if slices.Contains(img.RepoTags, imageName) {
-			return img.ID, true
-		}
-	}
-	return "", false
+	return image.ID, true
 }
 
 // GetContainerImageID returns the ID (sha256:...) of the image a container was

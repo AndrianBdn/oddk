@@ -78,52 +78,43 @@ func AddDatabaseUser(ctx context.Context, deps *Dependencies, params AddDatabase
 	// Generate a secure password
 	password := util.GenerateSecurePassword(24)
 
+	// Role creation, grants, and ownership changes must succeed together.
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin user creation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	// Create the user with the generated password (can be done from any database).
 	// PostgreSQL doesn't accept parameter binding for the PASSWORD clause,
 	// so the literal is escaped via quotePostgresLiteral instead.
 	createUserQuery := fmt.Sprintf("CREATE USER %s WITH PASSWORD %s",
 		pgx.Identifier{params.Username}.Sanitize(), quotePostgresLiteral(password))
-	if _, err := conn.Exec(ctx, createUserQuery); err != nil {
+	if _, err := tx.Exec(ctx, createUserQuery); err != nil {
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
-	// Apply database- and schema-level grants; the first failure rolls back
-	// the just-created user.
 	for _, step := range grantStatements(params.DatabaseName, params.Username, params.ReadOnly, dbOwner) {
-		if _, err := conn.Exec(ctx, step.sql); err != nil {
-			_ = dropUserBestEffort(ctx, conn, params.Username)
+		if _, err := tx.Exec(ctx, step.sql); err != nil {
 			return nil, fmt.Errorf("failed to %s: %w", step.what, err)
 		}
 	}
 
-	// Transfer ownership if requested
 	if params.Owner {
-		// Transfer database ownership (must be done from a different database, we're connected to target)
-		// We need a separate connection to postgres database for ALTER DATABASE
-		postgresConn, err := ConnectToRunningInstance(ctx, deps, params.InstanceName, ConnectOptions{Database: "postgres"})
-		if err != nil {
-			_ = dropUserBestEffort(ctx, conn, params.Username)
-			return nil, fmt.Errorf("failed to connect to postgres database for ownership transfer: %w", err)
-		}
-		defer func() { _ = postgresConn.Close(ctx) }()
-
 		alterDBQuery := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s",
 			pgx.Identifier{params.DatabaseName}.Sanitize(),
 			pgx.Identifier{params.Username}.Sanitize())
-		if _, err := postgresConn.Exec(ctx, alterDBQuery); err != nil {
-			_ = dropUserBestEffort(ctx, conn, params.Username)
+		if _, err := tx.Exec(ctx, alterDBQuery); err != nil {
 			return nil, fmt.Errorf("failed to transfer database ownership: %w", err)
 		}
 
-		// Transfer ownership of all objects in the database from postgres to the new user
-		// Note: REASSIGN OWNED BY postgres doesn't work because postgres is a superuser
-		// and PostgreSQL won't reassign system-required objects. Instead, we transfer
-		// ownership of user objects (tables, sequences, functions, etc.) individually.
-		if err := transferSchemaObjectsOwnership(ctx, conn, params.Username); err != nil {
-			// Note: database ownership already transferred, but that's acceptable
-			// The user can still run migrations on their own objects
+		if err := transferSchemaObjectsOwnership(ctx, tx, params.Username); err != nil {
 			return nil, fmt.Errorf("failed to transfer object ownership: %w", err)
 		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit user creation: %w", err)
 	}
 
 	accessType := map[bool]string{true: "read-only", false: "read-write"}[params.ReadOnly]
@@ -216,21 +207,24 @@ func dropUserBestEffort(ctx context.Context, conn *pgx.Conn, username string) er
 	return nil
 }
 
-// transferSchemaObjectsOwnership transfers ownership of all user objects in public schema
-// to the specified user. This is used instead of REASSIGN OWNED BY postgres which fails
-// because postgres is a superuser and PostgreSQL protects system objects.
-func transferSchemaObjectsOwnership(ctx context.Context, conn *pgx.Conn, newOwner string) error {
+// transferSchemaObjectsOwnership transfers supported public-schema objects owned
+// by postgres. REASSIGN OWNED would also target protected system objects.
+func transferSchemaObjectsOwnership(ctx context.Context, tx pgx.Tx, newOwner string) error {
 	sanitizedOwner := pgx.Identifier{newOwner}.Sanitize()
 
 	transferKind := func(kind, alterVerb, listQuery string) error {
-		names, err := querySingleColumn(ctx, conn, listQuery, kind)
+		rows, err := tx.Query(ctx, listQuery)
 		if err != nil {
-			return err
+			return fmt.Errorf("query %ss: %w", kind, err)
+		}
+		names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return fmt.Errorf("collect %ss: %w", kind, err)
 		}
 		for _, name := range names {
 			query := fmt.Sprintf("ALTER %s %s OWNER TO %s",
-				alterVerb, pgx.Identifier{name}.Sanitize(), sanitizedOwner)
-			if _, err := conn.Exec(ctx, query); err != nil {
+				alterVerb, pgx.Identifier{"public", name}.Sanitize(), sanitizedOwner)
+			if _, err := tx.Exec(ctx, query); err != nil {
 				return fmt.Errorf("alter %s %s owner: %w", kind, name, err)
 			}
 		}
@@ -260,7 +254,7 @@ func transferSchemaObjectsOwnership(ctx context.Context, conn *pgx.Conn, newOwne
 
 	// Functions need their argument signature in the ALTER statement, so they
 	// can't go through transferKind.
-	if err := transferFunctionOwnership(ctx, conn, sanitizedOwner); err != nil {
+	if err := transferFunctionOwnership(ctx, tx, sanitizedOwner); err != nil {
 		return err
 	}
 
@@ -280,10 +274,10 @@ func transferSchemaObjectsOwnership(ctx context.Context, conn *pgx.Conn, newOwne
 	return nil
 }
 
-// transferFunctionOwnership transfers ownership of public-schema functions and
-// procedures owned by postgres.
-func transferFunctionOwnership(ctx context.Context, conn *pgx.Conn, sanitizedOwner string) error {
-	rows, err := conn.Query(ctx, `
+// transferFunctionOwnership transfers public-schema functions, procedures, and
+// aggregates owned by postgres.
+func transferFunctionOwnership(ctx context.Context, tx pgx.Tx, sanitizedOwner string) error {
+	rows, err := tx.Query(ctx, `
 		SELECT p.proname, pg_get_function_identity_arguments(p.oid) as args
 		FROM pg_proc p
 		JOIN pg_namespace n ON p.pronamespace = n.oid
@@ -294,50 +288,21 @@ func transferFunctionOwnership(ctx context.Context, conn *pgx.Conn, sanitizedOwn
 		return fmt.Errorf("query functions: %w", err)
 	}
 	type funcSig struct{ name, args string }
-	var funcs []funcSig
-	for rows.Next() {
+	funcs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (funcSig, error) {
 		var f funcSig
-		if err := rows.Scan(&f.name, &f.args); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan function name: %w", err)
-		}
-		funcs = append(funcs, f)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate functions: %w", err)
+		err := row.Scan(&f.name, &f.args)
+		return f, err
+	})
+	if err != nil {
+		return fmt.Errorf("collect routines: %w", err)
 	}
 
 	for _, f := range funcs {
-		query := fmt.Sprintf("ALTER FUNCTION %s(%s) OWNER TO %s",
-			pgx.Identifier{f.name}.Sanitize(), f.args, sanitizedOwner)
-		if _, err := conn.Exec(ctx, query); err != nil {
-			return fmt.Errorf("alter function %s owner: %w", f.name, err)
+		query := fmt.Sprintf("ALTER ROUTINE %s(%s) OWNER TO %s",
+			pgx.Identifier{"public", f.name}.Sanitize(), f.args, sanitizedOwner)
+		if _, err := tx.Exec(ctx, query); err != nil {
+			return fmt.Errorf("alter routine %s owner: %w", f.name, err)
 		}
 	}
 	return nil
-}
-
-// querySingleColumn collects a single-column string result set. It fully
-// drains and closes the rows before returning so the caller can safely Exec
-// on the same connection afterwards (pgx forbids Exec while rows are open).
-func querySingleColumn(ctx context.Context, conn *pgx.Conn, query, kind string) ([]string, error) {
-	rows, err := conn.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("query %ss: %w", kind, err)
-	}
-	defer rows.Close()
-
-	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("scan %s name: %w", kind, err)
-		}
-		names = append(names, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate %ss: %w", kind, err)
-	}
-	return names, nil
 }
