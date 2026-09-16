@@ -373,3 +373,33 @@ func TestMigrateFromBackups_PartialFailureIsExplained(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrateFromBackups_LargeArchivesHaveNoUploadCapWarning(t *testing.T) {
+	f := defaultMigrateDaemon()
+	f.backupsRaw = `[{"id": 1, "instanceName": "app", "timestamp": "2026-09-15T03:00:00Z", "size": 10737418240, "status": "completed"}]`
+	env := f.start(t)
+	out, err := runMigrate(t, env, "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "10.0 GiB") {
+		t.Errorf("large archive missing from disk estimate: %s", out)
+	}
+	if strings.Contains(out, "single-PutObject") || strings.Contains(out, "cannot") {
+		t.Errorf("obsolete upload warning: %s", out)
+	}
+	out, err = runMigrate(t, env, "--dry-run", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		EstimatedBytes int64 `json:"estimatedSnapshotBytes"`
+		NearUploadCap  *bool `json:"nearUploadCap"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.EstimatedBytes != 10737418240 || report.NearUploadCap == nil || *report.NearUploadCap {
+		t.Fatalf("unexpected estimate: %s", out)
+	}
+}

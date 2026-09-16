@@ -414,8 +414,13 @@ What you need to know:
   archive carries only the hash. Re-read it with `instance get-postgres-password`.
 - Retention keeps the newest snapshots regardless of age, so a run of failed
   captures can never expire everything you have.
-- Offsite upload is currently limited to 5 GiB per snapshot (a single S3
-  `PutObject`; no multipart yet).
+- Backups and snapshots larger than 5 GiB upload automatically using S3
+  multipart uploads. Failed uploads keep their local copy for retry. Allow
+  `s3:AbortMultipartUpload` on the archive prefix so failed or canceled uploads
+  can clean up their uploaded parts. Configure a bucket lifecycle rule to abort
+  incomplete multipart uploads left by a daemon crash or loss of connectivity.
+  For SSE-KMS buckets, the upload identity needs `kms:Decrypt` and
+  `kms:GenerateDataKey` on the encryption key.
 
 `oddk checklist` reports whether snapshots are scheduled, how stale the newest one
 is, and — per instance — whether that instance's data is actually in the newest

@@ -13,15 +13,6 @@ import (
 	"github.com/andrianbdn/oddk/internal/store/offsite"
 )
 
-// maxPutObjectBytes is S3's hard limit for a single PutObject.
-//
-// s3.Client.UploadFile is a single PutObject — there is no multipart upload and
-// aws-sdk-go-v2's feature/s3/manager is deliberately not a dependency. That has
-// never mattered for per-instance backups, but a snapshot covers the WHOLE
-// deployment and can plausibly cross 5 GiB. Checking up front turns an opaque
-// SDK failure at the end of a long upload into an actionable refusal.
-const maxPutObjectBytes int64 = 5 * 1024 * 1024 * 1024
-
 // SnapshotS3Prefix is the first key segment for snapshots, mirroring how a
 // backup's key starts with its instance name. Snapshots belong to no single
 // instance, and "*" cannot collide with a real one because instance names are
@@ -76,12 +67,6 @@ func UploadSnapshot(ctx context.Context, deps *Dependencies, id int) (*UploadSna
 	if err != nil {
 		return nil, fmt.Errorf("stat snapshot file: %w", err)
 	}
-	if info.Size() > maxPutObjectBytes {
-		return nil, operr.Invalidf(
-			"snapshot %d is %.1f GiB, above the %d GiB limit for a single S3 PutObject, and ODDK does not do multipart uploads. Copy it offsite by other means, or reduce what the deployment holds",
-			id, float64(info.Size())/(1024*1024*1024), maxPutObjectBytes/(1024*1024*1024),
-		)
-	}
 
 	s3Client, err := s3service.NewClient(ctx, settings)
 	if err != nil {
@@ -96,7 +81,7 @@ func UploadSnapshot(ctx context.Context, deps *Dependencies, id int) (*UploadSna
 	// written and only the bookkeeping failed, the first object is orphaned in
 	// S3 forever, invisible to ODDK and to remote retention (which works off the
 	// recorded location). Deriving the key from CreatedAt makes upload
-	// idempotent — a retry targets the same key and PutObject overwrites it.
+	// idempotent — a retry targets the same key and replaces it only when complete.
 	// Do not delete-then-put: a failed upload after a successful delete would
 	// drop a previously-good remote copy.
 	s3Key := fmt.Sprintf("%s/%s/%s", SnapshotS3Prefix, record.CreatedAt.Format("2006-01-02"), filename)

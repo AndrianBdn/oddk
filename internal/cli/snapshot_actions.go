@@ -107,8 +107,7 @@ func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error
 		_, _ = fmt.Fprintf(c.out, "Snapshot: %s\n", result.Path)
 	}
 	// humanSize, matching 'snapshot list' — the same value was rendered two
-	// different ways. It also makes the 5 GiB offsite upload limit something an
-	// operator can check at a glance. The exact byte count is still in --json.
+	// different ways. The exact byte count is still in --json.
 	_, _ = fmt.Fprintf(c.out, "Size: %s\n", humanSize(result.Size))
 	_, _ = fmt.Fprintf(c.out, "Format: %s\n", describeSnapshotFormat(result.Format))
 	// The per-instance list above already names every instance, so spelling out

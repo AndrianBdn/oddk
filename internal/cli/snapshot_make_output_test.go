@@ -41,8 +41,7 @@ func TestSnapshotMakeOutput_NoConfigOnlyBreakdown(t *testing.T) {
 	if strings.Contains(out, "configuration-only") {
 		t.Errorf("should not mention configuration-only when there are none, got:\n%s", out)
 	}
-	// Same value as 'snapshot list' renders, and comparable against the 5 GiB
-	// offsite upload limit at a glance.
+	// Same value as 'snapshot list' renders.
 	if !strings.Contains(out, "Size: 1.2 GiB") {
 		t.Errorf("expected a human-readable size, got:\n%s", out)
 	}

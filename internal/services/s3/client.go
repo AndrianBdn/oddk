@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/ec2rolecreds"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager" //nolint:staticcheck // Keeps seekable file uploads streaming; transfermanager buffers entire parts.
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -256,19 +257,66 @@ func IsRegionMismatch(err error) bool {
 	return strings.Contains(msg, "PermanentRedirect") || strings.Contains(msg, "AuthorizationHeaderMalformed")
 }
 
+// UploadFile automatically uses multipart uploads for large archives. Keep files
+// as ReaderAt+ReadSeeker so the SDK sizes parts to stay below 10,000 parts and
+// streams them from disk instead of allocating a part-sized buffer per worker.
 func (c *Client) UploadFile(ctx context.Context, key string, content io.Reader) error {
 	fullKey := c.bucketPath + key
 
-	_, err := c.s3Client.PutObject(ctx, &s3.PutObjectInput{
+	// The SDK's ReaderAt path starts at offset zero, even when the caller has
+	// already consumed a prefix. Give it a view of exactly the remaining data.
+	if file, ok := content.(interface {
+		io.ReaderAt
+		io.ReadSeeker
+	}); ok {
+		start, err := file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("get upload position: %w", err)
+		}
+		end, err := file.Seek(0, io.SeekEnd)
+		if err != nil {
+			return fmt.Errorf("get upload size: %w", err)
+		}
+		if _, err := file.Seek(start, io.SeekStart); err != nil {
+			return fmt.Errorf("restore upload position: %w", err)
+		}
+		content = io.NewSectionReader(file, start, max(0, end-start))
+	}
+
+	client := &uploadClient{Client: c.s3Client}
+	uploader := manager.NewUploader(client, func(u *manager.Uploader) { //nolint:staticcheck // See import: bounded memory for large files.
+		u.PartSize = 16 * 1024 * 1024
+		u.Concurrency = 2
+	})
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{ //nolint:staticcheck // See import: bounded memory for large files.
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(fullKey),
 		Body:   content,
 	})
 	if err != nil {
-		return fmt.Errorf("upload to S3: %w", err)
+		return fmt.Errorf("upload to S3: %w", errors.Join(err, client.abortErr))
 	}
 
 	return nil
+}
+
+// The uploader aborts failed multipart uploads using the upload's context,
+// which may already be canceled. Allow cleanup to finish, with a bounded wait.
+type uploadClient struct {
+	*s3.Client
+	abortErr error
+}
+
+func (c *uploadClient) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput, opts ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	output, err := c.Client.AbortMultipartUpload(cleanupCtx, input, opts...)
+	if err != nil {
+		// The SDK discards abort errors. Preserve this one so operators know
+		// that uploaded parts may remain and can identify the upload to clean.
+		c.abortErr = fmt.Errorf("abort multipart upload %s: %w", aws.ToString(input.UploadId), err)
+	}
+	return output, err
 }
 
 // DownloadFile loads an object fully into memory. Only use for small objects
@@ -340,9 +388,10 @@ func (c *Client) RelativeKey(fullKey string) string {
 
 // ObjectInfo describes one listed S3 object. Key is the full bucket-root key
 // (NOT relative to the client's bucket path), so it renders directly into an
-// s3://bucket/key URI. ETag identifies the CONTENT (for a single-PutObject
-// upload it is the body's MD5), which is what lets the download cache prove a
-// reuse candidate is the same object rather than a same-sized impostor.
+// s3://bucket/key URI. The download cache compares ETag alongside URI and size
+// to detect object replacement. Treat ETag as opaque: multipart uploads and
+// encryption can change its format, and identical bytes uploaded with different
+// part boundaries can have different ETags.
 type ObjectInfo struct {
 	Key          string    `json:"key"`
 	Size         int64     `json:"size"`

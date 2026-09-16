@@ -16,12 +16,6 @@ import (
 // grep for the command name before deleting, since install.sh still references
 // that one.)
 
-// snapshotUploadCapBytes mirrors maxPutObjectBytes in internal/operations: the
-// snapshot upload path is a single S3 PutObject. It is duplicated rather than
-// imported because this is a pre-flight *estimate* against a remote daemon that
-// may be a different build; the daemon remains the authority that enforces it.
-const snapshotUploadCapBytes int64 = 5 * 1024 * 1024 * 1024
-
 type backupCronPlan struct {
 	InstanceName      string `json:"instanceName"`
 	UTCHour           int    `json:"utcHour"`
@@ -50,7 +44,7 @@ type snapshotMigrationReport struct {
 	Unmanaged        unmanagedBackups `json:"unmanagedBackups"`
 	EstimatedBytes   int64            `json:"estimatedSnapshotBytes"`
 	EstimateSource   string           `json:"estimateSource"`
-	NearUploadCap    bool             `json:"nearUploadCap"`
+	NearUploadCap    bool             `json:"nearUploadCap"` // Always false; retained for JSON compatibility.
 }
 
 // snapshotMigrateFromBackupsAction adopts the per-instance backup schedules as
@@ -353,7 +347,6 @@ func (c *Client) fillMigrationEstimates(plans []backupCronPlan, report *snapshot
 		}
 		report.EstimateSource = "sumOfBackups"
 	}
-	report.NearUploadCap = report.EstimatedBytes > snapshotUploadCapBytes*4/5
 
 	migrating := make(map[string]bool, len(plans))
 	for _, p := range plans {
@@ -446,24 +439,6 @@ func (c *Client) printMigrationPreview(report snapshotMigrationReport) {
 				humanSize(report.EstimatedBytes*int64(report.SnapshotPlan.CleanupLocalDays)))
 		}
 	}
-
-	if report.NearUploadCap {
-		_, _ = fmt.Fprintf(c.out,
-			"\n⚠  Estimated snapshot size ~%s is near the %d GiB single-PutObject limit for\n"+
-				"   offsite upload. Per-instance backup uploads have no such limit, so a\n"+
-				"   deployment that uploaded fine before can produce a snapshot that cannot.\n"+
-				"   (%s; a snapshot compresses the whole deployment as one stream, so treat\n"+
-				"   this as approximate.)\n",
-			humanSize(report.EstimatedBytes), snapshotUploadCapBytes/(1024*1024*1024),
-			estimateSourceLabel(report.EstimateSource))
-	}
-}
-
-func estimateSourceLabel(source string) string {
-	if source == "lastSnapshot" {
-		return "measured from the most recent snapshot"
-	}
-	return "estimated by summing each instance's newest backup"
 }
 
 // printPostMigrationNotes reports what the migration deliberately left alone.

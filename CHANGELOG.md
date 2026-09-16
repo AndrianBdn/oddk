@@ -11,6 +11,23 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.85 — 2026-09-16
+
+### Fixed
+
+- **Backups and snapshots larger than 5 GiB can upload to S3.** Large archives
+  upload in parts, with retries per part and cleanup on failure or cancellation.
+  Uploads stream from disk with two concurrent parts.
+- **Local retention protects large snapshots that have no offsite copy.** The
+  previous exception for archives above 5 GiB is removed. Migration previews no
+  longer warn about the old upload cap.
+
+**Action:** Upgrade ODDK and restart its daemon. Allow `s3:AbortMultipartUpload`
+on the archive prefix in the bucket's upload policy. Configure an S3 lifecycle
+rule to abort incomplete multipart uploads left by crashes or failed cleanup.
+For SSE-KMS buckets, the upload identity also needs `kms:Decrypt` alongside
+`kms:GenerateDataKey` on the encryption key. No database migration is required.
+
 ## v0.1.84 — 2026-09-05
 
 ### Fixed

@@ -309,20 +309,8 @@ func (op *SnapshotCronTaskOp) runLocalCleanup() error {
 		// behind it protects nothing, and holding it would strand the row
 		// forever: it can never be uploaded, so the condition can never clear.
 		if present && offsiteConfigured && rec.RemotePath == "" {
-			// The safeguard exists because "no remote copy" usually means the
-			// upload failed and will be retried. For an archive above the
-			// PutObject limit that is never true: it can NEVER be uploaded, so
-			// holding it forever is not protecting a recoverable copy, it is
-			// filling the disk until snapshots stop working entirely. Let normal
-			// retention apply — the newest-N floor above still guarantees a
-			// local copy survives.
-			if rec.Size > maxPutObjectBytes {
-				log.Printf("Warning: local snapshot %d is %.1f GiB, above the %d GiB single-PutObject limit, so it can never be uploaded; applying local retention to it rather than keeping it forever",
-					rec.ID, float64(rec.Size)/(1024*1024*1024), maxPutObjectBytes/(1024*1024*1024))
-			} else {
-				log.Printf("Warning: keeping local snapshot %d past retention: offsite is configured but it has no remote copy (upload it or remove it manually)", rec.ID)
-				continue
-			}
+			log.Printf("Warning: keeping local snapshot %d past retention: offsite is configured but it has no remote copy (upload it or remove it manually)", rec.ID)
+			continue
 		}
 		if verdict.pinExpired {
 			// The last archive in which every instance had data is going away.

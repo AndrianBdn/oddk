@@ -93,7 +93,7 @@ func UploadBackup(ctx context.Context, deps *Dependencies, params UploadBackupPa
 		backupFilename,
 	)
 
-	// PutObject overwrites the same key. Deleting first meant a failed upload
+	// A completed upload replaces the same key. Deleting first meant a failed upload
 	// after a successful delete left no remote copy of a previously-good object.
 	if _, err := localFile.Seek(0, 0); err != nil {
 		return nil, fmt.Errorf("reset file position: %w", err)

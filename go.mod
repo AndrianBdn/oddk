@@ -7,7 +7,9 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.2
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.2
+	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.110.0
+	github.com/aws/smithy-go v1.28.1
 	github.com/containerd/errdefs v1.0.0
 	github.com/expr-lang/expr v1.17.8
 	github.com/go-pkgz/notify v1.5.0
@@ -75,7 +77,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.36.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.41.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.48.0 // indirect
-	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bkielbasa/cyclop v1.2.3 // indirect
