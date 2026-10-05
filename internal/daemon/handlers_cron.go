@@ -38,6 +38,14 @@ func (s *Server) handleCronBackupCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Deprecation: no NEW per-instance schedules. Editing, pausing, resuming
+	// and removing an existing one all still work — refusing those would strand
+	// a deployment that has not migrated yet with a schedule it cannot change.
+	if existing == nil && !s.allowNewBackupPlans() {
+		s.writeError(w, http.StatusBadRequest, operations.LegacyBackupNewScheduleRefusal)
+		return
+	}
+
 	utcHour := 3
 	cleanupLocal := 7
 	cleanupRemote := 14

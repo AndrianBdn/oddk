@@ -3,7 +3,11 @@ package compression
 import (
 	"archive/tar"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,17 +66,76 @@ type Member struct {
 //     the page cache; fsync narrows this but does not close it. Detecting later
 //     bit rot needs a separate scrub, which is why this is exported.
 func (c *Compressor) VerifyTarZstd(_ context.Context, archivePath string) ([]Member, error) {
+	return verifyTarZstd(archivePath, nil)
+}
+
+// Verified is what VerifyTarZstdDigest learned about an archive.
+type Verified struct {
+	Members []Member
+	// SHA256 is the lowercase hex digest of the archive FILE (the compressed
+	// bytes, not the content), in the form `sha256sum` prints, so an operator
+	// can check a copy by hand.
+	SHA256 string
+}
+
+// VerifyTarZstdDigest is VerifyTarZstd plus a SHA-256 of the file, computed
+// from the same read — the verify pass already pulls every byte of the file
+// through the decompressor, so hashing them on the way costs no extra I/O.
+// Returns nil and an error when verification fails: a corrupt archive has no
+// digest worth recording.
+//
+// The frame checksum and the digest answer different questions. The frame
+// checksum says "this file is internally broken"; it cannot say whether two
+// intact copies (local, S3, a DR host's download) are the SAME archive. A
+// digest recorded when the archive was written can — that is why the
+// catalogue stores it (migration 022).
+//
+// Only the write and download paths want a digest; the restore paths call
+// VerifyTarZstd and pay nothing for it.
+func (c *Compressor) VerifyTarZstdDigest(_ context.Context, archivePath string) (*Verified, error) {
+	h := sha256.New()
+	members, err := verifyTarZstd(archivePath, h)
+	if err != nil {
+		return nil, err
+	}
+	return &Verified{Members: members, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
+}
+
+// verifyTarZstd is the body of both verifiers. When h is non-nil, every byte
+// read from the file is also written to it, in order.
+//
+// The cost of h, measured on a 194 MB archive on a CPU without SHA extensions:
+// verify 0.47s, verify+digest 0.81s. Hashing in a separate goroutine measured
+// the same, so it is done inline. CPUs with SHA extensions hash several times
+// faster.
+func verifyTarZstd(archivePath string, h hash.Hash) ([]Member, error) {
 	f, err := os.Open(archivePath) // #nosec G304 - archivePath is controlled by caller
 	if err != nil {
 		return nil, fmt.Errorf("open archive: %w", err)
 	}
 	defer func() { _ = f.Close() }()
+	return verifyTarZstdFrom(f, h)
+}
 
-	zr, err := zstd.NewReader(f)
+// verifyTarZstdFrom is verifyTarZstd over an already-open reader, so that
+// extraction can verify and extract through ONE file handle (see
+// ExtractTarZstdWith). It reads f to EOF and does not close it.
+func verifyTarZstdFrom(f io.Reader, h hash.Hash) ([]Member, error) {
+	src := f
+	if h != nil {
+		// The decoder reads src from its own goroutine, so h is written there.
+		// That is safe to read afterwards only because zr.Close — explicit
+		// below, and deferred on every error path, both of which run before
+		// the caller calls Sum — waits for that goroutine to finish (it drains
+		// the goroutine's output channel until the goroutine closes it).
+		src = io.TeeReader(f, h)
+	}
+
+	zr, err := zstd.NewReader(src)
 	if err != nil {
 		return nil, fmt.Errorf("open zstd stream: %w", err)
 	}
-	defer zr.Close()
+	defer zr.Close() // idempotent
 
 	var members []Member
 	tr := tar.NewReader(zr)
@@ -97,7 +160,41 @@ func (c *Compressor) VerifyTarZstd(_ context.Context, archivePath string) ([]Mem
 		return members, fmt.Errorf("archive is corrupt (zstd stream did not validate): %w", err)
 	}
 
+	if h != nil {
+		// Stop the decoder's reader goroutine, then hash whatever it did not
+		// read. The decoder has already seen EOF (it must, to know no further
+		// frame follows), so the tail is normally empty — it is read so the
+		// digest covers the whole file by construction rather than by an
+		// assumption about the decoder's buffering.
+		zr.Close()
+		if _, err := io.Copy(io.Discard, src); err != nil {
+			return members, fmt.Errorf("read archive tail: %w", err)
+		}
+	}
+
 	return members, nil
+}
+
+// ErrArchiveChanged marks an archive file that was modified in place while it
+// was being verified and extracted.
+var ErrArchiveChanged = errors.New("archive changed during extraction")
+
+// afterVerifyHook, when set, runs between verification and extraction. Tests
+// use it to replace the archive in exactly that window; it is nil otherwise.
+var afterVerifyHook func()
+
+// ErrDigestMismatch marks an archive that verified as intact but whose SHA-256
+// is not the one its catalogue recorded: a different archive under the
+// expected name.
+var ErrDigestMismatch = errors.New("archive digest does not match the catalogue")
+
+// Written describes an archive published by writeVerifiedArchive.
+type Written struct {
+	Size int64
+	// SHA256 of the published file, from the read-back that verified it — so it
+	// describes bytes that were proven intact, not bytes the writer believed it
+	// wrote.
+	SHA256 string
 }
 
 // CreateTarZstd creates a tar.zst archive from the source directory.
@@ -105,12 +202,12 @@ func (c *Compressor) VerifyTarZstd(_ context.Context, archivePath string) ([]Mem
 //
 // verify, if non-nil, receives the members read back out of the finished archive
 // and may reject it — see writeVerifiedArchive.
-func (c *Compressor) CreateTarZstd(ctx context.Context, sourceDir, archivePath string, verify func([]Member) error) (int64, error) {
+func (c *Compressor) CreateTarZstd(ctx context.Context, sourceDir, archivePath string, verify func([]Member) error) (Written, error) {
 	// Build file map from directory contents (not the directory itself)
 	// This ensures archive contains "globals.sql" not ".tmp-xxx/globals.sql"
 	entries, err := os.ReadDir(sourceDir)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read source directory: %w", err)
+		return Written{}, fmt.Errorf("failed to read source directory: %w", err)
 	}
 
 	fileMap := make(map[string]string)
@@ -121,7 +218,7 @@ func (c *Compressor) CreateTarZstd(ctx context.Context, sourceDir, archivePath s
 
 	files, err := archives.FilesFromDisk(ctx, nil, fileMap)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read files from disk: %w", err)
+		return Written{}, fmt.Errorf("failed to read files from disk: %w", err)
 	}
 
 	return writeVerifiedArchive(ctx, c, archivePath, files, verify)
@@ -142,9 +239,9 @@ type ArchiveEntry struct {
 // decompressing everything ahead of it. A snapshot puts its manifest first so a
 // reader can validate version compatibility from the first few kilobytes
 // instead of streaming through gigabytes of dumps to find it.
-func (c *Compressor) CreateTarZstdOrdered(ctx context.Context, entries []ArchiveEntry, archivePath string, verify func([]Member) error) (int64, error) {
+func (c *Compressor) CreateTarZstdOrdered(ctx context.Context, entries []ArchiveEntry, archivePath string, verify func([]Member) error) (Written, error) {
 	if len(entries) == 0 {
-		return 0, fmt.Errorf("no entries to archive")
+		return Written{}, fmt.Errorf("no entries to archive")
 	}
 
 	// FilesFromDisk takes a map, so its output order is undefined. Call it once
@@ -153,7 +250,7 @@ func (c *Compressor) CreateTarZstdOrdered(ctx context.Context, entries []Archive
 	for _, entry := range entries {
 		got, err := archives.FilesFromDisk(ctx, nil, map[string]string{entry.SourcePath: entry.ArchiveName})
 		if err != nil {
-			return 0, fmt.Errorf("read %s from disk: %w", entry.SourcePath, err)
+			return Written{}, fmt.Errorf("read %s from disk: %w", entry.SourcePath, err)
 		}
 		files = append(files, got...)
 	}
@@ -174,8 +271,58 @@ func (c *Compressor) CreateTarZstdOrdered(ctx context.Context, entries []Archive
 // The cost is one extra decompression pass, with no disk writes. That is cheap
 // next to writing the extracted tree, and cheap next to restoring a corrupt one.
 func (c *Compressor) ExtractTarZstd(ctx context.Context, archivePath, destDir string) error {
-	if _, err := c.VerifyTarZstd(ctx, archivePath); err != nil {
+	return c.ExtractTarZstdWith(ctx, archivePath, destDir, ExtractOptions{})
+}
+
+// ExtractOptions narrows or strengthens an extraction.
+type ExtractOptions struct {
+	// Keep, when non-nil, selects the members written (by their name in the
+	// archive). The WHOLE archive is still verified first — integrity is a
+	// property of the file, not of the members one happens to want — but a
+	// restore that needs one instance out of a multi-instance snapshot no
+	// longer needs disk for all of them. Directories are filtered the same
+	// way, so a caller keeping a subtree must accept the subtree's own
+	// directory entries (a prefix test does).
+	Keep func(name string) bool
+
+	// WantSHA256, when non-empty, is the digest a catalogue recorded when the
+	// archive was written. It is checked in the same verification pass, so it
+	// costs a hash and no extra read. An INTACT archive with a different
+	// digest is refused: the frame check cannot see a file that was replaced
+	// by another valid archive, and restoring it would put somebody else's
+	// data back and report success.
+	WantSHA256 string
+}
+
+// ExtractTarZstdWith is ExtractTarZstd with options; see ExtractOptions.
+func (c *Compressor) ExtractTarZstdWith(ctx context.Context, archivePath, destDir string, opts ExtractOptions) error {
+	// ONE handle for verification and extraction, and the SAME BYTES proven
+	// for both. Verifying the path and reopening it to extract restored
+	// whatever was at the path a moment later (a sync job, a `cp` into the
+	// backup dir mid-restore). One descriptor makes a rename over the path
+	// irrelevant; hashing the bytes each pass reads, and requiring the two
+	// digests to match, closes the rest: a file rewritten in place between or
+	// during the passes — even to the same length with its mtime put back,
+	// which a size/mtime check (the previous guard here) cannot see.
+	archiveFile, err := os.Open(archivePath) // #nosec G304 - archivePath is controlled by caller
+	if err != nil {
+		return fmt.Errorf("open archive: %w", err)
+	}
+	defer func() { _ = archiveFile.Close() }()
+
+	verifyHash := sha256.New()
+	if _, err := verifyTarZstdFrom(archiveFile, verifyHash); err != nil {
 		return fmt.Errorf("refusing to extract %s: %w", filepath.Base(archivePath), err)
+	}
+	verified := hex.EncodeToString(verifyHash.Sum(nil))
+	if opts.WantSHA256 != "" && verified != opts.WantSHA256 {
+		return fmt.Errorf("%w: refusing to extract %s: it is intact but is NOT the archive that was catalogued — "+
+			"its SHA-256 is %s, the catalogue recorded %s when the archive was written. "+
+			"The file has been replaced since; do not restore from it without finding out why",
+			ErrDigestMismatch, filepath.Base(archivePath), verified, opts.WantSHA256)
+	}
+	if afterVerifyHook != nil {
+		afterVerifyHook()
 	}
 
 	// Create destination directory if it doesn't exist
@@ -183,21 +330,15 @@ func (c *Compressor) ExtractTarZstd(ctx context.Context, archivePath, destDir st
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	// Open the archive file
-	archiveFile, err := os.Open(archivePath) // #nosec G304 - archivePath is controlled by caller
-	if err != nil {
-		return fmt.Errorf("failed to open archive: %w", err)
+	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind archive: %w", err)
 	}
-	defer func() { _ = archiveFile.Close() }()
-
-	// Identify the format
 	format, _, err := archives.Identify(ctx, archivePath, archiveFile)
 	if err != nil {
 		return fmt.Errorf("failed to identify archive format: %w", err)
 	}
-
 	// Reset file position after identification
-	if _, err := archiveFile.Seek(0, 0); err != nil {
+	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to reset file position: %w", err)
 	}
 
@@ -206,11 +347,36 @@ func (c *Compressor) ExtractTarZstd(ctx context.Context, archivePath, destDir st
 		return fmt.Errorf("unsupported format for extraction")
 	}
 
-	err = extractor.Extract(ctx, archiveFile, func(_ context.Context, f archives.FileInfo) error {
+	// Hash exactly the bytes extraction consumes. The decoder reads from its
+	// own goroutine; Extract returns only after its deferred Close, which waits
+	// for that goroutine, so the hash is complete and unshared when the tail is
+	// drained below — the same ordering verifyTarZstdFrom relies on.
+	extractHash := sha256.New()
+	extractSrc := io.TeeReader(archiveFile, extractHash)
+	keep := opts.Keep
+	err = extractor.Extract(ctx, extractSrc, func(_ context.Context, f archives.FileInfo) error {
+		if keep != nil && !keep(f.NameInArchive) {
+			return nil
+		}
 		return c.handleFile(f, destDir)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to extract archive: %w", err)
+	}
+	// The tar reader stops at its terminator, before the end of the file; the
+	// rest must be hashed too, or two files differing only past that point
+	// would compare equal.
+	if _, err := io.Copy(io.Discard, extractSrc); err != nil {
+		return fmt.Errorf("read archive tail: %w", err)
+	}
+
+	// The bytes extracted must be the bytes verified. Callers extract into a
+	// staging directory they remove on error and do nothing destructive before
+	// extraction returns, so refusing here costs only the attempt.
+	if extracted := hex.EncodeToString(extractHash.Sum(nil)); extracted != verified {
+		return fmt.Errorf("%w: %s changed while it was being verified and extracted "+
+			"(SHA-256 %s verified, %s extracted); the extracted files are discarded. Retry once nothing is writing to it",
+			ErrArchiveChanged, filepath.Base(archivePath), verified, extracted)
 	}
 
 	return nil
@@ -308,12 +474,12 @@ func (c *Compressor) handleFile(f archives.FileInfo, destDir string) error {
 // deletes them (a user may have parked one for `backup restore --file`), so a
 // retained corrupt archive would be permanent litter in the directory an
 // operator greps during a disaster, indistinguishable by name from a real one.
-func writeVerifiedArchive(ctx context.Context, c *Compressor, archivePath string, files []archives.FileInfo, verify func([]Member) error) (int64, error) {
+func writeVerifiedArchive(ctx context.Context, c *Compressor, archivePath string, files []archives.FileInfo, verify func([]Member) error) (Written, error) {
 	dir := filepath.Dir(archivePath)
 
 	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(archivePath)+"-*")
 	if err != nil {
-		return 0, fmt.Errorf("failed to create archive file: %w", err)
+		return Written{}, fmt.Errorf("failed to create archive file: %w", err)
 	}
 	tmpPath := tmp.Name()
 	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmpPath) }
@@ -322,7 +488,7 @@ func writeVerifiedArchive(ctx context.Context, c *Compressor, archivePath string
 	// role password hashes.
 	if err := tmp.Chmod(0o600); err != nil {
 		cleanup()
-		return 0, fmt.Errorf("chmod archive: %w", err)
+		return Written{}, fmt.Errorf("chmod archive: %w", err)
 	}
 
 	format := archives.CompressedArchive{
@@ -331,41 +497,41 @@ func writeVerifiedArchive(ctx context.Context, c *Compressor, archivePath string
 	}
 	if err := format.Archive(ctx, tmp, files); err != nil {
 		cleanup()
-		return 0, fmt.Errorf("failed to create archive: %w", err)
+		return Written{}, fmt.Errorf("failed to create archive: %w", err)
 	}
 
 	if err := tmp.Sync(); err != nil {
 		cleanup()
-		return 0, fmt.Errorf("fsync archive: %w", err)
+		return Written{}, fmt.Errorf("fsync archive: %w", err)
 	}
 	// Checked, NOT deferred: a dropped Close error is exactly how a short final
 	// write becomes a silently truncated archive.
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
-		return 0, fmt.Errorf("close archive: %w", err)
+		return Written{}, fmt.Errorf("close archive: %w", err)
 	}
 
-	members, err := c.VerifyTarZstd(ctx, tmpPath)
+	verified, err := c.VerifyTarZstdDigest(ctx, tmpPath)
 	if err != nil {
 		_ = os.Remove(tmpPath)
-		return 0, fmt.Errorf("archive failed verification and was discarded: %w", err)
+		return Written{}, fmt.Errorf("archive failed verification and was discarded: %w", err)
 	}
 	if verify != nil {
-		if err := verify(members); err != nil {
+		if err := verify(verified.Members); err != nil {
 			_ = os.Remove(tmpPath)
-			return 0, fmt.Errorf("archive failed verification and was discarded: %w", err)
+			return Written{}, fmt.Errorf("archive failed verification and was discarded: %w", err)
 		}
 	}
 
 	stat, err := os.Stat(tmpPath)
 	if err != nil {
 		_ = os.Remove(tmpPath)
-		return 0, fmt.Errorf("failed to get archive size: %w", err)
+		return Written{}, fmt.Errorf("failed to get archive size: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, archivePath); err != nil {
 		_ = os.Remove(tmpPath)
-		return 0, fmt.Errorf("failed to publish archive: %w", err)
+		return Written{}, fmt.Errorf("failed to publish archive: %w", err)
 	}
 
 	// Best effort: the rename is already durable enough on the common
@@ -376,5 +542,5 @@ func writeVerifiedArchive(ctx context.Context, c *Compressor, archivePath string
 		_ = d.Close()
 	}
 
-	return stat.Size(), nil
+	return Written{Size: stat.Size(), SHA256: verified.SHA256}, nil
 }

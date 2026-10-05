@@ -510,7 +510,10 @@ func (c *Client) RemoveHelperContainers() (int, error) {
 
 	removed := 0
 	for _, ctr := range containers.Items {
-		if _, err := c.cli.ContainerRemove(c.ctx, ctr.ID, client.ContainerRemoveOptions{Force: true}); err != nil {
+		// RemoveVolumes: the postgres image declares a VOLUME, so every helper
+		// gets an anonymous volume — and a scratch cluster's holds a full copy
+		// of an instance's data. Named volumes are never touched by this flag.
+		if _, err := c.cli.ContainerRemove(c.ctx, ctr.ID, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
 			if !cerrdefs.IsNotFound(err) {
 				log.Printf("Warning: failed to remove orphaned helper %s: %v", ctr.ID[:12], err)
 				continue

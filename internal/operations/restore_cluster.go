@@ -24,6 +24,7 @@ const maxRestoreJobs = 8
 type RestoreClusterParams struct {
 	InstanceName  string         // names the ephemeral helper containers
 	Image         string         // image the helper containers run
+	Major         int            // the cluster's PostgreSQL major (gates pgRestoreEnv)
 	Port          int            // cluster port on the bridge gateway
 	Password      string         // postgres superuser password (plaintext)
 	CPUCores      int            // caps pg_restore -j
@@ -95,7 +96,7 @@ func RestoreClusterFromArchive(ctx context.Context, deps *Dependencies, p Restor
 			}
 		}
 
-		if err := restoreDatabaseWithOwner(ctx, deps, p.InstanceName, p.Image, p.Port, p.Password, dbDir, db.Name, jobs); err != nil {
+		if err := restoreDatabaseWithOwner(ctx, deps, p.InstanceName, p.Image, p.Major, p.Port, p.Password, dbDir, db.Name, jobs); err != nil {
 			return 0, fmt.Errorf("restore database %s: %w", db.Name, err)
 		}
 
@@ -124,7 +125,7 @@ func RestoreClusterFromArchive(ctx context.Context, deps *Dependencies, p Restor
 	}
 
 	// Verify the restored cluster has every expected database.
-	presentDBs, err := listUserDatabasesDirect(ctx, p.Port, p.Password)
+	presentDBs, err := listUserDatabasesDirect(ctx, p.Port, p.Password, p.Major)
 	if err != nil {
 		return 0, fmt.Errorf("verify restored cluster: %w", err)
 	}

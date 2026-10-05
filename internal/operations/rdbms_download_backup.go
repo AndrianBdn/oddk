@@ -3,6 +3,7 @@ package operations
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,7 +62,7 @@ func DownloadBackup(ctx context.Context, deps *Dependencies, params DownloadBack
 	// REPORTS unreferenced archives — it never deletes them, precisely because
 	// one might be a file an operator parked there for 'backup restore --file'.
 	// The stored key includes the configured bucket path; the client re-adds it.
-	written, err := streamToLocalFileAtomic(ctx, s3Client, s3Client.RelativeKey(s3Key), localPath)
+	written, digest, err := streamToLocalFileAtomic(ctx, s3Client, s3Client.RelativeKey(s3Key), localPath, backup.SHA256Str)
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +71,13 @@ func DownloadBackup(ctx context.Context, deps *Dependencies, params DownloadBack
 		// Clean up downloaded file since we couldn't update database
 		_ = os.Remove(localPath)
 		return nil, fmt.Errorf("update backup local location: %w", err)
+	}
+	if !backup.SHA256.Valid {
+		// A pre-022 row learns its digest from the first verified copy, so a
+		// later download of the same row has something to be checked against.
+		if err := deps.Store.Backup.SetSHA256IfUnknown(params.BackupID, digest); err != nil {
+			log.Printf("WARNING: backup %d downloaded but its digest could not be recorded: %v", params.BackupID, err)
+		}
 	}
 
 	return &DownloadBackupResult{
@@ -154,7 +162,7 @@ func streamToLocalFile(ctx context.Context, s3Client *s3service.Client, key, loc
 // verifyDownloadedArchive proves a freshly downloaded archive is intact before
 // anything is allowed to depend on it — before a catalogue row claims a local
 // copy, before a provenance sidecar vouches for it, before it is renamed to a
-// name that reads as a real archive.
+// name that reads as a real archive. It returns the archive's SHA-256.
 //
 // S3 integrity checking here was ContentLength plus an ETag sidecar, which is
 // provenance, not integrity: neither says the BYTES ON THIS DISK are the bytes
@@ -163,10 +171,24 @@ func streamToLocalFile(ctx context.Context, s3Client *s3service.Client, key, loc
 // internal/compression). Restores verify too, since v0.1.70 — but discovering
 // at restore time that the archive you downloaded a week ago is corrupt is
 // discovering it at the worst possible moment.
-func verifyDownloadedArchive(ctx context.Context, path string) error {
-	if _, err := compression.NewCompressor().VerifyTarZstd(ctx, path); err != nil {
-		return fmt.Errorf("the downloaded archive failed verification and was discarded (%w); "+
+//
+// wantSHA256, when non-empty, is the digest the catalogue recorded when this
+// host WROTE the archive. The frame check alone cannot catch a copy that is
+// intact but is not that archive — an object overwritten in the bucket, or a
+// key that now holds a different deployment's upload under the same name — and
+// restoring it would report success with somebody else's data. Empty means the
+// row predates migration 022, so there is nothing to compare against.
+func verifyDownloadedArchive(ctx context.Context, path, wantSHA256 string) (string, error) {
+	verified, err := compression.NewCompressor().VerifyTarZstdDigest(ctx, path)
+	if err != nil {
+		return "", fmt.Errorf("the downloaded archive failed verification and was discarded (%w); "+
 			"re-run the download, and if it fails again the copy in the bucket is damaged", err)
 	}
-	return nil
+	if wantSHA256 != "" && verified.SHA256 != wantSHA256 {
+		return "", fmt.Errorf("the downloaded archive is intact but is NOT the archive this host wrote, and was discarded: "+
+			"its SHA-256 is %s, the catalogue recorded %s when the archive was created. "+
+			"The object in the bucket has been replaced since it was uploaded; do not restore from it without finding out why",
+			verified.SHA256, wantSHA256)
+	}
+	return verified.SHA256, nil
 }

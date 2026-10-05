@@ -3,12 +3,22 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/andrianbdn/oddk/internal/compression"
 )
 
 // testSnapshotUpload covers shipping a snapshot offsite: the manual upload
@@ -38,6 +48,16 @@ func testSnapshotUpload(h *TestHarness) error {
 	}
 	if records[0].RemoteLocation != "" {
 		return fmt.Errorf("fresh snapshot already claims a remote copy")
+	}
+
+	// Migration 022: the catalogue records the archive's SHA-256, and it is
+	// the digest of the file as `sha256sum` would print it.
+	original, err := os.ReadFile(records[0].LocalLocation)
+	if err != nil {
+		return fmt.Errorf("read fresh snapshot: %w", err)
+	}
+	if want := sha256Hex(original); records[0].SHA256 != want {
+		return fmt.Errorf("catalogue sha256 = %q, want %q (sha256 of the archive file)", records[0].SHA256, want)
 	}
 
 	log.Println("Step 2: Upload is refused before offsite is configured")
@@ -142,6 +162,31 @@ func testSnapshotUpload(h *TestHarness) error {
 		return fmt.Errorf("remove-local also destroyed the remote copy")
 	}
 
+	log.Println("Step 7b': A replaced object in the bucket is refused, even though it is intact")
+	// The zstd frame check cannot see this: the substitute is a perfectly valid
+	// archive. Only the digest recorded when this host wrote the snapshot can
+	// tell it is not the same one.
+	if err := replaceFakeS3Object(h, records[0].RemoteLocation, "not the archive this host wrote"); err != nil {
+		return err
+	}
+	output, err = h.runCLI("snapshot", "download", fmt.Sprintf("%d", id))
+	if err == nil {
+		return fmt.Errorf("download accepted a replaced object as snapshot %d; output: %s", id, output)
+	}
+	if !strings.Contains(err.Error(), "NOT the archive this host wrote") {
+		return fmt.Errorf("expected a digest-mismatch refusal, got: %v", err)
+	}
+	records, err = listSnapshotRecords(h)
+	if err != nil {
+		return err
+	}
+	if records[0].LocalLocation != "" {
+		return fmt.Errorf("a refused download still recorded a local copy: %q", records[0].LocalLocation)
+	}
+	if err := putFakeS3Object(h, records[0].RemoteLocation, original); err != nil {
+		return err
+	}
+
 	output, err = h.runCLI("snapshot", "download", fmt.Sprintf("%d", id))
 	if err != nil {
 		return fmt.Errorf("snapshot download: %w (output: %s)", err, output)
@@ -193,6 +238,66 @@ type e2eSnapshotRecord struct {
 	Status         string `json:"status"`
 	LocalLocation  string `json:"localLocation"`
 	RemoteLocation string `json:"remoteLocation"`
+	SHA256         string `json:"sha256"`
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// replaceFakeS3Object overwrites the object at an s3:// location with a
+// different, VALID archive — the substitution a frame checksum cannot see.
+func replaceFakeS3Object(h *TestHarness, location, payload string) error {
+	dir, err := os.MkdirTemp(h.dataDir, "substitute-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	src := filepath.Join(dir, "src")
+	if err := os.MkdirAll(src, 0o750); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(src, "manifest.json"), []byte(payload), 0o600); err != nil {
+		return err
+	}
+	archive := filepath.Join(dir, "substitute.tar.zst")
+	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive, nil); err != nil {
+		return fmt.Errorf("build substitute archive: %w", err)
+	}
+	b, err := os.ReadFile(archive) // #nosec G304 - test-controlled path
+	if err != nil {
+		return err
+	}
+	return putFakeS3Object(h, location, b)
+}
+
+// putFakeS3Object writes an object straight into the fake S3 server,
+// bypassing ODDK — which is the point.
+func putFakeS3Object(h *TestHarness, location string, body []byte) error {
+	rest, ok := strings.CutPrefix(location, "s3://")
+	if !ok {
+		return fmt.Errorf("not an s3:// location: %q", location)
+	}
+	req, err := http.NewRequest(http.MethodPut, h.fakeS3URL+"/"+rest, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	// Carry the object's own CRC32, as any real SDK overwrite would. Without it
+	// the fake server keeps serving the ORIGINAL upload's checksum, and the
+	// download fails at the transport layer before the digest check is reached.
+	var crc [4]byte
+	binary.BigEndian.PutUint32(crc[:], crc32.ChecksumIEEE(body))
+	req.Header.Set("x-amz-checksum-crc32", base64.StdEncoding.EncodeToString(crc[:]))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("put %s: %w", location, err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("put %s: HTTP %d", location, resp.StatusCode)
+	}
+	return nil
 }
 
 func listSnapshotRecords(h *TestHarness) ([]e2eSnapshotRecord, error) {

@@ -19,6 +19,10 @@ type BackupRecord struct {
 	Comment        sql.NullString   `db:"comment" json:"-"`
 	CommentStr     string           `db:"-" json:"comment,omitempty"` // For JSON output
 	CreatedAt      rfc3339time.Time `db:"created_at" json:"createdAt"`
+	// SHA256 of the archive file, recorded when it was written (migration 022).
+	// NULL on older rows: unknown, not "nothing to check".
+	SHA256    sql.NullString `db:"sha256" json:"-"`
+	SHA256Str string         `db:"-" json:"sha256,omitempty"` // For JSON output
 	// Computed fields from filesystem check (not stored in DB)
 	FileExists bool  `db:"-" json:"fileExists,omitempty"`
 	ActualSize int64 `db:"-" json:"actualSize,omitempty"`

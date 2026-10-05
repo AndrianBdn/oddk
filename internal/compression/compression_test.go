@@ -157,10 +157,11 @@ func TestCompressor_CreateTarZstd(t *testing.T) {
 
 	// Create compressor and archive
 	compressor := compression.NewCompressor()
-	size, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
+	written, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
 	if err != nil {
 		t.Fatalf("CreateTarZstd failed: %v", err)
 	}
+	size := written.Size
 
 	// Verify archive was created and has reasonable size
 	if size <= 0 {
@@ -245,10 +246,11 @@ func TestCompressor_CreateTarZstd_EmptyDirectory(t *testing.T) {
 	}
 
 	compressor := compression.NewCompressor()
-	size, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
+	written, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
 	if err != nil {
 		t.Fatalf("CreateTarZstd failed for empty directory: %v", err)
 	}
+	size := written.Size
 
 	// Even empty tar.zst should have some size (headers)
 	if size <= 0 {

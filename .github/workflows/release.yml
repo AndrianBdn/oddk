@@ -56,18 +56,40 @@ jobs:
         run: |
           set -eu
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          # The release body is this tag's CHANGELOG section: everything between
-          # its "## <tag> — <date>" heading and the next "## " heading.
-          awk -v hdr="## $TAG " '
-            index($0, hdr) == 1 { found = 1; next }
-            found && /^## / { exit }
-            found { print }
-          ' CHANGELOG.md > notes.md
+          # Releases are not cut for every version: several internal versions
+          # can ship in one public release. So the body covers every CHANGELOG
+          # section from this tag's down to (not including) the PREVIOUS public
+          # tag's. Otherwise someone upgrading from that tag never sees the
+          # intermediate versions' notes, and least of all their Action: lines,
+          # which matter most exactly when several versions land at once.
+          # (fetch-depth: 0 above is what makes the previous tag visible.)
+          PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$TAG^" 2>/dev/null || true)"
+          echo "release notes: $TAG, since ${PREV:-<no previous tag>}"
+          TAG="$TAG" PREV="$PREV" awk -f - CHANGELOG.md > notes.md <<'AWK'
+          # Stops at: the previous tag's heading, any non-version heading
+          # ("## Earlier releases"), or — with no previous tag — the next
+          # heading, which keeps a first release to its own section.
+          function is_version(line) { return line ~ /^## v[0-9]+\.[0-9]+\.[0-9]+ / }
+          BEGIN { tag = ENVIRON["TAG"]; prev = ENVIRON["PREV"] }
+          index($0, "## " tag " ") == 1 { found = 1; own = $0; next }
+          !found { next }
+          /^## / {
+            if (prev == "" || !is_version($0) || index($0, "## " prev " ") == 1) exit
+            versions++
+          }
+          { body = body $0 "\n" }
+          END {
+            # With intermediate versions, the tag's own section needs its
+            # heading too, or its notes read as belonging to the next one.
+            if (versions > 0) printf "%s\n", own
+            printf "%s", body
+          }
+          AWK
           # A missing section fails the release, deliberately and for the same
           # reason the version check above does: the recovery is identical
           # (fix the commit, move the tag, re-push), and a release published
           # with placeholder notes is one nobody ever goes back to write.
-          if ! grep -q '[^[:space:]]' notes.md; then
+          if ! grep -q "^## $TAG " CHANGELOG.md || ! grep -q '[^[:space:]]' notes.md; then
             echo "::error::CHANGELOG.md has no section for $TAG (expected a '## $TAG — <date>' heading)"
             exit 1
           fi

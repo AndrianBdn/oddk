@@ -70,7 +70,7 @@ func DownloadSnapshot(ctx context.Context, deps *Dependencies, id int, backupDir
 		return nil, operr.Invalidf("snapshot %d has an unusable remote location: %v", id, err)
 	}
 
-	size, err := streamToLocalFileAtomic(ctx, s3Client, s3Client.RelativeKey(key), localPath)
+	size, digest, err := streamToLocalFileAtomic(ctx, s3Client, s3Client.RelativeKey(key), localPath, record.SHA256Str)
 	if err != nil {
 		logOffsiteFailure(deps, settings, "snapshot_download", record.Filename, err)
 		return nil, fmt.Errorf("download snapshot: %w", err)
@@ -78,6 +78,13 @@ func DownloadSnapshot(ctx context.Context, deps *Dependencies, id int, backupDir
 
 	if err := deps.Store.Snapshot.SetLocalLocation(id, localPath); err != nil {
 		return nil, err
+	}
+	if !record.SHA256.Valid {
+		// A pre-022 row learns its digest from the first verified copy, so a
+		// later download of the same row has something to be checked against.
+		if err := deps.Store.Snapshot.SetSHA256IfUnknown(id, digest); err != nil {
+			log.Printf("WARNING: snapshot %d downloaded but its digest could not be recorded: %v", id, err)
+		}
 	}
 
 	if err := deps.Store.Offsite.AddLog(&offsite.OffsiteLog{

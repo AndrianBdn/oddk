@@ -36,10 +36,14 @@ func (s *BackupStore) RecordBackup(record *BackupRecord) error {
 		record.LocalLocation = sql.NullString{String: record.LocalPath, Valid: true}
 	}
 
+	if !record.SHA256.Valid && record.SHA256Str != "" {
+		record.SHA256 = sql.NullString{String: record.SHA256Str, Valid: true}
+	}
+
 	result, err := s.db.Exec(`
-		INSERT INTO backup_history (instance_name, timestamp, size, local_location, remote_location, status, comment, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, record.InstanceName, record.Timestamp, record.Size, record.LocalLocation, record.RemoteLocation, record.Status, record.Comment, record.CreatedAt)
+		INSERT INTO backup_history (instance_name, timestamp, size, local_location, remote_location, status, comment, created_at, sha256)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.InstanceName, record.Timestamp, record.Size, record.LocalLocation, record.RemoteLocation, record.Status, record.Comment, record.CreatedAt, record.SHA256)
 	if err != nil {
 		return fmt.Errorf("insert backup record: %w", err)
 	}
@@ -68,6 +72,9 @@ func (s *BackupStore) ListAllBackups() ([]BackupRecord, error) {
 		// Convert Comment from sql.NullString to regular string
 		if backups[i].Comment.Valid {
 			backups[i].CommentStr = backups[i].Comment.String
+		}
+		if backups[i].SHA256.Valid {
+			backups[i].SHA256Str = backups[i].SHA256.String
 		}
 		// Convert locations for JSON output
 		if backups[i].LocalLocation.Valid {
@@ -165,6 +172,9 @@ func (s *BackupStore) ListBackups(instanceName string) ([]BackupRecord, error) {
 		if backups[i].Comment.Valid {
 			backups[i].CommentStr = backups[i].Comment.String
 		}
+		if backups[i].SHA256.Valid {
+			backups[i].SHA256Str = backups[i].SHA256.String
+		}
 		// Convert locations for JSON output
 		if backups[i].LocalLocation.Valid {
 			backups[i].LocalPath = backups[i].LocalLocation.String
@@ -227,6 +237,9 @@ func (s *BackupStore) GetBackupByID(backupID int) (*BackupRecord, error) {
 	// Convert for output
 	if backup.Comment.Valid {
 		backup.CommentStr = backup.Comment.String
+	}
+	if backup.SHA256.Valid {
+		backup.SHA256Str = backup.SHA256.String
 	}
 	if backup.LocalLocation.Valid {
 		backup.LocalPath = backup.LocalLocation.String
@@ -465,4 +478,13 @@ func (s *BackupStore) ReconcileLocalLocations(backupDir string) (repointed, clea
 		cleared++
 	}
 	return repointed, cleared, danglingAfter, nil
+}
+
+// SetSHA256IfUnknown records an archive digest on a row that has none (written
+// before migration 022). Never overwrites: see SnapshotStore.SetSHA256IfUnknown.
+func (s *BackupStore) SetSHA256IfUnknown(backupID int, digest string) error {
+	if _, err := s.db.Exec(`UPDATE backup_history SET sha256 = ? WHERE id = ? AND sha256 IS NULL`, digest, backupID); err != nil {
+		return fmt.Errorf("record backup %d digest: %w", backupID, err)
+	}
+	return nil
 }

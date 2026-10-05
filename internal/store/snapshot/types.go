@@ -77,6 +77,10 @@ type Record struct {
 	RemoteLocation sql.NullString `db:"remote_location" json:"-"`
 	Comment        sql.NullString `db:"comment" json:"-"`
 
+	// SHA256 of the archive file, recorded when it was written (migration 022).
+	// NULL on older rows: unknown, not "nothing to check".
+	SHA256 sql.NullString `db:"sha256" json:"-"`
+
 	// Flattened for JSON output, mirroring BackupRecord. Instances is nil for a
 	// pre-019 row (unknown coverage) and non-nil — possibly empty — once the
 	// column is populated. Deliberately NOT omitempty: an empty deployment's
@@ -86,6 +90,7 @@ type Record struct {
 	LocalPath  string           `db:"-" json:"localLocation,omitempty"`
 	RemotePath string           `db:"-" json:"remoteLocation,omitempty"`
 	CommentStr string           `db:"-" json:"comment,omitempty"`
+	SHA256Str  string           `db:"-" json:"sha256,omitempty"`
 	Instances  []RecordInstance `db:"-" json:"instances"`
 }
 

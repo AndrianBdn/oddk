@@ -11,6 +11,205 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.93 — 2026-09-30
+
+### Fixed
+
+- **`snapshot restore-instance --json` and `snapshot restore-database --json`
+  print only JSON on stdout.** Progress lines and credential notes ("Restoring
+  …", "No AWS credentials in this shell") used to come first, so a script
+  parsing the output failed *after* the restore had already run. A retry was
+  then refused, because the database existed, or rebuilt the instance a second
+  time. Those lines now go to stderr in JSON mode.
+- **`--json` on these two commands now requires `--yes`,** as it already did for
+  `migrate-from-backups` and `dangerously-drop-all`. The confirmation prompt
+  would otherwise land in the JSON output.
+
+**Action:** add `--yes` to any script that runs either command with `--json`.
+
+## v0.1.92 — 2026-09-30
+
+### Deprecated
+
+- **Per-instance backups (`oddk backup`) will be removed in the first release
+  after 2026-12-31.** Snapshots now cover everything backups did, including
+  restoring or cloning a single database (`oddk snapshot restore-database`,
+  v0.1.87).
+  - Every `oddk backup` command prints a notice on stderr naming its
+    replacement. Stdout and `--json` output are unchanged, so scripts keep
+    working.
+  - **New backup schedules are refused.** Existing schedules keep running and
+    can still be changed, paused, resumed or removed.
+  - Restore, list, download and `dangerously-drop-all` keep working until the
+    removal, so existing archives stay usable.
+
+**Action:** if `oddk checklist` shows a `legacy backups` warning, move the
+schedules before the removal with `oddk snapshot migrate-from-backups --dry-run`
+(preview), then `--yes`. When you trust the snapshot schedule, clear the old
+archives with `oddk backup dangerously-drop-all`. Anything that creates backup
+schedules through `oddk backup setup-cron` or `POST /api/cron/backup` must
+switch to `oddk snapshot setup-cron`.
+
+## v0.1.91 — 2026-09-29
+
+### Fixed
+
+- **A whole-instance restore makes no connection that fires the restored
+  cluster's login triggers** (PostgreSQL 17+). After a physical `restore-instance`
+  or `snapshot apply`, the readiness check and database count connected
+  normally. After a logical one, the final verification did. Each of those
+  connections fired any login trigger in the restored `postgres` database. An
+  audit trigger recorded them as user logins, and a trigger that raises an error
+  made a completed restore report failure. Once a restore finishes, the
+  cluster's triggers fire on logins as they always did, including ODDK's health
+  checks.
+
+**Action:** None.
+
+## v0.1.90 — 2026-09-29
+
+### Fixed
+
+- **Restores no longer fire the database's own login event triggers**
+  (PostgreSQL 17+). `pg_restore` recreates a login trigger near the end of a
+  restore and then reconnects. That reconnect ran the trigger against the
+  database it had just restored. A trigger that deletes rows emptied the
+  restored database, and an audit trigger logged the restore as a user login.
+  Every restore now runs with event triggers off: `backup restore`, `snapshot
+  restore-database`, a logical `restore-instance` or `apply`, and `instance
+  major-upgrade`.
+- **The scratch copy used by `snapshot restore-database` fires no login trigger
+  either,** and its read-only setting can no longer be overridden by a role or
+  database setting inside the archive. Its clients set both at connect time,
+  where they take precedence. Before this, a login trigger could change the
+  copy before it was dumped. Even a harmless audit trigger made the restore
+  fail.
+- **A restore extracts only bytes it verified.** Since v0.1.89 a rewrite of the
+  archive during a restore was detected by its size and modification time. A
+  different archive of the same length with its timestamp preserved got past
+  that check. The bytes read for extraction are now hashed and must match the
+  bytes that were verified. This costs one SHA-256 pass over the archive per
+  restore.
+
+**Action:** None.
+
+## v0.1.89 — 2026-09-29
+
+### Fixed
+
+- **A restore extracts exactly the archive it verified.** The archive was
+  verified, closed, and then opened again by name to extract. A file replaced
+  in between, for example by a sync job or a `cp` into the backup directory,
+  passed the checks as one archive while another was restored. Verification
+  and extraction now read the same open file. An archive rewritten in place
+  while a restore reads it is refused, and the extracted files are discarded,
+  before anything is changed. This covers every restore: `backup restore`,
+  `snapshot restore-instance`, `snapshot restore-database`, `snapshot apply`
+  and `instance major-upgrade`.
+- **The scratch copy used by `snapshot restore-database` cannot be left behind
+  unnoticed.** Docker can report a container removed while failing to delete
+  its volume, which here holds a full copy of an instance's data. The volume is
+  now created with an ODDK label and removed by a separate, checked call. If
+  that fails, the command says so and prints the removal command. The daemon
+  also removes any leftover scratch volume when it starts.
+
+**Action:** None.
+
+## v0.1.88 — 2026-09-29
+
+### Fixed
+
+- **Database names are always passed to PostgreSQL tools as a name.** A name
+  containing `=`, or starting with `postgres://` or `-`, was read by
+  `pg_restore`, `pg_dump` and libpq as a connection string or an option.
+  `backup restore --restore-as 'dbname=postgres'` could pass the "target does
+  not exist" check and then write into the existing `postgres` database. This
+  affected `backup restore`, `instance major-upgrade`, and backups and logical
+  snapshots of such a database.
+- **A database whose name contains a space or other punctuation can be backed
+  up.** The name was used in a helper container's name, which Docker rejects.
+- **Restoring by `--id` checks the local copy against the recorded SHA-256.**
+  Since v0.1.86 this was checked only when the archive had to be downloaded.
+  A catalogued local file that had been replaced by another valid archive was
+  restored as if it were the original. This covers `backup restore --id`,
+  `snapshot restore-instance --id` and `snapshot restore-database --id`. The
+  check runs in the verification pass that already happens before extraction,
+  so it adds no extra read. Archives recorded before v0.1.86 have no digest and
+  are not checked.
+
+**Action:** None.
+
+## v0.1.87 — 2026-09-29
+
+### Added
+
+- **`oddk snapshot restore-database` restores one database out of a snapshot.**
+  It creates the database on a running instance and changes nothing else. The
+  instance's other databases, roles, postgres password and configuration stay as
+  they were, and it keeps serving. The target name must be free, so use
+  `--restore-as` to put yesterday's copy next to today's. It takes the same
+  `--file`, `--id` and `--s3-uri` sources as `restore-instance`. As with `backup
+  restore`, objects come back owned by `postgres`, without object privileges.
+  Until now, restoring a single database still needed a per-instance backup.
+- **`--from-instance` restores another instance's database.** For example,
+  `--instance staging --from-instance prod --database sales` puts last night's
+  production database on staging. The target does not have to be in the
+  snapshot. It must be running a PostgreSQL major at least as new as the
+  snapshot's copy.
+- **From a physical snapshot (the default format), the instance's copy is
+  started as a scratch cluster first,** because a physical archive has no
+  per-database dumps. The database is dumped out of that cluster, and then the
+  cluster and its volume are removed. The scratch cluster has **no network
+  access**, and it runs no background workers, no logical replication and no
+  WAL archiving. So the source's subscriptions, foreign servers and scheduled
+  jobs (pg_cron, TimescaleDB and pg_partman workers) can neither reach real
+  systems nor change the copy before it is dumped. It needs free disk for the
+  whole cluster while it runs, and UNLOGGED tables come back empty.
+
+### Fixed
+
+- **Helper containers no longer leave a Docker volume behind.** Every `pg_dump`,
+  `pg_restore` and `pg_basebackup` helper got an anonymous volume from the
+  postgres image, and removing the helper did not remove it. A host that has run
+  nightly backups for a while has thousands of them. They are small, but each is
+  a directory and a Docker record.
+
+**Action:** optional cleanup. ODDK cannot tell its leaked volumes from anyone
+else's because they carry no label, so it does not remove existing ones. List
+them with `docker volume ls -qf dangling=true`. If nothing else on the host
+relies on unattached anonymous volumes, reclaim them with `docker volume prune`.
+On Docker 23 and later, that command removes only anonymous volumes.
+
+## v0.1.86 — 2026-09-29
+
+### Added
+
+- **Every new backup and snapshot records its SHA-256 in the catalogue.** The
+  digest is of the archive file, the same value `sha256sum` prints. It is taken
+  from the read-back that already verifies every archive before it is
+  published, so it describes bytes that were proven intact. It appears as
+  `sha256` in `snapshot list --json`, `snapshot make --json`, and the backup
+  records returned by `GET /api/backups`.
+- **Downloading a catalogued archive checks it against that digest.** This
+  covers `backup download`, `snapshot download <id>`, and `snapshot
+  restore-instance --id` when it has to fetch the archive. Corruption was
+  already refused. What is new is refusing an archive that is **intact but is
+  not the one this host wrote**: an object replaced in the bucket, for example.
+  Previously that downloaded cleanly and would have restored someone else's
+  data. The download is now discarded, and the error gives both digests.
+  `--s3-uri` fetches are not tied to a catalogue row, so they are not checked.
+
+Archives recorded before this version have no digest. They are not checked,
+and each one records the digest of its first verified download instead. A
+recorded digest is never replaced.
+
+Writing and downloading archives costs one extra SHA-256 pass over the file,
+done in the same read. Measured at about 1.8 s/GB on a CPU without SHA
+extensions; CPUs that have them are several times faster. Restores are
+unaffected.
+
+**Action:** None. Migration 022 adds the column on the first daemon start.
+
 ## v0.1.85 — 2026-09-16
 
 ### Fixed

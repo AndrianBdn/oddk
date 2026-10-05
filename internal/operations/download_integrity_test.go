@@ -2,6 +2,8 @@ package operations
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -34,7 +36,7 @@ func TestStreamToLocalFileAtomic_RefusesCorruptObject(t *testing.T) {
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "backup-app-20260811-7.tar.zst")
 
-	if _, err := streamToLocalFileAtomic(context.Background(), client, "k/backup.tar.zst", dest); err == nil {
+	if _, _, err := streamToLocalFileAtomic(context.Background(), client, "k/backup.tar.zst", dest, ""); err == nil {
 		t.Fatal("a corrupt object was accepted; the catalogue would now claim a local copy that cannot be restored")
 	}
 
@@ -63,9 +65,12 @@ func TestStreamToLocalFileAtomic_LandsAGoodArchive(t *testing.T) {
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "snapshot-db01-20260811090000.tar.zst")
 
-	written, err := streamToLocalFileAtomic(context.Background(), client, "k/snap.tar.zst", dest)
+	written, digest, err := streamToLocalFileAtomic(context.Background(), client, "k/snap.tar.zst", dest, "")
 	if err != nil {
 		t.Fatalf("a good archive was refused: %v", err)
+	}
+	if want := sha256Hex(good); digest != want {
+		t.Errorf("digest = %s, want %s (sha256 of the downloaded bytes)", digest, want)
 	}
 	if written != int64(len(good)) {
 		t.Errorf("wrote %d bytes, want %d", written, len(good))
@@ -126,5 +131,55 @@ func TestCopyFile_PublishesAtomically(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".tmp-") {
 			t.Errorf("temp file %s left behind", e.Name())
 		}
+	}
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// The frame checksum cannot see an object that is intact but is a DIFFERENT
+// archive — replaced in the bucket, or another deployment's upload under the
+// same key. The digest the catalogue recorded at write time can, and a copy
+// that does not match it must never become the row's local copy.
+func TestStreamToLocalFileAtomic_RefusesIntactArchiveWithWrongDigest(t *testing.T) {
+	recorded := tinyArchiveBytes(t, "the archive this host wrote")
+	substitute := tinyArchiveBytes(t, "some other archive entirely")
+
+	serve := func(body []byte) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodHead:
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+				w.WriteHeader(http.StatusOK)
+			case http.MethodGet:
+				_, _ = w.Write(body)
+			}
+		}
+	}
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "snapshot-db01-20260929090000.tar.zst")
+
+	_, _, err := streamToLocalFileAtomic(context.Background(), newFetchStubClient(t, serve(substitute)),
+		"k/snap.tar.zst", dest, sha256Hex(recorded))
+	if err == nil {
+		t.Fatal("an intact archive with the wrong digest was accepted as the catalogued snapshot")
+	}
+	if !strings.Contains(err.Error(), "NOT the archive this host wrote") {
+		t.Errorf("error does not say the copy is a different archive: %v", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		t.Errorf("%s was left behind by a refused download", e.Name())
+	}
+
+	// The matching object is accepted.
+	if _, digest, err := streamToLocalFileAtomic(context.Background(), newFetchStubClient(t, serve(recorded)),
+		"k/snap.tar.zst", dest, sha256Hex(recorded)); err != nil {
+		t.Fatalf("the recorded archive was refused: %v", err)
+	} else if digest != sha256Hex(recorded) {
+		t.Errorf("digest = %s, want %s", digest, sha256Hex(recorded))
 	}
 }

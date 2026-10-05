@@ -328,6 +328,7 @@ func (op *UpgradeRDBMSOp) restoreIntoCluster(ctx context.Context, plan *upgradeP
 	restored, err := RestoreClusterFromArchive(ctx, op.deps, RestoreClusterParams{
 		InstanceName:  op.params.Name,
 		Image:         plan.targetImage,
+		Major:         majorOrZero(op.params.TargetVersion),
 		Port:          plan.instance.Port,
 		Password:      plan.password,
 		CPUCores:      plan.instance.CPUCores,
@@ -400,8 +401,54 @@ func connectDirect(ctx context.Context, port int, password string) (*pgx.Conn, e
 	return pgx.Connect(ctx, util.PostgresURI(password, port, "postgres"))
 }
 
+// connectForRestore is connectDirect for connections a RESTORE makes to a
+// cluster that already holds the user's data — and so the user's event
+// triggers. On PostgreSQL 17+ it sends event_triggers=off as a startup
+// parameter, so the restore's own logins fire no LOGIN trigger.
+//
+// Measured: a physical restore-instance fired an audit login trigger twice
+// (its readiness probe and its database count), a logical one once (its final
+// verification). Once the restore returns, the cluster's triggers fire on
+// logins exactly as they did on the source — health checks included — which is
+// the cluster's behaviour. What this keeps out is the RESTORE firing them:
+// logging itself as a user, failing on a trigger that errors, or running one
+// against a cluster it is still verifying. Normal operations keep using
+// connectDirect. A startup parameter outranks role and database settings, and
+// is not sent below 17, where the setting does not exist and would be refused.
+func connectForRestore(ctx context.Context, port int, password string, major int) (*pgx.Conn, error) {
+	cfg, err := pgx.ParseConfig(util.PostgresURI(password, port, "postgres"))
+	if err != nil {
+		return nil, err
+	}
+	if major >= 17 {
+		cfg.RuntimeParams["event_triggers"] = "off"
+	}
+	return pgx.ConnectConfig(ctx, cfg)
+}
+
 // waitForPostgresReady polls until the cluster accepts connections or times out.
 func waitForPostgresReady(ctx context.Context, port int, password string) error {
+	return pollReady(ctx, func() error { return TestPostgreSQLConnectivityWithPassword(ctx, port, password) })
+}
+
+// waitForRestoredClusterReady is waitForPostgresReady for a cluster whose data
+// (and triggers) a restore has just put in place: it probes through
+// connectForRestore, so the probe fires no LOGIN trigger.
+func waitForRestoredClusterReady(ctx context.Context, port int, password string, major int) error {
+	return pollReady(ctx, func() error {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		conn, err := connectForRestore(probeCtx, port, password, major)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = conn.Close(probeCtx) }()
+		return conn.Ping(probeCtx)
+	})
+}
+
+// pollReady retries probe until it succeeds or 90s pass.
+func pollReady(ctx context.Context, probe func() error) error {
 	deadline := time.Now().Add(90 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -410,7 +457,7 @@ func waitForPostgresReady(ctx context.Context, port int, password string) error 
 			return ctx.Err()
 		default:
 		}
-		if err := TestPostgreSQLConnectivityWithPassword(ctx, port, password); err == nil {
+		if err := probe(); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -421,9 +468,10 @@ func waitForPostgresReady(ctx context.Context, port int, password string) error 
 }
 
 // listUserDatabasesDirect returns the set of non-template databases on the
-// instance using a direct connection.
-func listUserDatabasesDirect(ctx context.Context, port int, password string) (map[string]bool, error) {
-	conn, err := connectDirect(ctx, port, password)
+// instance. It runs only after a restore (verification, and the physical
+// path's count), so it connects with connectForRestore.
+func listUserDatabasesDirect(ctx context.Context, port int, password string, major int) (map[string]bool, error) {
+	conn, err := connectForRestore(ctx, port, password, major)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
@@ -529,14 +577,14 @@ func restoreGlobals(ctx context.Context, deps *Dependencies, instanceName, image
 // restoreDatabaseWithOwner restores a single database, preserving object
 // ownership and privileges (no --no-owner / --no-privileges). Roles must
 // already exist (restoreGlobals runs first).
-func restoreDatabaseWithOwner(ctx context.Context, deps *Dependencies, instanceName, image string, port int, password, dbDir, dbName string, jobs int) error {
+func restoreDatabaseWithOwner(ctx context.Context, deps *Dependencies, instanceName, image string, major, port int, password, dbDir, dbName string, jobs int) error {
 	return runHelperContainer(ctx, deps, helperContainerSpec{
-		ContainerName: fmt.Sprintf("oddk-upgrade-restore-%s-%s-%d", instanceName, dbName, time.Now().UnixNano()),
+		ContainerName: fmt.Sprintf("oddk-upgrade-restore-%s-%s-%d", instanceName, containerNameSafe(dbName), time.Now().UnixNano()),
 		Image:         image,
 		Cmd: []string{
 			"pg_restore",
 			"-Fd",
-			"-d", dbName,
+			"--dbname=" + pgConninfoDBName(dbName),
 			"-h", util.GatewayIP,
 			"-p", strconv.Itoa(port),
 			"-U", "postgres",
@@ -547,6 +595,7 @@ func restoreDatabaseWithOwner(ctx context.Context, deps *Dependencies, instanceN
 		Mounts: []mount.Mount{
 			{Type: mount.TypeBind, Source: dbDir, Target: "/backup", ReadOnly: true},
 		},
+		Env:  pgRestoreEnv(major),
 		Tool: "pg_restore",
 	})
 }

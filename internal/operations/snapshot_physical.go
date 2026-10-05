@@ -632,8 +632,8 @@ func checkPhysicalImageMajor(dockerClient *docker.Client, entry SnapshotInstance
 // countUserDatabases reports how many non-template databases (excluding the
 // built-in postgres database) a freshly restored cluster serves — the physical
 // counterpart of the logical restore's per-database count.
-func countUserDatabases(ctx context.Context, port int, password string) (int, error) {
-	set, err := listUserDatabasesDirect(ctx, port, password)
+func countUserDatabases(ctx context.Context, port int, password string, major int) (int, error) {
+	set, err := listUserDatabasesDirect(ctx, port, password, major)
 	if err != nil {
 		return 0, err
 	}

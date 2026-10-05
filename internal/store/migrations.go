@@ -36,6 +36,7 @@ func (s *Store) runAllMigrations() error {
 		{"019_snapshot_instances", migration019SnapshotInstances},
 		{"020_instance_status_check", migration020InstanceStatusCheck},
 		{"021_schedule_pause", migration021SchedulePause},
+		{"022_archive_sha256", migration022ArchiveSHA256},
 	}
 
 	for _, m := range migrations {
@@ -626,6 +627,20 @@ func migration021SchedulePause(sqx *sqlx.DB) error {
 	for _, table := range []string{"snapshot_plans", "cron_plans"} {
 		sqx.MustExec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN paused_at TEXT`, table))
 		sqx.MustExec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN paused_reason TEXT NOT NULL DEFAULT ''`, table))
+	}
+	return nil
+}
+
+// migration022ArchiveSHA256 records the SHA-256 of each archive file, computed
+// in the read-back that already verifies every archive before it is published.
+//
+// Nullable, and NULL means "unknown" (a row written before this migration), never
+// "no digest expected". The zstd frame checksum already says whether ONE copy is
+// internally broken; the stored digest is what says whether two intact copies —
+// local, S3, a DR host's download — are the same archive.
+func migration022ArchiveSHA256(sqx *sqlx.DB) error {
+	for _, table := range []string{"snapshot_history", "backup_history"} {
+		sqx.MustExec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN sha256 TEXT`, table))
 	}
 	return nil
 }

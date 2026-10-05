@@ -32,7 +32,7 @@ oddk instance get-postgres-password app --conn
   to S3, and able to rebuild a single instance or an entire host — plus health
   monitoring with Email/Slack/Telegram/Webhook alerts, password and user
   management, minor-version image switches, dump/restore major upgrades, and
-  legacy per-instance backups (still the way to restore a single database).
+  per-instance backups (deprecated; removed after 2026-12-31).
 - **Actually recoverable.** A snapshot carries every instance's data *and* ODDK's
   own configuration, so a dead host can be rebuilt from one archive plus the
   master key — not reassembled by hand from per-database dumps.
@@ -330,7 +330,7 @@ failed and notifies, and `oddk checklist` shows that instance as `✗ config-onl
 rather than covered. An archive that is empty for somebody must never read as
 protection.
 
-Restoring comes in three shapes:
+Restoring comes in four shapes:
 
 ```bash
 # 1. Rebuild ONE instance into a deployment that stays up, from a local file.
@@ -346,7 +346,17 @@ oddk snapshot restore-instance --instance app \
 # Find URIs with `oddk snapshot list-remote` — it lists what is actually in the
 # bucket, including snapshots whose records died with another host.
 
-# 3. Rebuild a WHOLE HOST — migration or disaster recovery.
+# 3. Restore ONE DATABASE into a running instance, as a new database. The
+#    instance, its other databases, roles and password are left alone, and the
+#    original name must be free, so --restore-as puts it next to the live one.
+#    Takes the same --file / --id / --s3-uri sources as restore-instance.
+oddk snapshot restore-database --instance app --database sales --id 7 \
+      --restore-as sales_yesterday
+#    --from-instance reads another instance's copy: prod's database into staging.
+oddk snapshot restore-database --instance staging --from-instance prod \
+      --database sales --id 7
+
+# 4. Rebuild a WHOLE HOST — migration or disaster recovery.
 #    Runs locally, not through the daemon, so it works when the daemon cannot start.
 systemctl stop oddk
 sudo -u oddk oddk snapshot apply \
@@ -373,8 +383,19 @@ What you need to know:
   physical snapshot restores onto the same PostgreSQL major and the same CPU
   architecture; `--logical` produces the portable `pg_dump`-based format for
   cross-architecture moves and for UNLOGGED table rows that a physical restore
-  would empty. Restore a single database with `oddk backup restore --database`,
-  not a snapshot command.
+  would empty. To restore a single database, use `oddk snapshot
+  restore-database` (above).
+- **A single-database restore from a physical snapshot starts a scratch copy
+  of the instance.** A physical archive has no per-database dumps, so
+  `restore-database` starts the instance's copy as a throwaway cluster, dumps
+  the one database out of it, and removes it. The copy has **no network
+  access**, and its logical-replication workers and WAL archiving are off. A
+  copy of a production cluster brings its subscriptions, foreign servers and
+  scheduled jobs with it, and must not be able to act on the systems they
+  point at. It needs free disk for the whole cluster while it runs. As with
+  `backup restore`, the restored objects are owned by `postgres` and carry no
+  object privileges. Re-grant what your application needs, for example with
+  `oddk instance add-db-user ... --owner`.
 - **UNLOGGED tables come back empty from a physical restore.** This is standard
   physical-backup semantics (RDS storage snapshots behave the same): unlogged
   tables are truncated by any crash recovery, which is what a physical restore
@@ -410,6 +431,12 @@ What you need to know:
   configuration-only entry: an instance with no container at all, or one you
   deliberately stopped under `--logical`. Either way the specific reason is
   recorded in the manifest and printed on stdout — reported, never silent.
+- **Every archive's SHA-256 is recorded when it is written, and downloads are
+  checked against it.** `snapshot list --json` shows it as `sha256`, the value
+  `sha256sum` prints, so any copy can be checked by hand. `snapshot download`,
+  `backup download` and `restore-instance --id` refuse a copy whose digest
+  differs, even when the archive is otherwise intact. That catches an object
+  replaced in the bucket, which would otherwise restore somebody else's data.
 - Restoring an instance sets its postgres password to the snapshot's, because the
   archive carries only the hash. Re-read it with `instance get-postgres-password`.
 - Retention keeps the newest snapshots regardless of age, so a run of failed
@@ -453,8 +480,9 @@ to run across a fleet. Add `--dry-run` to preview, `--yes` to skip the prompt, a
 > with `oddk backup remove-local` once you trust the snapshot schedule — or all
 > at once with `oddk backup dangerously-drop-all` (below).
 
-This is a transitional command. Per-instance `backup` itself is unaffected — it
-is still the only way to restore or clone a **single database**.
+This is a transitional command. Per-instance `backup` itself is unaffected.
+Restoring or cloning a **single database** no longer needs it: `oddk snapshot
+restore-database` does that from a snapshot.
 
 #### Disaster recovery from S3
 
@@ -628,13 +656,28 @@ Archives fetched by URI land in a managed `downloads/` area under the backup
 directory and are pruned after 7 days; everything there is re-fetchable from
 S3, so deleting it never loses data.
 
-### Legacy: per-instance backups
+### Deprecated: per-instance backups
 
-> **Snapshots are the recommended way to protect a deployment**, and the only
-> protection the `oddk checklist` audit reports. Per-instance backups keep
-> working — and are still the only way to restore or clone a **single
-> database**, which snapshots cannot yet do — but don't build new automation
-> on them; move schedules over with `oddk snapshot migrate-from-backups`.
+> **Per-instance backups are deprecated and will be removed in the first
+> release after 2026-12-31.** Snapshots do everything they did, including
+> restoring or cloning a single database (`oddk snapshot restore-database`).
+>
+> Until then:
+> - every `oddk backup` command prints a notice on stderr naming its
+>   replacement (stdout and `--json` output are unchanged);
+> - **new backup schedules are refused.** Existing schedules keep running and
+>   can still be changed, paused, resumed or removed. Move them with
+>   `oddk snapshot migrate-from-backups`;
+> - restore, list, download and `dangerously-drop-all` keep working, so the
+>   archives you already have stay usable.
+>
+> | Instead of | Use |
+> |---|---|
+> | `oddk backup make` | `oddk snapshot make` |
+> | `oddk backup restore --database` | `oddk snapshot restore-database` |
+> | `oddk backup setup-cron` | `oddk snapshot setup-cron` (or `migrate-from-backups`) |
+> | `oddk backup list` / `list-cron` | `oddk snapshot list` / `list-cron` |
+> | `oddk backup upload` / `download` / `remove-*` | the `oddk snapshot` commands of the same name |
 
 ```bash
 oddk backup make app --comment "before deploy"
@@ -643,8 +686,7 @@ oddk backup restore --instance app --id 42 --database analytics
 oddk backup restore --instance app --id 42 --database analytics --restore-as analytics_copy
 oddk backup restore --instance app --file /path/to/backup.tar.zst --database analytics
 
-# Scheduling and offsite copies (superseded by `oddk snapshot setup-cron`)
-oddk backup setup-cron --instance app --utc-hour 3              # daily at 03:00 UTC
+# Existing schedules (new ones are refused; use `oddk snapshot setup-cron`)
 oddk backup setup-cron --instance app --cleanup-local-days 14   # keeps the existing hour
 oddk backup setup-cron --instance app --pause                  # suspend without deleting
 oddk backup setup-cron --instance app --resume
@@ -655,8 +697,7 @@ oddk backup download app <backup-id>
 
 Fields you do not pass to `setup-cron` are preserved, matching
 `oddk snapshot setup-cron` — changing a retention window cannot silently move
-the hour. `--utc-hour` is therefore required when creating a schedule, and
-optional when adjusting one.
+the hour.
 
 Backups record roles with database-level `CREATE` access, and both restore and
 `major-upgrade` reapply those grants automatically. A role must already exist on

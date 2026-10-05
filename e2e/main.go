@@ -54,6 +54,11 @@ func main() {
 		{Name: "DatabaseUserAtomicity", Fn: testDatabaseUserAtomicity},
 		{Name: "DeleteUserConcurrentDDL", Fn: testDeleteUserConcurrentDDL},
 		{Name: "CronCRUD", Fn: testCronCRUD},
+		{
+			Name:  "BackupScheduleDeprecation",
+			Fn:    testBackupScheduleDeprecation,
+			KVMap: map[string]string{debugAllowNewBackupPlansKey: "0"},
+		},
 		{Name: "CronValidation", Fn: testCronValidation},
 		{Name: "CronMultipleInstances", Fn: testCronMultipleInstances},
 		{Name: "CronCleanupDays", Fn: testCronCleanupDays},
@@ -97,6 +102,10 @@ func main() {
 		{Name: "SnapshotMake", Fn: testSnapshotMake},
 		{Name: "SnapshotRoundTrip", Fn: testSnapshotRoundTrip},
 		{Name: "SnapshotRestoreInstance", Fn: testSnapshotRestoreInstance},
+		{Name: "SnapshotRestoreDatabase", Fn: testSnapshotRestoreDatabase},
+		{Name: "SnapshotRestoreDatabaseScratchJobs", Fn: testSnapshotRestoreDatabaseScratchJobs},
+		{Name: "SnapshotRestoreDatabaseLoginTrigger", Fn: testSnapshotRestoreDatabaseLoginTrigger},
+		{Name: "SnapshotRestoreInstanceLoginTrigger", Fn: testRestoreInstanceLoginTrigger},
 		{
 			Name: "SnapshotCron",
 			Fn:   testSnapshotCron,

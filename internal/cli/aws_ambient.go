@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"time"
 
@@ -25,13 +26,15 @@ const ambientCredsResolveTimeout = 5 * time.Second
 //
 // An already-expired session IS an error: sending it would fail the restore
 // minutes later with an opaque S3 message instead of now with a fix.
-func (c *Client) resolveAmbientAWSCredentials(ctx context.Context, profile string) (map[string]string, string, error) {
+// Its notes go to notes, not c.out: with --json, stdout must carry only the
+// response.
+func (c *Client) resolveAmbientAWSCredentials(ctx context.Context, profile string, notes io.Writer) (map[string]string, string, error) {
 	rctx, cancel := context.WithTimeout(ctx, ambientCredsResolveTimeout)
 	defer cancel()
 
 	creds, region, err := s3service.ResolveAmbientCredentials(rctx, profile)
 	if err != nil {
-		_, _ = fmt.Fprintln(c.out,
+		_, _ = fmt.Fprintln(notes,
 			"No AWS credentials in this shell; the daemon will use its offsite settings or its own instance role.")
 		return nil, "", nil
 	}
@@ -42,7 +45,7 @@ func (c *Client) resolveAmbientAWSCredentials(ctx context.Context, profile strin
 			return nil, "", fmt.Errorf("your AWS session has expired; refresh it (e.g. 'aws sso login') and retry")
 		}
 		if until < 15*time.Minute {
-			_, _ = fmt.Fprintf(c.out, "⚠️  Your AWS session expires in %s; a long download may outlive it.\n",
+			_, _ = fmt.Fprintf(notes, "⚠️  Your AWS session expires in %s; a long download may outlive it.\n",
 				until.Round(time.Minute))
 		}
 	}
@@ -64,7 +67,7 @@ func (c *Client) resolveAmbientAWSCredentials(ctx context.Context, profile strin
 // transit to a non-localhost daemon: the API channel is plain HTTP (the same
 // channel `offsite apply` has always sent its secret over — but that is a
 // deliberate act, and this warning makes the s3-uri form equally deliberate).
-func (c *Client) warnIfRemoteDaemonCreds() {
+func (c *Client) warnIfRemoteDaemonCreds(notes io.Writer) {
 	if c.config == nil {
 		return
 	}
@@ -76,7 +79,7 @@ func (c *Client) warnIfRemoteDaemonCreds() {
 	case "localhost", "127.0.0.1", "::1", "":
 		return
 	}
-	_, _ = fmt.Fprintf(c.out,
+	_, _ = fmt.Fprintf(notes,
 		"⚠️  Sending AWS credentials to %s over plain HTTP; prefer an SSH tunnel (ssh -L 5442:localhost:5442).\n",
 		u.Hostname())
 }

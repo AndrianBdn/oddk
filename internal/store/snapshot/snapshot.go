@@ -152,12 +152,17 @@ func (s *SnapshotStore) RecordSnapshot(rec *Record) error {
 		instancesJSON = sql.NullString{String: string(encoded), Valid: true}
 	}
 
+	digest := rec.SHA256
+	if !digest.Valid && rec.SHA256Str != "" {
+		digest = sql.NullString{String: rec.SHA256Str, Valid: true}
+	}
+
 	result, err := s.db.Exec(`
 		INSERT INTO snapshot_history
-			(filename, created_at, size, status, instances_with_data, config_only, format, instances_json, local_location, remote_location, comment)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(filename, created_at, size, status, instances_with_data, config_only, format, instances_json, local_location, remote_location, comment, sha256)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, rec.Filename, rec.CreatedAt, rec.Size, rec.Status,
-		rec.InstancesWithData, rec.ConfigOnly, format, instancesJSON, local, rec.RemoteLocation, comment)
+		rec.InstancesWithData, rec.ConfigOnly, format, instancesJSON, local, rec.RemoteLocation, comment, digest)
 	if err != nil {
 		return fmt.Errorf("record snapshot: %w", err)
 	}
@@ -168,6 +173,7 @@ func (s *SnapshotStore) RecordSnapshot(rec *Record) error {
 	rec.ID = int(id)
 	rec.LocalLocation = local
 	rec.Comment = comment
+	rec.SHA256 = digest
 	return nil
 }
 
@@ -351,6 +357,9 @@ func flatten(r *Record) {
 	if r.Comment.Valid {
 		r.CommentStr = r.Comment.String
 	}
+	if r.SHA256.Valid {
+		r.SHA256Str = r.SHA256.String
+	}
 	if r.InstancesJSON.Valid && r.InstancesJSON.String != "" {
 		var instances []RecordInstance
 		if err := json.Unmarshal([]byte(r.InstancesJSON.String), &instances); err != nil {
@@ -369,6 +378,19 @@ func flatten(r *Record) {
 func (s *SnapshotStore) SetLocalLocation(id int, local string) error {
 	if _, err := s.db.Exec(`UPDATE snapshot_history SET local_location = ? WHERE id = ?`, local, id); err != nil {
 		return fmt.Errorf("set snapshot local location: %w", err)
+	}
+	return nil
+}
+
+// SetSHA256IfUnknown records an archive digest on a row that has none — a row
+// written before migration 022, whose digest is first learned when a copy is
+// downloaded and verified. A row that already has one is never overwritten:
+// the digest taken at write time is the reference every later copy is checked
+// against, and replacing it with a copy's would make a divergent copy the
+// new truth.
+func (s *SnapshotStore) SetSHA256IfUnknown(id int, digest string) error {
+	if _, err := s.db.Exec(`UPDATE snapshot_history SET sha256 = ? WHERE id = ? AND sha256 IS NULL`, digest, id); err != nil {
+		return fmt.Errorf("record snapshot %d digest: %w", id, err)
 	}
 	return nil
 }

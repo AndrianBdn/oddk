@@ -54,6 +54,7 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	// Restoring ONE instance out of a snapshot IS an endpoint, unlike apply: the
 	// deployment stays up, so it needs the executor and the health-check pause.
 	mux.HandleFunc("POST /api/snapshot/restore-instance", s.withAuth(s.handleSnapshotRestoreInstance))
+	mux.HandleFunc("POST /api/snapshot/restore-database", s.withAuth(s.handleSnapshotRestoreDatabase))
 	mux.HandleFunc("GET /api/snapshots", s.withAuth(s.handleSnapshotList))
 	// The BUCKET's inventory under the ODDK snapshot layout, as opposed to this
 	// host's catalogue — it also shows archives whose rows died with another host.

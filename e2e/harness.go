@@ -60,6 +60,18 @@ func setupTestHarness(testName string, kvMap map[string]string, runFakeS3 bool) 
 		panic(fmt.Sprintf("Failed to create server: %v", err))
 	}
 
+	// Per-instance backup schedules are deprecated and the daemon refuses new
+	// ones. The legacy-backup and migration tests need schedules to exist, so
+	// the harness opts every test into creating them; a test that exercises
+	// the refusal sets this key to "0" in its KVMap (which wins, below). The
+	// key is read only by oddk_debug builds.
+	if _, ok := kvMap[debugAllowNewBackupPlansKey]; !ok {
+		if err := server.DebugSetRawKV(debugAllowNewBackupPlansKey, "1"); err != nil {
+			_ = os.RemoveAll(tempDir)
+			panic(fmt.Sprintf("Failed to allow backup plans: %v", err))
+		}
+	}
+
 	// Set any provided KV values before starting the server
 	for key, value := range kvMap {
 		if err := server.DebugSetRawKV(key, value); err != nil {
@@ -620,3 +632,7 @@ func (h *TestHarness) imageExists(tag string) (string, bool) {
 	}
 	return "", false
 }
+
+// debugAllowNewBackupPlansKey mirrors the daemon's oddk_debug-only switch that
+// lets tests create deprecated per-instance backup schedules.
+const debugAllowNewBackupPlansKey = "cron.debug_allow_new_backup_plans.int"

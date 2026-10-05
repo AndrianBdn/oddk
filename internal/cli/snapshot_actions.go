@@ -547,32 +547,17 @@ type snapshotRestoreInstanceResult struct {
 // filesystem question entirely: the daemon fetches the archive itself.
 func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Command) error {
 	instance := cmd.String("instance")
-	archivePath := cmd.String("file")
-	snapshotID := cmd.Int("id")
-	s3URI := cmd.String("s3-uri")
 	if instance == "" {
 		return fmt.Errorf("--instance is required (which instance to restore out of the snapshot)")
 	}
-	sources := 0
-	for _, set := range []bool{archivePath != "", snapshotID != 0, s3URI != ""} {
-		if set {
-			sources++
-		}
+	sourceDesc, err := describeSnapshotArchiveSource(cmd)
+	if err != nil {
+		return err
 	}
-	if sources != 1 {
-		return fmt.Errorf("exactly one of --file, --id or --s3-uri is required (the snapshot to restore from)")
+	if err := requireYesForJSON(cmd); err != nil {
+		return err
 	}
-	if s3URI == "" && (cmd.String("region") != "" || cmd.String("endpoint") != "" || cmd.String("aws-profile") != "") {
-		return fmt.Errorf("--region, --endpoint and --aws-profile are only meaningful with --s3-uri")
-	}
-
-	sourceDesc := archivePath
-	switch {
-	case snapshotID != 0:
-		sourceDesc = fmt.Sprintf("snapshot id %d (this host's catalogue)", snapshotID)
-	case s3URI != "":
-		sourceDesc = s3URI
-	}
+	notes := c.notesWriter(cmd.Bool("json"))
 
 	if !cmd.Bool("yes") {
 		_, _ = fmt.Fprintf(c.out, "About to restore instance %q from %s\n\n", instance, sourceDesc)
@@ -597,44 +582,14 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 	}
 
 	body := map[string]any{"instance": instance}
-	switch {
-	case archivePath != "":
-		body["filePath"] = archivePath
-	case snapshotID != 0:
-		body["snapshotId"] = snapshotID
-	default:
-		body["s3Uri"] = s3URI
-		// Best-effort: attach this shell's resolved ambient credentials so the
-		// daemon can reach a bucket its offsite settings do not cover. An empty
-		// shell attaches nothing — the daemon's rung order (offsite settings →
-		// request → its own instance role) decides what authenticates.
-		creds, resolvedRegion, err := c.resolveAmbientAWSCredentials(ctx, cmd.String("aws-profile"))
-		if err != nil {
-			return err
-		}
-		if creds != nil {
-			body["credentials"] = creds
-			c.warnIfRemoteDaemonCreds()
-		}
-		region := cmd.String("region")
-		if region == "" {
-			region = resolvedRegion
-		}
-		if region != "" {
-			body["region"] = region
-		}
-		if endpoint := cmd.String("endpoint"); endpoint != "" {
-			body["endpoint"] = endpoint
-		}
-	}
-	if key := cmd.String("master-key"); key != "" {
-		body["masterKeyPath"] = key
+	if err := c.addSnapshotArchiveSource(ctx, cmd, body, notes); err != nil {
+		return err
 	}
 
-	if archivePath == "" {
-		_, _ = fmt.Fprintf(c.out, "\nFetching the snapshot archive if needed, then restoring %s (this may take a while)...\n", instance)
+	if cmd.String("file") == "" {
+		_, _ = fmt.Fprintf(notes, "\nFetching the snapshot archive if needed, then restoring %s (this may take a while)...\n", instance)
 	} else {
-		_, _ = fmt.Fprintf(c.out, "\nRestoring %s (this may take a while)...\n", instance)
+		_, _ = fmt.Fprintf(notes, "\nRestoring %s (this may take a while)...\n", instance)
 	}
 	resp, err := c.request("POST", "/api/snapshot/restore-instance", body)
 	if err != nil {
@@ -665,20 +620,7 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 	if result.SourceHost != "" {
 		_, _ = fmt.Fprintf(c.out, "  Source:    %s (snapshot taken %s)\n", result.SourceHost, result.SnapshotAt)
 	}
-	if o := result.ArchiveOrigin; o != nil {
-		switch o.Kind {
-		case "catalogue-downloaded":
-			_, _ = fmt.Fprintf(c.out, "  Archive:   downloaded from S3 (%s) to %s — now the snapshot's local copy\n",
-				humanSize(o.DownloadedBytes), o.Path)
-		case "s3-download":
-			_, _ = fmt.Fprintf(c.out, "  Archive:   downloaded from S3 (%s) to %s\n"+
-				"             (kept for further restores; the daemon prunes it after 7 days)\n",
-				humanSize(o.DownloadedBytes), o.Path)
-		case "s3-cached":
-			_, _ = fmt.Fprintf(c.out, "  Archive:   reused previously downloaded copy at %s\n"+
-				"             (kept for further restores; the daemon prunes it after 7 days)\n", o.Path)
-		}
-	}
+	c.printSnapshotArchiveOrigin(result.ArchiveOrigin)
 	if result.FinalStatus == "stopped" {
 		// A cold-captured instance comes back the way it was captured. Saying
 		// nothing would read as a restore that failed to start the instance.
@@ -697,6 +639,241 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 	}
 
 	return nil
+}
+
+type snapshotRestoreDatabaseResult struct {
+	Instance          string                 `json:"instance"`
+	SourceInstance    string                 `json:"sourceInstance"`
+	SourceDatabase    string                 `json:"sourceDatabase"`
+	TargetDatabase    string                 `json:"targetDatabase"`
+	Format            string                 `json:"format"`
+	SourceHost        string                 `json:"sourceHost"`
+	SnapshotAt        string                 `json:"snapshotAt"`
+	SkippedGrantRoles []string               `json:"skippedGrantRoles"`
+	Warnings          []string               `json:"warnings"`
+	ArchiveOrigin     *snapshotArchiveOrigin `json:"archiveOrigin"`
+}
+
+// snapshotRestoreDatabaseAction restores ONE database out of a snapshot into a
+// live instance, as a new database.
+//
+// The prompt spells out what does NOT happen, because the operator reaching
+// for this is choosing it over restore-instance precisely for that, and the
+// two commands differ by one word.
+func (c *Client) snapshotRestoreDatabaseAction(ctx context.Context, cmd *cli.Command) error {
+	instance := cmd.String("instance")
+	database := cmd.String("database")
+	restoreAs := cmd.String("restore-as")
+	fromInstance := cmd.String("from-instance")
+	if instance == "" || database == "" {
+		return fmt.Errorf("--instance and --database are required")
+	}
+	if fromInstance == instance {
+		fromInstance = ""
+	}
+	sourceDesc, err := describeSnapshotArchiveSource(cmd)
+	if err != nil {
+		return err
+	}
+	if err := requireYesForJSON(cmd); err != nil {
+		return err
+	}
+	notes := c.notesWriter(cmd.Bool("json"))
+	target := database
+	if restoreAs != "" {
+		target = restoreAs
+	}
+
+	if !cmd.Bool("yes") {
+		source := instance
+		if fromInstance != "" {
+			source = fromInstance
+		}
+		_, _ = fmt.Fprintf(c.out, "About to restore database %q of instance %q from %s", database, source, sourceDesc)
+		if fromInstance != "" {
+			_, _ = fmt.Fprintf(c.out, " into instance %q", instance)
+		}
+		if restoreAs != "" {
+			_, _ = fmt.Fprintf(c.out, " as %q", restoreAs)
+		}
+		_, _ = fmt.Fprint(c.out, "\n\n")
+		_, _ = fmt.Fprintf(c.out, "  - Creates database %q on %s. It must not exist yet; nothing is overwritten.\n", target, instance)
+		_, _ = fmt.Fprintln(c.out, "  - The instance's other databases, roles, password and configuration are")
+		_, _ = fmt.Fprintln(c.out, "    untouched, and it keeps serving throughout.")
+		_, _ = fmt.Fprintln(c.out, "  - Objects come back owned by postgres, without object privileges; re-grant")
+		_, _ = fmt.Fprintln(c.out, "    what your application needs (e.g. 'oddk instance add-db-user ... --owner').")
+		_, _ = fmt.Fprintln(c.out, "  - From a physical snapshot, the instance's copy is started as an isolated")
+		_, _ = fmt.Fprintln(c.out, "    scratch cluster first: that needs free disk for the whole cluster, and")
+		_, _ = fmt.Fprintln(c.out, "    UNLOGGED tables come back empty.")
+		_, _ = fmt.Fprintln(c.out)
+
+		confirmed, err := c.cliConfirm(fmt.Sprintf("Restore database %q into %q? [y/N]: ", target, instance))
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			_, _ = fmt.Fprintln(c.out, "Cancelled")
+			return nil
+		}
+	}
+
+	body := map[string]any{"instance": instance, "database": database}
+	if restoreAs != "" {
+		body["restoreAs"] = restoreAs
+	}
+	if fromInstance != "" {
+		body["fromInstance"] = fromInstance
+	}
+	if err := c.addSnapshotArchiveSource(ctx, cmd, body, notes); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(notes, "\nRestoring %s into %s (this may take a while)...\n", target, instance)
+	resp, err := c.request("POST", "/api/snapshot/restore-database", body)
+	if err != nil {
+		return err
+	}
+	if cmd.Bool("json") {
+		_, _ = fmt.Fprintf(c.out, "%s\n", resp)
+		return nil
+	}
+
+	var result snapshotRestoreDatabaseResult
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+	_, _ = fmt.Fprintf(c.out, "\nRestored database %s on instance %s\n", result.TargetDatabase, result.Instance)
+	if result.SourceInstance != "" && result.SourceInstance != result.Instance {
+		_, _ = fmt.Fprintf(c.out, "  From:      database %s of instance %s in the snapshot\n", result.SourceDatabase, result.SourceInstance)
+	} else if result.TargetDatabase != result.SourceDatabase {
+		_, _ = fmt.Fprintf(c.out, "  From:      database %s in the snapshot\n", result.SourceDatabase)
+	}
+	if result.Format != "" {
+		_, _ = fmt.Fprintf(c.out, "  Format:    %s\n", describeSnapshotFormat(result.Format))
+	}
+	if result.SourceHost != "" {
+		_, _ = fmt.Fprintf(c.out, "  Source:    %s (snapshot taken %s)\n", result.SourceHost, result.SnapshotAt)
+	}
+	c.printSnapshotArchiveOrigin(result.ArchiveOrigin)
+	for _, w := range result.Warnings {
+		_, _ = fmt.Fprintf(c.out, "\n⚠️  %s\n", w)
+	}
+	if len(result.SkippedGrantRoles) > 0 {
+		_, _ = fmt.Fprintf(c.out,
+			"\n⚠️  CREATE on the database was granted to roles that do not exist here, so it was\n"+
+				"   not replayed for: %s\n", strings.Join(result.SkippedGrantRoles, ", "))
+	}
+	return nil
+}
+
+// notesWriter is where a command's progress lines and advisories go: stdout
+// normally, stderr under --json, where stdout must carry nothing but the JSON
+// document. A script parsing a restore's output used to fail AFTER the restore
+// had happened — and a naive retry of restore-database is then refused (the
+// database exists), while one of restore-instance rebuilds the instance again.
+func (c *Client) notesWriter(jsonMode bool) io.Writer {
+	if jsonMode {
+		return os.Stderr
+	}
+	return c.out
+}
+
+// requireYesForJSON refuses --json without --yes: the confirmation prompt is
+// interactive and would land on the same stdout the JSON does. Same rule as
+// migrate-from-backups and dangerously-drop-all.
+func requireYesForJSON(cmd *cli.Command) error {
+	if cmd.Bool("json") && !cmd.Bool("yes") {
+		return fmt.Errorf("--json requires --yes (the confirmation prompt would corrupt the JSON output)")
+	}
+	return nil
+}
+
+// describeSnapshotArchiveSource validates the archive-selection flags shared
+// by restore-instance and restore-database and describes the choice for the
+// confirmation prompt. It resolves nothing: that happens after the prompt.
+func describeSnapshotArchiveSource(cmd *cli.Command) (string, error) {
+	archivePath := cmd.String("file")
+	snapshotID := cmd.Int("id")
+	s3URI := cmd.String("s3-uri")
+	sources := 0
+	for _, set := range []bool{archivePath != "", snapshotID != 0, s3URI != ""} {
+		if set {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return "", fmt.Errorf("exactly one of --file, --id or --s3-uri is required (the snapshot to restore from)")
+	}
+	if s3URI == "" && (cmd.String("region") != "" || cmd.String("endpoint") != "" || cmd.String("aws-profile") != "") {
+		return "", fmt.Errorf("--region, --endpoint and --aws-profile are only meaningful with --s3-uri")
+	}
+	switch {
+	case snapshotID != 0:
+		return fmt.Sprintf("snapshot id %d (this host's catalogue)", snapshotID), nil
+	case s3URI != "":
+		return s3URI, nil
+	default:
+		return archivePath, nil
+	}
+}
+
+// addSnapshotArchiveSource writes the archive selection into a restore
+// request body. For --s3-uri it resolves this shell's ambient AWS credentials,
+// which is why it runs only after the operator has confirmed.
+func (c *Client) addSnapshotArchiveSource(ctx context.Context, cmd *cli.Command, body map[string]any, notes io.Writer) error {
+	switch {
+	case cmd.String("file") != "":
+		body["filePath"] = cmd.String("file")
+	case cmd.Int("id") != 0:
+		body["snapshotId"] = cmd.Int("id")
+	default:
+		body["s3Uri"] = cmd.String("s3-uri")
+		// Best-effort: attach this shell's resolved ambient credentials so the
+		// daemon can reach a bucket its offsite settings do not cover. An empty
+		// shell attaches nothing — the daemon's rung order (offsite settings →
+		// request → its own instance role) decides what authenticates.
+		creds, resolvedRegion, err := c.resolveAmbientAWSCredentials(ctx, cmd.String("aws-profile"), notes)
+		if err != nil {
+			return err
+		}
+		if creds != nil {
+			body["credentials"] = creds
+			c.warnIfRemoteDaemonCreds(notes)
+		}
+		region := cmd.String("region")
+		if region == "" {
+			region = resolvedRegion
+		}
+		if region != "" {
+			body["region"] = region
+		}
+		if endpoint := cmd.String("endpoint"); endpoint != "" {
+			body["endpoint"] = endpoint
+		}
+	}
+	if key := cmd.String("master-key"); key != "" {
+		body["masterKeyPath"] = key
+	}
+	return nil
+}
+
+// printSnapshotArchiveOrigin reports where a restore's archive came from.
+func (c *Client) printSnapshotArchiveOrigin(o *snapshotArchiveOrigin) {
+	if o == nil {
+		return
+	}
+	switch o.Kind {
+	case "catalogue-downloaded":
+		_, _ = fmt.Fprintf(c.out, "  Archive:   downloaded from S3 (%s) to %s — now the snapshot's local copy\n",
+			humanSize(o.DownloadedBytes), o.Path)
+	case "s3-download":
+		_, _ = fmt.Fprintf(c.out, "  Archive:   downloaded from S3 (%s) to %s\n"+
+			"             (kept for further restores; the daemon prunes it after 7 days)\n",
+			humanSize(o.DownloadedBytes), o.Path)
+	case "s3-cached":
+		_, _ = fmt.Fprintf(c.out, "  Archive:   reused previously downloaded copy at %s\n"+
+			"             (kept for further restores; the daemon prunes it after 7 days)\n", o.Path)
+	}
 }
 
 // snapshotApplyAction rebuilds this host from a snapshot.

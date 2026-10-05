@@ -2,6 +2,9 @@ package compression_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -245,5 +248,171 @@ func TestCreateTarZstd_PublishesAtomicallyAndVerifiably(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".tmp-") {
 			t.Errorf("temp file %s left behind after a successful write", e.Name())
 		}
+	}
+}
+
+// The digest the catalogue stores is taken from the read-back that verified the
+// archive, so it must be the digest of the published FILE — the value
+// `sha256sum` prints — and it must come from the same pass that verifies it.
+func TestCreateTarZstd_ReportsTheFileDigest(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 3<<20)
+	rand.New(rand.NewSource(11)).Read(payload)
+	if err := os.WriteFile(filepath.Join(src, "data.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(dir, "a.tar.zst")
+	written, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive, nil)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+
+	b, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	want := hex.EncodeToString(sum[:])
+	if written.SHA256 != want {
+		t.Errorf("Written.SHA256 = %q, want %q (sha256 of the file on disk)", written.SHA256, want)
+	}
+	if written.Size != int64(len(b)) {
+		t.Errorf("Written.Size = %d, want %d", written.Size, len(b))
+	}
+
+	v, err := compression.NewCompressor().VerifyTarZstdDigest(context.Background(), archive)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if v.SHA256 != want {
+		t.Errorf("VerifyTarZstdDigest SHA256 = %q, want %q", v.SHA256, want)
+	}
+}
+
+// A corrupt archive must not come back with a digest: a caller that recorded
+// it would be recording the fingerprint of broken bytes as the reference copy.
+func TestVerifyTarZstdDigest_NoDigestForCorruptArchive(t *testing.T) {
+	archive := buildArchive(t, t.TempDir())
+	bad := mutate(t, archive, "flipped.tar.zst", func(b []byte) []byte {
+		b[len(b)/2] ^= 0x01
+		return b
+	})
+	v, err := compression.NewCompressor().VerifyTarZstdDigest(context.Background(), bad)
+	if err == nil {
+		t.Fatal("a flipped bit verified clean")
+	}
+	if v != nil && v.SHA256 != "" {
+		t.Errorf("a corrupt archive returned a digest: %s", v.SHA256)
+	}
+}
+
+// A filtered extraction writes only the kept members, but still refuses a
+// corrupt archive — integrity is a property of the file, not of the members
+// a caller happens to want.
+func TestExtractTarZstdWith_Keep(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	for _, p := range []string{"instances/app/databases/sales", "instances/other"} {
+		if err := os.MkdirAll(filepath.Join(src, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{
+		"manifest.json":                         "{}",
+		"instances/app/instance.json":           "app",
+		"instances/app/databases/sales/toc.dat": "toc",
+		"instances/other/instance.json":         "other",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The member that gets FILTERED OUT carries a large incompressible payload,
+	// so the byte corrupted below lands in its content — the case where a
+	// filter that skipped verification would extract "cleanly". (Flipping a
+	// byte of a tiny archive can land on frame metadata that changes no
+	// content, which no checksum can see; that made this test flaky.)
+	payload := make([]byte, 1<<20)
+	rand.New(rand.NewSource(3)).Read(payload)
+	if err := os.WriteFile(filepath.Join(src, "instances/other/data.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(dir, "a.tar.zst")
+	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	keep := func(name string) bool {
+		name = strings.TrimSuffix(name, "/")
+		return name == "manifest.json" || name == "instances" || name == "instances/app" ||
+			strings.HasPrefix(name, "instances/app/")
+	}
+	dest := filepath.Join(dir, "out")
+	if err := compression.NewCompressor().ExtractTarZstdWith(context.Background(), archive, dest, compression.ExtractOptions{Keep: keep}); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	for _, want := range []string{"manifest.json", "instances/app/instance.json", "instances/app/databases/sales/toc.dat"} {
+		if _, err := os.Stat(filepath.Join(dest, want)); err != nil {
+			t.Errorf("%s was not extracted: %v", want, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dest, "instances/other")); !os.IsNotExist(err) {
+		t.Error("a filtered-out instance was extracted")
+	}
+
+	bad := mutate(t, archive, "flipped.tar.zst", func(b []byte) []byte {
+		b[len(b)/2] ^= 0x01
+		return b
+	})
+	if err := compression.NewCompressor().ExtractTarZstdWith(context.Background(), bad, filepath.Join(dir, "out2"), compression.ExtractOptions{Keep: keep}); err == nil {
+		t.Error("a corrupt archive was extracted because the damaged member was filtered out")
+	}
+}
+
+// A catalogued archive whose file was replaced by another VALID archive passes
+// every integrity check there is — only the recorded digest can refuse it, and
+// it must do so before anything is written.
+func TestExtractTarZstdWith_RefusesReplacedArchive(t *testing.T) {
+	dir := t.TempDir()
+	archive := buildArchive(t, dir)
+	b, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	recorded := hex.EncodeToString(sum[:])
+
+	dest := filepath.Join(dir, "ok")
+	if err := compression.NewCompressor().ExtractTarZstdWith(context.Background(), archive, dest,
+		compression.ExtractOptions{WantSHA256: recorded}); err != nil {
+		t.Fatalf("the catalogued archive was refused: %v", err)
+	}
+
+	// A different but perfectly valid archive, standing in the same place.
+	otherSrc := filepath.Join(dir, "other-src")
+	if err := os.MkdirAll(otherSrc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherSrc, "manifest.json"), []byte(`{"someone":"else"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "other.tar.zst")
+	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), otherSrc, other, nil); err != nil {
+		t.Fatal(err)
+	}
+	dest = filepath.Join(dir, "replaced")
+	err = compression.NewCompressor().ExtractTarZstdWith(context.Background(), other, dest,
+		compression.ExtractOptions{WantSHA256: recorded})
+	if !errors.Is(err, compression.ErrDigestMismatch) {
+		t.Fatalf("a replaced archive was not refused as a digest mismatch: %v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Error("a refused extraction created its destination")
 	}
 }

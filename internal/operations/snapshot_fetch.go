@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/operr"
 	s3service "github.com/andrianbdn/oddk/internal/services/s3"
 	"github.com/andrianbdn/oddk/internal/store/offsite"
@@ -173,25 +175,30 @@ func newSnapshotFetchClient(ctx context.Context, deps *Dependencies, spec *Remot
 // leave a partial file at the final name — which would make the next attempt
 // refuse with "move it aside first". The temp name carries the ".tmp-" prefix
 // the startup sweep already reclaims.
-func streamToLocalFileAtomic(ctx context.Context, s3Client *s3service.Client, key, localPath string) (int64, error) {
+//
+// wantSHA256 is the catalogue row's recorded digest ("" when unknown); the
+// download is refused if the verified copy does not match it. Returns the
+// byte count and the copy's digest.
+func streamToLocalFileAtomic(ctx context.Context, s3Client *s3service.Client, key, localPath, wantSHA256 string) (int64, string, error) {
 	tmpPath := filepath.Join(filepath.Dir(localPath), ".tmp-s3-download-"+filepath.Base(localPath))
 	written, err := streamToLocalFile(ctx, s3Client, key, tmpPath)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	// Verified BEFORE the rename, so a corrupt download never reaches a name
 	// that reads as a real archive — the same ordering writeVerifiedArchive uses
 	// on the way out.
-	if err := verifyDownloadedArchive(ctx, tmpPath); err != nil {
+	digest, err := verifyDownloadedArchive(ctx, tmpPath, wantSHA256)
+	if err != nil {
 		_ = os.Remove(tmpPath)
-		return 0, err
+		return 0, "", err
 	}
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		_ = os.Remove(tmpPath)
-		return 0, fmt.Errorf("finalize downloaded archive: %w", err)
+		return 0, "", fmt.Errorf("finalize downloaded archive: %w", err)
 	}
 	syncDir(filepath.Dir(localPath))
-	return written, nil
+	return written, digest, nil
 }
 
 // syncDir flushes a directory entry so a rename survives a power loss. Failures
@@ -294,7 +301,9 @@ func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key
 	// is to let a later fetch REUSE this file without downloading it again, so
 	// vouching for bytes nobody has checked would cache the corruption.
 	emitLine(progress, "Verifying %s...", name)
-	if err := verifyDownloadedArchive(ctx, tmpPath); err != nil {
+	// No expected digest: an --s3-uri fetch is by definition not tied to a
+	// catalogue row (a URI that IS one is routed through DownloadSnapshot).
+	if _, err := verifyDownloadedArchive(ctx, tmpPath, ""); err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
@@ -453,6 +462,15 @@ type ArchiveOrigin struct {
 	// CredentialSource says what authenticated an S3 fetch:
 	// "offsite-settings", "request", or "instance-role". Empty for local kinds.
 	CredentialSource string `json:"credentialSource,omitempty"`
+
+	// ExpectedSHA256 is the digest the catalogue recorded when this host
+	// wrote the archive, for an archive resolved THROUGH the catalogue (--id,
+	// or an s3 URI that is a catalogue row's remote copy). The restore checks
+	// the file against it before extracting, because a local copy is only
+	// ever stat'd here and an intact file that was REPLACED would otherwise
+	// restore as if it were the catalogued snapshot. Empty: nothing to check
+	// (a --file / uncatalogued --s3-uri source, or a pre-022 row).
+	ExpectedSHA256 string `json:"-"`
 }
 
 // ResolveRestoreInstanceArchive turns a restore source into a local archive
@@ -536,7 +554,9 @@ func resolveCatalogueArchive(ctx context.Context, deps *Dependencies, id int, ba
 	}
 	if record.LocalPath != "" {
 		if _, statErr := os.Stat(record.LocalPath); statErr == nil {
-			return record.LocalPath, false, &ArchiveOrigin{Kind: ArchiveOriginCatalogue, Path: record.LocalPath}, nil
+			return record.LocalPath, false, &ArchiveOrigin{
+				Kind: ArchiveOriginCatalogue, Path: record.LocalPath, ExpectedSHA256: record.SHA256Str,
+			}, nil
 		}
 	}
 
@@ -550,6 +570,9 @@ func resolveCatalogueArchive(ctx context.Context, deps *Dependencies, id int, ba
 		Path:             result.LocalPath,
 		DownloadedBytes:  result.Size,
 		CredentialSource: credSourceOffsite,
+		// The download was already checked against this; carrying it on
+		// costs a hash in the extraction pass and keeps one rule for both.
+		ExpectedSHA256: record.SHA256Str,
 	}, nil
 }
 
@@ -632,4 +655,14 @@ func FetchSnapshotForApply(ctx context.Context, spec *RemoteSnapshotSpec, backup
 		return nil, appendNoChanges(err)
 	}
 	return fetch, nil
+}
+
+// classifyExtractError tags a digest mismatch as a refusal (HTTP 400) rather
+// than an internal error: nothing was extracted or changed, and the operator
+// must find out why the file was replaced before retrying.
+func classifyExtractError(what string, err error) error {
+	if errors.Is(err, compression.ErrDigestMismatch) {
+		return operr.Invalidf("%s: %v", what, err)
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }

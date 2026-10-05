@@ -32,7 +32,7 @@ func BuildApp(client *Client) *cli.Command {
 			checklistCommand(client),
 			instanceCommands(client),
 			notifyCommands(client),
-			backupCommands(client),
+			withBackupDeprecationNotices(backupCommands(client)),
 			snapshotCommands(client),
 			cronCommands(client),
 			parametersCommands(client),
@@ -748,50 +748,73 @@ func snapshotCommands(client *Client) *cli.Command {
 					"If the instance exists its cluster is destroyed and rebuilt from the snapshot;\n" +
 					"otherwise it is created. Other instances are untouched.\n" +
 					"Use 'snapshot apply' instead to rebuild a whole host.",
-				Flags: []cli.Flag{
+				Flags: append([]cli.Flag{
 					&cli.StringFlag{
 						Name:     "instance",
 						Usage:    "Instance to restore out of the snapshot",
 						Required: true,
 					},
-					&cli.StringFlag{
-						Name:  "file",
-						Usage: "Path to the snapshot .tar.zst (on the daemon's filesystem)",
-					},
-					&cli.IntFlag{
-						Name:  "id",
-						Usage: "Catalogue ID of the snapshot ('oddk snapshot list'); auto-downloaded from S3 if the local copy is gone",
-					},
-					&cli.StringFlag{
-						Name:  "s3-uri",
-						Usage: "s3://bucket/key of a snapshot archive ('oddk snapshot list-remote'); downloaded to the daemon's managed downloads area",
-					},
-					&cli.StringFlag{
-						Name:  "region",
-						Usage: "AWS region for --s3-uri (default: this shell's AWS config, then us-east-1)",
-					},
-					&cli.StringFlag{
-						Name:  "endpoint",
-						Usage: "Custom S3 endpoint URL for --s3-uri (S3-compatible storage)",
-					},
-					&cli.StringFlag{
-						Name:  "aws-profile",
-						Usage: "AWS shared-config profile to resolve credentials from for --s3-uri",
-					},
-					&cli.StringFlag{
-						Name:  "master-key",
-						Usage: "Path to the SOURCE host's master.key; only needed when the snapshot came from another deployment",
-					},
+				}, append(snapshotArchiveSourceFlags(),
 					&cli.BoolFlag{
 						Name:  "yes",
 						Usage: "Skip the confirmation prompt",
 					},
 					&cli.BoolFlag{
 						Name:  "json",
-						Usage: "Output as JSON",
+						Usage: "Output as JSON (requires --yes)",
 					},
-				},
+				)...),
 				Action: client.snapshotRestoreInstanceAction,
+			},
+			{
+				Name:  "restore-database",
+				Usage: "Restore ONE database out of a snapshot into a live instance, as a new database",
+				Description: "Creates the database on the running instance from the snapshot's copy of it.\n" +
+					"--from-instance reads it from another instance's copy instead (e.g. prod's\n" +
+					"database into staging); the snapshot's copy must not be a newer PostgreSQL\n" +
+					"major than the target.\n" +
+					"Nothing else changes: not the instance's other databases, its roles, its\n" +
+					"password or its configuration. The database must not already exist — use\n" +
+					"--restore-as to restore it next to the current one under another name.\n" +
+					"Objects come back owned by postgres, without object privileges (as with\n" +
+					"'backup restore'); database-level CREATE grants are replayed for roles\n" +
+					"that exist here.\n" +
+					"A physical snapshot has no per-database dumps, so the instance's copy is\n" +
+					"started as an isolated scratch cluster (no network) and the database is\n" +
+					"dumped out of it. That needs free disk for the whole cluster, and\n" +
+					"UNLOGGED tables come back empty.\n" +
+					"The snapshot comes from exactly one of --file, --id or --s3-uri, as for\n" +
+					"'snapshot restore-instance'.",
+				Flags: append([]cli.Flag{
+					&cli.StringFlag{
+						Name:     "instance",
+						Usage:    "Running instance to restore into",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:     "database",
+						Usage:    "Database to restore out of the snapshot",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:  "from-instance",
+						Usage: "Read the database from this instance's copy in the snapshot (default: --instance), e.g. prod's database into staging",
+					},
+					&cli.StringFlag{
+						Name:  "restore-as",
+						Usage: "Create it under this name instead (the original name must otherwise be free)",
+					},
+				}, append(snapshotArchiveSourceFlags(),
+					&cli.BoolFlag{
+						Name:  "yes",
+						Usage: "Skip the confirmation prompt",
+					},
+					&cli.BoolFlag{
+						Name:  "json",
+						Usage: "Output as JSON (requires --yes)",
+					},
+				)...),
+				Action: client.snapshotRestoreDatabaseAction,
 			},
 			{
 				Name:      "list-remote",
@@ -890,7 +913,7 @@ func snapshotCommands(client *Client) *cli.Command {
 func backupCommands(client *Client) *cli.Command {
 	return &cli.Command{
 		Name:  "backup",
-		Usage: "Manage per-instance backups (legacy — prefer 'oddk snapshot'; still the way to restore a single database)",
+		Usage: "Manage per-instance backups (DEPRECATED — removed after 2026-12-31; use 'oddk snapshot')",
 		Commands: []*cli.Command{
 			{
 				Name:      "make",
@@ -1260,4 +1283,41 @@ func writeTable(out io.Writer, headers []string, rows [][]string) error {
 	}
 
 	return w.Flush()
+}
+
+// snapshotArchiveSourceFlags are the flags that choose the archive a snapshot
+// restore reads, shared by restore-instance and restore-database so the two
+// cannot drift apart. The master key belongs here too: it is a property of
+// where the archive came from.
+func snapshotArchiveSourceFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{
+			Name:  "file",
+			Usage: "Path to the snapshot .tar.zst (on the daemon's filesystem)",
+		},
+		&cli.IntFlag{
+			Name:  "id",
+			Usage: "Catalogue ID of the snapshot ('oddk snapshot list'); auto-downloaded from S3 if the local copy is gone",
+		},
+		&cli.StringFlag{
+			Name:  "s3-uri",
+			Usage: "s3://bucket/key of a snapshot archive ('oddk snapshot list-remote'); downloaded to the daemon's managed downloads area",
+		},
+		&cli.StringFlag{
+			Name:  "region",
+			Usage: "AWS region for --s3-uri (default: this shell's AWS config, then us-east-1)",
+		},
+		&cli.StringFlag{
+			Name:  "endpoint",
+			Usage: "Custom S3 endpoint URL for --s3-uri (S3-compatible storage)",
+		},
+		&cli.StringFlag{
+			Name:  "aws-profile",
+			Usage: "AWS shared-config profile to resolve credentials from for --s3-uri",
+		},
+		&cli.StringFlag{
+			Name:  "master-key",
+			Usage: "Path to the SOURCE host's master.key; only needed when the snapshot came from another deployment",
+		},
+	}
 }

@@ -41,31 +41,7 @@ func captureDatabaseMetadata(ctx context.Context, deps *Dependencies, instanceNa
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
-	// datlocprovider exists only from PostgreSQL 15; older clusters are libc.
-	providerExpr := "'c'::text"
-	if major >= 15 {
-		providerExpr = "d.datlocprovider::text"
-	}
-	query := fmt.Sprintf(`
-		SELECT d.datname,
-		       pg_catalog.pg_get_userbyid(d.datdba),
-		       pg_catalog.pg_encoding_to_char(d.encoding),
-		       d.datcollate,
-		       d.datctype,
-		       %s,
-		       ARRAY(
-		           SELECT DISTINCT r.rolname
-		           FROM pg_catalog.aclexplode(
-		               COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))
-		           ) AS acl
-		           JOIN pg_catalog.pg_roles AS r ON r.oid = acl.grantee
-		           WHERE acl.privilege_type = 'CREATE'
-		           ORDER BY r.rolname
-		       )
-		FROM pg_catalog.pg_database AS d
-		WHERE d.datistemplate = false
-		ORDER BY d.datname`, providerExpr)
-
+	query := databaseMetadataQuery(major)
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("query pg_database: %w", err)
@@ -89,6 +65,37 @@ func captureDatabaseMetadata(ctx context.Context, deps *Dependencies, instanceNa
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// databaseMetadataQuery selects, per non-template database: name, owner,
+// encoding, collate, ctype, locale provider and CREATE grantees — in that
+// column order, which captureDatabaseMetadata scans positionally and
+// scratchDatabaseMetadata aggregates into DatabaseMeta's JSON shape by alias.
+func databaseMetadataQuery(major int) string {
+	// datlocprovider exists only from PostgreSQL 15; older clusters are libc.
+	providerExpr := "'c'::text"
+	if major >= 15 {
+		providerExpr = "d.datlocprovider::text"
+	}
+	return fmt.Sprintf(`
+		SELECT d.datname AS dbname,
+		       pg_catalog.pg_get_userbyid(d.datdba) AS dbowner,
+		       pg_catalog.pg_encoding_to_char(d.encoding) AS dbencoding,
+		       d.datcollate AS dbcollate,
+		       d.datctype AS dbctype,
+		       %s AS dblocprovider,
+		       ARRAY(
+		           SELECT DISTINCT r.rolname
+		           FROM pg_catalog.aclexplode(
+		               COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))
+		           ) AS acl
+		           JOIN pg_catalog.pg_roles AS r ON r.oid = acl.grantee
+		           WHERE acl.privilege_type = 'CREATE'
+		           ORDER BY r.rolname
+		       ) AS dbcreategrantees
+		FROM pg_catalog.pg_database AS d
+		WHERE d.datistemplate = false
+		ORDER BY d.datname`, providerExpr)
 }
 
 // writeDatabaseMetadata writes the metadata as databases.json into dir (a backup

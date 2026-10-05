@@ -105,6 +105,14 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 	} else if removed > 0 {
 		log.Printf("Removed %d orphaned helper container(s) from previous run", removed)
 	}
+	// Then scratch volumes: each holds a full copy of an instance's cluster,
+	// and one can outlive its container (see RemoveScratchCluster). After the
+	// container sweep, so none can still be in use.
+	if removed, err := dockerClient.RemoveOrphanedScratchVolumes(); err != nil {
+		log.Printf("WARNING: scratch volume sweep: %v", err)
+	} else if removed > 0 {
+		log.Printf("Removed %d orphaned scratch volume(s) (copies of instance data from an interrupted single-database restore)", removed)
+	}
 
 	// Reconcile stored instance state with Docker reality, sweep orphaned
 	// backup artifacts, and converge stored secrets on the current encryption

@@ -35,6 +35,9 @@ type helperContainerSpec struct {
 	Password string
 	// Mounts are added in addition to the .pgpass mount.
 	Mounts []mount.Mount
+	// Env is added to the helper's environment (after PGPASSFILE). Never put
+	// a credential here: Docker keeps Config.Env in the container's metadata.
+	Env []string
 	// JoinNetNSContainer, when set, joins that container's network namespace
 	// (NetworkMode container:<id>) instead of attaching to oddk-bridge — a
 	// container sharing another's netns cannot also be attached to networks.
@@ -73,7 +76,7 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 		Image:  spec.Image,
 		User:   fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		Cmd:    spec.Cmd,
-		Env:    []string{pgPassEnv},
+		Env:    append([]string{pgPassEnv}, spec.Env...),
 		Labels: map[string]string{"oddk.helper": "true"},
 	}
 	hostConfig := &container.HostConfig{Mounts: append(append([]mount.Mount{}, spec.Mounts...), pgPassMount)}
@@ -103,7 +106,12 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 		// running; the daemon-startup sweep is the backstop.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_, _ = cli.ContainerRemove(cleanupCtx, resp.ID, client.ContainerRemoveOptions{Force: true})
+		// RemoveVolumes: the postgres image declares a VOLUME, so Docker gives
+		// every helper an anonymous volume. Removing the container without it
+		// leaked one volume per pg_dump/pg_restore/pg_basebackup run —
+		// thousands on a host that has run nightly backups for a while. Only
+		// anonymous volumes are affected; bind mounts and named volumes are not.
+		_, _ = cli.ContainerRemove(cleanupCtx, resp.ID, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
 	}()
 
 	if _, err := cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {

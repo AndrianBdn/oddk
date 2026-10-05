@@ -46,7 +46,7 @@ func RestoreRDBMS(ctx context.Context, deps *Dependencies, params *RestoreRDBMSP
 	}
 
 	// 2. Determine backup file path
-	backupPath, sourceDesc, err := resolveBackupSource(deps, params)
+	backupPath, sourceDesc, wantSHA256, err := resolveBackupSource(deps, params)
 	if err != nil {
 		return nil, err
 	}
@@ -98,48 +98,22 @@ func RestoreRDBMS(ctx context.Context, deps *Dependencies, params *RestoreRDBMSP
 	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	compressor := compression.NewCompressor()
-	if err := compressor.ExtractTarZstd(ctx, backupPath, tempDir); err != nil {
-		return nil, fmt.Errorf("extract backup: %w", err)
+	if err := compressor.ExtractTarZstdWith(ctx, backupPath, tempDir,
+		compression.ExtractOptions{WantSHA256: wantSHA256}); err != nil {
+		return nil, classifyExtractError("extract backup", err)
 	}
 
-	// 8. Verify requested database exists in backup
-	dbDir := filepath.Join(tempDir, "databases", params.DatabaseName)
-	if _, err := os.Stat(dbDir); os.IsNotExist(err) {
-		// List available databases for helpful error message
-		available := listDatabasesInBackup(tempDir)
-		return nil, fmt.Errorf("database %s not found in backup; available databases: %v",
-			params.DatabaseName, available)
-	}
-
-	// 9. Create the (empty) target database.
-	createQuery, err := buildRestoreCreateSQL(tempDir, params.DatabaseName, targetDB)
+	// 8-10. Create the target database and replay the dump into it.
+	missingRoles, err := restoreDatabaseFromDumpTree(ctx, deps, conn, dumpRestore{
+		instance: instance,
+		password: password,
+		dumpTree: tempDir,
+		sourceDB: params.DatabaseName,
+		targetDB: targetDB,
+		noun:     "backup",
+	})
 	if err != nil {
 		return nil, err
-	}
-	createGrantees, err := readDatabaseCreateGrantees(tempDir, params.DatabaseName)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := conn.Exec(ctx, createQuery); err != nil {
-		return nil, fmt.Errorf("create target database: %w", err)
-	}
-
-	// 10. Run pg_restore via ephemeral container
-	if err := runPgRestore(ctx, deps, instance, password, dbDir, targetDB); err != nil {
-		dropQuery := fmt.Sprintf("DROP DATABASE IF EXISTS %s", pgx.Identifier{targetDB}.Sanitize())
-		_, _ = conn.Exec(ctx, dropQuery)
-		return nil, fmt.Errorf("pg_restore failed: %w", err)
-	}
-
-	// pg_restore intentionally skips ACLs because backup roles may not exist on
-	// the target. Replay the database-level CREATE grants captured separately;
-	// missing roles are reported and skipped, while a real grant failure removes
-	// the new database just like a pg_restore failure does.
-	missingRoles, err := restoreDatabaseCreateGrants(ctx, conn, targetDB, createGrantees)
-	if err != nil {
-		dropQuery := fmt.Sprintf("DROP DATABASE IF EXISTS %s", pgx.Identifier{targetDB}.Sanitize())
-		_, _ = conn.Exec(ctx, dropQuery)
-		return nil, fmt.Errorf("restore database CREATE privileges: %w", err)
 	}
 	if len(missingRoles) > 0 {
 		log.Printf(
@@ -154,6 +128,74 @@ func RestoreRDBMS(ctx context.Context, deps *Dependencies, params *RestoreRDBMSP
 		SourceBackup:   sourceDesc,
 		Message:        fmt.Sprintf("Successfully restored database %s from %s", targetDB, sourceDesc),
 	}, nil
+}
+
+// dumpRestore describes replaying one database out of a per-instance dump tree
+// into a live instance.
+type dumpRestore struct {
+	instance *instances.RDBMSInstance // the TARGET instance
+	password string                   // its postgres password
+
+	// dumpTree is a per-instance archive's layout: databases/<db>/ (a
+	// directory-format pg_dump) and databases.json. A backup archive is one; so
+	// is a logical snapshot's instances/<name>/ subtree (the same
+	// stageInstanceDump writes both); and a physical snapshot's single-database
+	// restore builds one out of a scratch copy of the cluster.
+	dumpTree string
+	sourceDB string
+	targetDB string
+
+	// noun names the archive kind in the "not found in <noun>" refusal.
+	noun string
+}
+
+// restoreDatabaseFromDumpTree creates the (empty) target database with the
+// source's recorded encoding/collation, pg_restores the dump into it, and
+// replays its database-level CREATE grants. Objects arrive owned by postgres
+// and without privileges (--no-owner --no-privileges): the target cluster may
+// not have the source's roles. Any failure after the CREATE drops the new
+// database again, so a refused restore leaves nothing behind.
+//
+// It returns the grantee roles skipped because they do not exist on the
+// target. The caller has already proved the target database is absent.
+func restoreDatabaseFromDumpTree(ctx context.Context, deps *Dependencies, conn *pgx.Conn, r dumpRestore) ([]string, error) {
+	dbDir := filepath.Join(r.dumpTree, "databases", r.sourceDB)
+	if _, err := os.Stat(dbDir); os.IsNotExist(err) {
+		return nil, operr.NotFoundf("database %s not found in %s; available databases: %v",
+			r.sourceDB, r.noun, listDatabasesInBackup(r.dumpTree))
+	}
+
+	createQuery, err := buildRestoreCreateSQL(r.dumpTree, r.sourceDB, r.targetDB)
+	if err != nil {
+		return nil, err
+	}
+	createGrantees, err := readDatabaseCreateGrantees(r.dumpTree, r.sourceDB)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, createQuery); err != nil {
+		return nil, fmt.Errorf("create target database: %w", err)
+	}
+	dropTarget := func() {
+		dropQuery := fmt.Sprintf("DROP DATABASE IF EXISTS %s", pgx.Identifier{r.targetDB}.Sanitize())
+		_, _ = conn.Exec(ctx, dropQuery)
+	}
+
+	if err := runPgRestore(ctx, deps, r.instance, r.password, dbDir, r.targetDB); err != nil {
+		dropTarget()
+		return nil, fmt.Errorf("pg_restore failed: %w", err)
+	}
+
+	// pg_restore intentionally skips ACLs because the source's roles may not
+	// exist on the target. Replay the database-level CREATE grants captured
+	// separately; missing roles are reported and skipped, while a real grant
+	// failure removes the new database just like a pg_restore failure does.
+	missingRoles, err := restoreDatabaseCreateGrants(ctx, conn, r.targetDB, createGrantees)
+	if err != nil {
+		dropTarget()
+		return nil, fmt.Errorf("restore database CREATE privileges: %w", err)
+	}
+	return missingRoles, nil
 }
 
 // validateRestoreParams rejects missing/conflicting inputs and path-unsafe
@@ -185,27 +227,29 @@ func validateRestoreParams(params *RestoreRDBMSParams) error {
 }
 
 // resolveBackupSource maps the restore input (backup ID or file path) to the
-// archive path on disk plus a human-readable source description.
-func resolveBackupSource(deps *Dependencies, params *RestoreRDBMSParams) (backupPath, sourceDesc string, err error) {
+// archive path on disk, a human-readable source description, and — for a
+// catalogued backup — the SHA-256 recorded when it was written, which the
+// extraction checks the file against ("" when there is nothing to check).
+func resolveBackupSource(deps *Dependencies, params *RestoreRDBMSParams) (backupPath, sourceDesc, wantSHA256 string, err error) {
 	if params.BackupID != 0 {
 		backup, err := deps.Store.Backup.GetBackupByID(params.BackupID)
 		if err != nil {
-			return "", "", fmt.Errorf("get backup: %w", err)
+			return "", "", "", fmt.Errorf("get backup: %w", err)
 		}
 		if !backup.LocalLocation.Valid || backup.LocalLocation.String == "" {
-			return "", "", fmt.Errorf("backup %d has no local copy (download it first)", params.BackupID)
+			return "", "", "", fmt.Errorf("backup %d has no local copy (download it first)", params.BackupID)
 		}
 		backupPath = backup.LocalLocation.String
 		if !filepath.IsAbs(backupPath) {
 			backupPath = filepath.Join(params.BackupDir, backupPath)
 		}
-		return backupPath, fmt.Sprintf("backup ID %d", params.BackupID), nil
+		return backupPath, fmt.Sprintf("backup ID %d", params.BackupID), backup.SHA256Str, nil
 	}
 
 	if _, err := os.Stat(params.FilePath); err != nil {
-		return "", "", fmt.Errorf("backup file not found: %s", params.FilePath)
+		return "", "", "", fmt.Errorf("backup file not found: %s", params.FilePath)
 	}
-	return params.FilePath, fmt.Sprintf("file %s", filepath.Base(params.FilePath)), nil
+	return params.FilePath, fmt.Sprintf("file %s", filepath.Base(params.FilePath)), "", nil
 }
 
 // buildRestoreCreateSQL builds the CREATE DATABASE statement for the restore
@@ -282,8 +326,8 @@ func runPgRestore(ctx context.Context, deps *Dependencies, instance *instances.R
 		Image:         image,
 		Cmd: []string{
 			"pg_restore",
-			"-Fd",          // Directory format
-			"-d", targetDB, // Target database
+			"-Fd",                                    // Directory format
+			"--dbname=" + pgConninfoDBName(targetDB), // Target database, never parsed as a conninfo
 			"-h", util.GatewayIP,
 			"-p", fmt.Sprintf("%d", instance.Port),
 			"-U", "postgres",
@@ -301,6 +345,7 @@ func runPgRestore(ctx context.Context, deps *Dependencies, instance *instances.R
 				ReadOnly: true,
 			},
 		},
+		Env:  pgRestoreEnv(majorOrZero(instance.Version)),
 		Tool: "pg_restore",
 	})
 }
@@ -363,4 +408,30 @@ func buildDatabaseCreateGrantSQL(databaseName string, grantees, existingRoles []
 		}
 	}
 	return statements, missing
+}
+
+// pgRestoreEnv is the environment of every pg_restore ODDK runs. On
+// PostgreSQL 17+ it turns event triggers off for the restore's own sessions.
+//
+// pg_dump puts event triggers in post-data, so a restore RE-CREATES a login
+// trigger near its end — and parallel pg_restore reconnects its main session
+// after the worker phase, which is a login to the database it just restored.
+// Measured: a login trigger that deletes rows emptied a database that had just
+// been restored with every row. A harmless audit trigger fires the same way,
+// logging the restore as a user login. event_triggers only exists (and login
+// triggers only exist) from 17; older servers refuse the unknown setting, so it
+// is not sent to them. pg_restore connects as postgres, which may set it.
+func pgRestoreEnv(major int) []string {
+	if major >= 17 {
+		return []string{"PGOPTIONS=-c event_triggers=off"}
+	}
+	return nil
+}
+
+// majorOrZero parses a PostgreSQL version's major, or 0 when it cannot —
+// which gates version-dependent options OFF, the safe direction for a setting
+// an older server would refuse.
+func majorOrZero(version string) int {
+	major, _ := parseMajorVersion(version)
+	return major
 }

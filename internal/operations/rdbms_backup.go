@@ -80,18 +80,18 @@ func BackupRDBMS(ctx context.Context, deps *Dependencies, params *BackupRDBMSPar
 	// checked before it is published; on failure nothing appears at archivePath
 	// and no catalogue row is written.
 	archivePath := backupPath + ".tar.zst"
-	size, err := compression.NewCompressor().CreateTarZstd(ctx, tempDir, archivePath, assertBackupMembers)
+	written, err := compression.NewCompressor().CreateTarZstd(ctx, tempDir, archivePath, assertBackupMembers)
 	if err != nil {
 		return nil, fmt.Errorf("create archive: %w", err)
 	}
 
 	// 3. Record backup in database
-	record := recordBackup(deps, params, archivePath, size, timestamp)
+	record := recordBackup(deps, params, archivePath, written, timestamp)
 
 	return &BackupRDBMSResult{
 		BackupID:   record.ID,
 		BackupPath: archivePath,
-		Size:       size,
+		Size:       written.Size,
 		Timestamp:  timestamp,
 	}, nil
 }
@@ -176,13 +176,14 @@ func dumpAllDatabases(ctx context.Context, deps *Dependencies, instance *instanc
 
 // recordBackup stores the backup record; a store failure is logged but does
 // not fail the backup (the archive itself is complete on disk).
-func recordBackup(deps *Dependencies, params *BackupRDBMSParams, archivePath string, size int64, timestamp time.Time) *backup.BackupRecord {
+func recordBackup(deps *Dependencies, params *BackupRDBMSParams, archivePath string, written compression.Written, timestamp time.Time) *backup.BackupRecord {
 	record := &backup.BackupRecord{
 		InstanceName: params.Name,
 		Timestamp:    rfc3339time.Time{Time: timestamp},
-		Size:         size,
+		Size:         written.Size,
 		LocalPath:    archivePath,
 		Status:       "completed",
+		SHA256Str:    written.SHA256,
 	}
 	if params.Comment != "" {
 		record.Comment = sql.NullString{String: params.Comment, Valid: true}
@@ -253,7 +254,7 @@ func backupDatabase(ctx context.Context, deps *Dependencies, instance *instances
 	}
 
 	return runHelperContainer(ctx, deps, helperContainerSpec{
-		ContainerName: fmt.Sprintf("oddk-backup-db-%s-%s-%d", instance.Name, dbName, time.Now().Unix()),
+		ContainerName: fmt.Sprintf("oddk-backup-db-%s-%s-%d", instance.Name, containerNameSafe(dbName), time.Now().Unix()),
 		Image:         image,
 		Cmd: []string{
 			"pg_dump",
@@ -264,7 +265,7 @@ func backupDatabase(ctx context.Context, deps *Dependencies, instance *instances
 			"-p", fmt.Sprintf("%d", instance.Port),
 			"-U", "postgres",
 			"--file", "/backup",
-			dbName,
+			"--dbname=" + pgConninfoDBName(dbName),
 		},
 		Password: password,
 		Mounts: []mount.Mount{
@@ -371,4 +372,40 @@ func assertBackupMembers(members []compression.Member) error {
 	}
 
 	return nil
+}
+
+// pgConninfoDBName renders a database name as a quoted conninfo dbname
+// parameter, for the --dbname of every PostgreSQL client ODDK runs.
+//
+// libpq treats a dbname containing "=", or starting with "postgresql://" or
+// "postgres://", as a whole connection string, and pg_dump reads its
+// positional database argument as an option when it starts with "-". All of
+// those are legal database names (validatePortableDBName only keeps names
+// path-safe), so passing one bare let `--restore-as 'dbname=postgres'` pass the
+// "target does not exist" check — which compares the LITERAL name — and then
+// pg_restore into the existing postgres database. Quoted like this, the value
+// is always exactly one database name.
+//
+// Quoting rules are libpq's: single quotes around the value, with backslash
+// and single quote escaped by a backslash.
+func pgConninfoDBName(name string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(name)
+	return "dbname='" + escaped + "'"
+}
+
+// containerNameSafe maps a database name onto the characters Docker accepts in
+// a container name ([a-zA-Z0-9_.-]). The name is only a label for humans and
+// for the startup sweep's logs; it must never be what makes a backup of a
+// database called "my db" fail.
+func containerNameSafe(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }

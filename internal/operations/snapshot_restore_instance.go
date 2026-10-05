@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -19,7 +18,6 @@ import (
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/instances"
 	"github.com/andrianbdn/oddk/internal/util"
-	"github.com/andrianbdn/oddk/internal/version"
 )
 
 // RestoreInstanceParams describes restoring ONE instance out of a snapshot
@@ -50,6 +48,10 @@ type RestoreInstanceParams struct {
 	ForeignSource bool
 
 	BackupDir string
+
+	// ExpectedSHA256 is the catalogue's digest for the archive, when it was
+	// resolved through the catalogue (see ArchiveOrigin.ExpectedSHA256).
+	ExpectedSHA256 string
 
 	// Progress receives human-readable lines. Nil is fine (emitLine no-ops).
 	Progress io.Writer
@@ -112,31 +114,11 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	// 1. Manifest first — it is the archive's first member, so compatibility and
 	//    "is this instance even in here" cost kilobytes rather than the whole
 	//    archive. Same reasoning as PreflightSnapshotApply.
-	manifest, err := ReadSnapshotManifestFromArchive(params.ArchivePath)
+	manifest, entry, err := readRestoreManifest(params.ArchivePath, params.InstanceName)
 	if err != nil {
-		return nil, operr.Invalidf("cannot read snapshot manifest: %v", err)
-	}
-	if manifest.FormatVersion > SnapshotFormatVersion {
-		return nil, operr.Invalidf("snapshot uses archive format v%d but this ODDK understands only v%d; upgrade ODDK",
-			manifest.FormatVersion, SnapshotFormatVersion)
-	}
-	if newer, ok := isVersionNewer(manifest.OddkVersion, version.Version); ok && newer {
-		return nil, operr.Invalidf("snapshot was created by oddk %s but this binary is %s; upgrade ODDK to %s or later",
-			manifest.OddkVersion, version.Version, manifest.OddkVersion)
-	}
-
-	entry, found := snapshotEntry(manifest, params.InstanceName)
-	if !found {
-		return nil, operr.NotFoundf("snapshot does not contain instance %q (it has: %s)",
-			params.InstanceName, instanceNameList(manifest))
+		return nil, err
 	}
 	physical := entryFormat(entry) == SnapshotFormatPhysical
-	if physical && entry.HasData && manifest.SourceArch != "" && manifest.SourceArch != runtime.GOARCH {
-		return nil, operr.Invalidf(
-			"instance %q was captured physically on %s, but this host is %s; physical clusters are not portable across architectures. Restore on a %s host, or take a --logical snapshot on the source",
-			params.InstanceName, manifest.SourceArch, runtime.GOARCH, manifest.SourceArch,
-		)
-	}
 	if !entry.HasData {
 		// A configuration-only entry has instance.json but no databases. Building
 		// an empty cluster from it would produce an instance that looks healthy
@@ -182,8 +164,9 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	}
 	defer func() { _ = os.RemoveAll(extractedDir) }()
 
-	if err := compression.NewCompressor().ExtractTarZstd(ctx, params.ArchivePath, extractedDir); err != nil {
-		return nil, fmt.Errorf("extract snapshot: %w", err)
+	if err := compression.NewCompressor().ExtractTarZstdWith(ctx, params.ArchivePath, extractedDir,
+		compression.ExtractOptions{WantSHA256: params.ExpectedSHA256}); err != nil {
+		return nil, classifyExtractError("extract snapshot", err)
 	}
 	emitLine(params.Progress, "  ✓ Snapshot extracted")
 

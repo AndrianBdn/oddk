@@ -120,10 +120,11 @@ func rebuildInstanceCluster(ctx context.Context, deps *Dependencies, rb instance
 		if err := deps.Docker.StartContainer(containerID); err != nil {
 			return rebuildResult{}, fmt.Errorf("start container: %w", err)
 		}
-		if err := waitForPostgresReady(ctx, meta.Port, rb.password); err != nil {
+		// The volume already holds the user's data and event triggers.
+		if err := waitForRestoredClusterReady(ctx, meta.Port, rb.password, majorOrZero(meta.Version)); err != nil {
 			return rebuildResult{}, fmt.Errorf("restored cluster did not become ready: %w", err)
 		}
-		count, countErr := countUserDatabases(ctx, meta.Port, rb.password)
+		count, countErr := countUserDatabases(ctx, meta.Port, rb.password, majorOrZero(meta.Version))
 		if countErr != nil {
 			return rebuildResult{}, fmt.Errorf("verify restored cluster: %w", countErr)
 		}
@@ -164,6 +165,7 @@ func rebuildInstanceCluster(ctx context.Context, deps *Dependencies, rb instance
 	restored, err := RestoreClusterFromArchive(ctx, deps, RestoreClusterParams{
 		InstanceName:  meta.Name,
 		Image:         meta.Image,
+		Major:         majorOrZero(meta.Version),
 		Port:          meta.Port,
 		Password:      rb.password,
 		CPUCores:      meta.CPUCores,

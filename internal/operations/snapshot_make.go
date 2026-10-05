@@ -191,6 +191,8 @@ type MakeSnapshotResult struct {
 	Instances         []SnapshotInstanceEntry `json:"instances"`
 	InstancesWithData int                     `json:"instancesWithData"`
 	ConfigOnly        int                     `json:"configOnly"`
+	// SHA256 of the archive file, as recorded in the catalogue.
+	SHA256 string `json:"sha256,omitempty"`
 
 	// CaptureFailures is non-empty when the archive was written but is NOT a
 	// complete capture of the deployment. Callers must treat that as a failed
@@ -308,13 +310,14 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 	// The archive is read back before it is published, and this asserts it holds
 	// what the manifest promises. On any failure nothing is written to
 	// archivePath and nothing is catalogued — see writeVerifiedArchive.
-	size, err := compression.NewCompressor().CreateTarZstdOrdered(ctx, archiveEntries, archivePath,
+	written, err := compression.NewCompressor().CreateTarZstdOrdered(ctx, archiveEntries, archivePath,
 		func(members []compression.Member) error {
 			return assertSnapshotMembers(members, entries)
 		})
 	if err != nil {
 		return nil, fmt.Errorf("create snapshot archive: %w", err)
 	}
+	size := written.Size
 
 	withData := 0
 	for _, e := range entries {
@@ -351,6 +354,7 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 		Instances:         recorded,
 		LocalPath:         archivePath,
 		CommentStr:        params.Comment,
+		SHA256Str:         written.SHA256,
 	}
 	if err := deps.Store.Snapshot.RecordSnapshot(record); err != nil {
 		// The archive is on disk and usable; failing the whole operation would
@@ -364,6 +368,7 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 		ID:                record.ID,
 		Path:              archivePath,
 		Size:              size,
+		SHA256:            written.SHA256,
 		Timestamp:         timestamp,
 		Format:            format,
 		Instances:         entries,

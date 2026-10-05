@@ -123,11 +123,10 @@ type AWSCredentialsBody struct {
 	Source string `json:"source,omitempty"`
 }
 
-// SnapshotRestoreInstanceRequest is the body of POST /api/snapshot/restore-instance.
-// Exactly one of FilePath, SnapshotID or S3URI selects the archive.
-type SnapshotRestoreInstanceRequest struct {
-	Instance string `json:"instance"`
-
+// SnapshotArchiveSource selects the archive a snapshot restore reads, shared by
+// restore-instance and restore-database. Exactly one of FilePath, SnapshotID or
+// S3URI must be set.
+type SnapshotArchiveSource struct {
 	// FilePath is a path on the DAEMON's filesystem (the original form).
 	FilePath string `json:"filePath,omitempty"`
 
@@ -148,6 +147,57 @@ type SnapshotRestoreInstanceRequest struct {
 	MasterKeyPath string `json:"masterKeyPath,omitempty"`
 }
 
+// resolve validates the source selection and converts it for the operations
+// layer. The returned string is a 400 message; empty means valid.
+func (src SnapshotArchiveSource) resolve() (*operations.RestoreArchiveSource, string) {
+	sources := 0
+	if src.FilePath != "" {
+		sources++
+	}
+	if src.SnapshotID != 0 {
+		sources++
+	}
+	if src.S3URI != "" {
+		sources++
+	}
+	if sources != 1 {
+		return nil, "exactly one of filePath, snapshotId or s3Uri is required"
+	}
+	if src.SnapshotID < 0 {
+		return nil, "invalid snapshot id"
+	}
+	if src.S3URI == "" && (src.Region != "" || src.Endpoint != "" || src.Credentials != nil) {
+		return nil, "region, endpoint and credentials are only meaningful with s3Uri"
+	}
+
+	out := &operations.RestoreArchiveSource{
+		ArchivePath: src.FilePath,
+		SnapshotID:  src.SnapshotID,
+	}
+	if src.S3URI != "" {
+		spec := &operations.RemoteSnapshotSpec{
+			URI:      src.S3URI,
+			Region:   src.Region,
+			Endpoint: src.Endpoint,
+		}
+		if src.Credentials != nil {
+			spec.Credentials = &s3service.StaticCredentials{
+				AccessKeyID:     src.Credentials.AccessKeyID,
+				SecretAccessKey: src.Credentials.SecretAccessKey,
+				SessionToken:    src.Credentials.SessionToken,
+			}
+		}
+		out.Remote = spec
+	}
+	return out, ""
+}
+
+// SnapshotRestoreInstanceRequest is the body of POST /api/snapshot/restore-instance.
+type SnapshotRestoreInstanceRequest struct {
+	Instance string `json:"instance"`
+	SnapshotArchiveSource
+}
+
 // handleSnapshotRestoreInstance handles POST /api/snapshot/restore-instance
 //
 // Unlike `snapshot apply` — which rebuilds a whole host, runs daemon-less and
@@ -164,47 +214,10 @@ func (s *Server) handleSnapshotRestoreInstance(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusBadRequest, "instance is required")
 		return
 	}
-	sources := 0
-	if req.FilePath != "" {
-		sources++
-	}
-	if req.SnapshotID != 0 {
-		sources++
-	}
-	if req.S3URI != "" {
-		sources++
-	}
-	if sources != 1 {
-		s.writeError(w, http.StatusBadRequest, "exactly one of filePath, snapshotId or s3Uri is required")
+	src, invalid := req.resolve()
+	if invalid != "" {
+		s.writeError(w, http.StatusBadRequest, invalid)
 		return
-	}
-	if req.SnapshotID < 0 {
-		s.writeError(w, http.StatusBadRequest, "invalid snapshot id")
-		return
-	}
-	if req.S3URI == "" && (req.Region != "" || req.Endpoint != "" || req.Credentials != nil) {
-		s.writeError(w, http.StatusBadRequest, "region, endpoint and credentials are only meaningful with s3Uri")
-		return
-	}
-
-	src := &operations.RestoreArchiveSource{
-		ArchivePath: req.FilePath,
-		SnapshotID:  req.SnapshotID,
-	}
-	if req.S3URI != "" {
-		spec := &operations.RemoteSnapshotSpec{
-			URI:      req.S3URI,
-			Region:   req.Region,
-			Endpoint: req.Endpoint,
-		}
-		if req.Credentials != nil {
-			spec.Credentials = &s3service.StaticCredentials{
-				AccessKeyID:     req.Credentials.AccessKeyID,
-				SecretAccessKey: req.Credentials.SecretAccessKey,
-				SessionToken:    req.Credentials.SessionToken,
-			}
-		}
-		src.Remote = spec
 	}
 
 	// Extracting an archive and replaying every database in an instance runs far
@@ -266,8 +279,109 @@ func (op *snapshotRestoreInstanceOp) Execute(ctx context.Context) error {
 	}
 	op.params.ArchivePath = archivePath
 	op.params.ForeignSource = foreign
+	op.params.ExpectedSHA256 = origin.ExpectedSHA256
 
 	result, err := operations.RestoreInstanceFromSnapshot(ctx, op.deps, op.params)
+	if err != nil {
+		return err
+	}
+	result.ArchiveOrigin = origin
+	*op.result = result
+	return nil
+}
+
+// SnapshotRestoreDatabaseRequest is the body of POST /api/snapshot/restore-database.
+type SnapshotRestoreDatabaseRequest struct {
+	Instance string `json:"instance"`
+	// FromInstance is the snapshot entry to read; empty means Instance.
+	FromInstance string `json:"fromInstance,omitempty"`
+	Database     string `json:"database"`
+	RestoreAs    string `json:"restoreAs,omitempty"`
+	SnapshotArchiveSource
+}
+
+// handleSnapshotRestoreDatabase handles POST /api/snapshot/restore-database:
+// one database out of a snapshot, into a live instance, as a NEW database.
+//
+// Health checks are NOT paused, matching backup restore: nothing about the
+// instance's container or its existing databases changes.
+func (s *Server) handleSnapshotRestoreDatabase(w http.ResponseWriter, r *http.Request) {
+	var req SnapshotRestoreDatabaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Instance == "" {
+		s.writeError(w, http.StatusBadRequest, "instance is required")
+		return
+	}
+	if req.Database == "" {
+		s.writeError(w, http.StatusBadRequest, "database is required")
+		return
+	}
+	src, invalid := req.resolve()
+	if invalid != "" {
+		s.writeError(w, http.StatusBadRequest, invalid)
+		return
+	}
+
+	// An S3 fetch, an extraction, possibly a scratch cluster's recovery and a
+	// dump, then a restore: all far past the 30s WriteTimeout.
+	s.clearWriteDeadline(w, fmt.Sprintf("snapshot restore-database %s/%s", req.Instance, req.Database))
+
+	var result *operations.RestoreDatabaseResult
+	op := &snapshotRestoreDatabaseOp{
+		src: src,
+		params: &operations.RestoreDatabaseParams{
+			InstanceName:   req.Instance,
+			SourceInstance: req.FromInstance,
+			DatabaseName:   req.Database,
+			RestoreAs:      req.RestoreAs,
+			MasterKeyPath:  req.MasterKeyPath,
+			BackupDir:      s.backupDir,
+		},
+		deps:   s.opDeps,
+		result: &result,
+	}
+
+	// context.Background(), not r.Context(): a restore aborted midway leaves a
+	// half-restored database and a scratch cluster to clean up.
+	if err := s.executor.Execute(context.Background(), op); err != nil {
+		s.writeOpError(w, err)
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, result)
+}
+
+// snapshotRestoreDatabaseOp resolves the archive (which may download it) and
+// restores one database, both inside the executor.
+type snapshotRestoreDatabaseOp struct {
+	src    *operations.RestoreArchiveSource
+	params *operations.RestoreDatabaseParams
+	deps   *operations.Dependencies
+	result **operations.RestoreDatabaseResult
+}
+
+func (op *snapshotRestoreDatabaseOp) Name() string {
+	return fmt.Sprintf("RestoreDatabaseFromSnapshot[%s/%s]", op.params.InstanceName, op.params.DatabaseName)
+}
+
+func (op *snapshotRestoreDatabaseOp) Type() operations.OpType {
+	return operations.OpTypeWrite
+}
+
+func (op *snapshotRestoreDatabaseOp) Execute(ctx context.Context) error {
+	archivePath, _, origin, err := operations.ResolveRestoreInstanceArchive(
+		ctx, op.deps, op.src, op.params.BackupDir, op.params.Progress,
+	)
+	if err != nil {
+		return err
+	}
+	op.params.ArchivePath = archivePath
+	op.params.ExpectedSHA256 = origin.ExpectedSHA256
+
+	result, err := operations.RestoreDatabaseFromSnapshot(ctx, op.deps, op.params)
 	if err != nil {
 		return err
 	}
