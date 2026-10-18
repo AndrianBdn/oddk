@@ -1,0 +1,48 @@
+name: CI
+
+# Build, vet, unit tests, format check and lint on every push and PR. It backs the CI
+# badge in the README. The e2e suite needs Docker and ~16 minutes, so it is
+# compile-checked here and run locally before each release.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # The e2e package builds only under the oddk_debug tag (it uses the
+      # debug-only endpoints and DebugSetRawKV), so `go vet ./...` above skips
+      # it entirely. Vet it explicitly, or it rots unnoticed until someone runs
+      # the suite.
+      - name: Vet e2e (oddk_debug tag)
+        run: go vet -tags oddk_debug ./e2e/
+
+      - name: Test
+        run: go test -count=1 ./internal/...
+
+      - name: Format check
+        run: make fmt-check
+
+      - name: Lint
+        run: make lint

@@ -3,7 +3,7 @@
 <a href="https://github.com/andrianbdn/oddk/releases/latest"><img src="https://img.shields.io/github/v/release/andrianbdn/oddk" /></a>
 <a href="./LICENSE"><img src="https://img.shields.io/github/license/andrianbdn/oddk" /></a>
 <a href="./go.mod"><img src="https://img.shields.io/github/go-mod/go-version/andrianbdn/oddk" /></a>
-[![Go Report Card](https://goreportcard.com/badge/github.com/andrianbdn/oddk)](https://goreportcard.com/report/github.com/andrianbdn/oddk)
+<a href="https://github.com/andrianbdn/oddk/actions/workflows/ci.yml"><img src="https://github.com/andrianbdn/oddk/actions/workflows/ci.yml/badge.svg" /></a>
 
 **Run PostgreSQL on your own Linux box with the ergonomics of a managed service.**
 
