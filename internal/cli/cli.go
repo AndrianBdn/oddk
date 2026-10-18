@@ -86,7 +86,7 @@ func localOnlyInvocation(args []string) bool {
 		// work when the daemon cannot start — so the missing-token nudge is
 		// pure noise on the one host guaranteed not to have a token yet: a
 		// freshly installed DR host.
-		if args[2] == "apply" {
+		if args[2] == "apply" || args[2] == "decrypt" {
 			return true
 		}
 		// `snapshot list-remote s3://...` is equally daemon-less (only its

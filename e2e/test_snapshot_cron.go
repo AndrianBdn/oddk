@@ -96,7 +96,7 @@ func testSnapshotCron(h *TestHarness) error {
 	deadline := time.Now().Add(60 * time.Second)
 	var archives []string
 	for time.Now().Before(deadline) {
-		archives, _ = filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst"))
+		archives, _ = filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst.age"))
 		if len(archives) > 0 {
 			break
 		}

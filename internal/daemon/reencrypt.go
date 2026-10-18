@@ -90,7 +90,7 @@ func reencryptLegacySecrets(st *store.Store, masterKey []byte) {
 // reason: until a row is rewritten, the SMTP password / Slack webhook URL /
 // Telegram token / webhook Authorization header inside it is readable by anyone
 // who can read oddk.db — and oddk.db is embedded verbatim in every snapshot
-// archive, which is NOT encrypted and is uploaded to S3.
+// archive, which before 0.1.94 was NOT encrypted and was uploaded to S3.
 //
 // Reads tolerate both forms, so this is convergence only and must never stop
 // the daemon: a row that cannot be rewritten is reported and left working.

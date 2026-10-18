@@ -862,7 +862,7 @@ func snapshotCommands(client *Client) *cli.Command {
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:  "file",
-						Usage: "Path to the snapshot .tar.zst",
+						Usage: "Path to the snapshot archive (.tar.zst.age; .tar.zst before 0.1.94)",
 					},
 					&cli.StringFlag{
 						Name:  "s3-uri",
@@ -905,6 +905,39 @@ func snapshotCommands(client *Client) *cli.Command {
 					},
 				},
 				Action: client.snapshotApplyAction,
+			},
+			{
+				Name:  "decrypt",
+				Usage: "Write the plain .tar.zst inside an encrypted snapshot or backup, or print the age secret that decrypts it",
+				Description: "Runs locally; no daemon needed. Archives written by ODDK 0.1.94 and later are\n" +
+					"age-encrypted with a key derived from master.key. This writes the plain\n" +
+					"tar.zst next to the archive (or at --out), verified first, mode 0600.\n\n" +
+					"--print-age-identity prints the derived age secret instead, so the stock age\n" +
+					"CLI can decrypt without ODDK. Set umask 077 first, or the secret and the\n" +
+					"plaintext land world-readable:\n" +
+					"  (umask 077; oddk snapshot decrypt --master-key k --print-age-identity > identity.txt;\n" +
+					"   age -d -i identity.txt -o x.tar.zst x.tar.zst.age)\n" +
+					"It is as sensitive as master.key itself: it decrypts every archive.",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "file",
+						Usage: "Path to the encrypted archive (.tar.zst.age)",
+					},
+					&cli.StringFlag{
+						Name:     "master-key",
+						Usage:    "Path to the master.key the archive was written with",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:  "out",
+						Usage: "Where to write the plain archive (default: --file without .age); never overwritten",
+					},
+					&cli.BoolFlag{
+						Name:  "print-age-identity",
+						Usage: "Print the age secret derived from --master-key to stdout and exit",
+					},
+				},
+				Action: client.snapshotDecryptAction,
 			},
 		},
 	}
@@ -1034,7 +1067,7 @@ func backupCommands(client *Client) *cli.Command {
 					},
 					&cli.StringFlag{
 						Name:  "file",
-						Usage: "Path to backup file (.tar.zst) (mutually exclusive with --id)",
+						Usage: "Path to backup file (.tar.zst.age; .tar.zst before 0.1.94) (mutually exclusive with --id)",
 					},
 					&cli.StringFlag{
 						Name:     "instance",
@@ -1293,7 +1326,7 @@ func snapshotArchiveSourceFlags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{
 			Name:  "file",
-			Usage: "Path to the snapshot .tar.zst (on the daemon's filesystem)",
+			Usage: "Path to the snapshot archive (.tar.zst.age; .tar.zst before 0.1.94) on the daemon's filesystem",
 		},
 		&cli.IntFlag{
 			Name:  "id",

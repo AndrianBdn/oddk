@@ -171,8 +171,9 @@ func (src SnapshotArchiveSource) resolve() (*operations.RestoreArchiveSource, st
 	}
 
 	out := &operations.RestoreArchiveSource{
-		ArchivePath: src.FilePath,
-		SnapshotID:  src.SnapshotID,
+		ArchivePath:   src.FilePath,
+		SnapshotID:    src.SnapshotID,
+		MasterKeyPath: src.MasterKeyPath,
 	}
 	if src.S3URI != "" {
 		spec := &operations.RemoteSnapshotSpec{

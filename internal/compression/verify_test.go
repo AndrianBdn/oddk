@@ -27,6 +27,11 @@ import (
 
 func buildArchive(t *testing.T, dir string) string {
 	t.Helper()
+	return buildArchiveOf(t, dir, archiveKinds[0])
+}
+
+func buildArchiveOf(t *testing.T, dir string, kind archiveKind) string {
+	t.Helper()
 
 	src := filepath.Join(dir, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
@@ -45,8 +50,8 @@ func buildArchive(t *testing.T, dir string) string {
 	rand.New(rand.NewSource(7)).Read(payload)
 	write("data.bin", payload)
 
-	archive := filepath.Join(dir, "a.tar.zst")
-	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive, nil); err != nil {
+	archive := filepath.Join(dir, "a"+kind.suffix)
+	if err := kind.write(t, src, archive); err != nil {
 		t.Fatalf("create archive: %v", err)
 	}
 	return archive
@@ -66,9 +71,13 @@ func mutate(t *testing.T, archive, name string, fn func([]byte) []byte) string {
 }
 
 func TestVerifyTarZstd_AcceptsAGoodArchive(t *testing.T) {
-	archive := buildArchive(t, t.TempDir())
+	forEachKind(t, testAcceptsAGoodArchive)
+}
 
-	members, err := compression.NewCompressor().VerifyTarZstd(context.Background(), archive)
+func testAcceptsAGoodArchive(t *testing.T, kind archiveKind) {
+	archive := buildArchiveOf(t, t.TempDir(), kind)
+
+	members, err := newC(t).VerifyTarZstd(context.Background(), archive)
 	if err != nil {
 		t.Fatalf("a freshly written archive failed verification: %v", err)
 	}
@@ -87,8 +96,12 @@ func TestVerifyTarZstd_AcceptsAGoodArchive(t *testing.T) {
 // The core guard. A single flipped bit anywhere in the compressed stream must be
 // caught — this is what the old extract path missed 40 times out of 40.
 func TestVerifyTarZstd_CatchesSingleBitFlips(t *testing.T) {
+	forEachKind(t, testCatchesSingleBitFlips)
+}
+
+func testCatchesSingleBitFlips(t *testing.T, kind archiveKind) {
 	dir := t.TempDir()
-	archive := buildArchive(t, dir)
+	archive := buildArchiveOf(t, dir, kind)
 	orig, err := os.ReadFile(archive)
 	if err != nil {
 		t.Fatal(err)
@@ -103,30 +116,34 @@ func TestVerifyTarZstd_CatchesSingleBitFlips(t *testing.T) {
 		pos := lo + r.Intn(hi-lo)
 		bit := uint(r.Intn(8))
 
-		bad := mutate(t, archive, "bad.tar.zst", func(b []byte) []byte {
+		bad := mutate(t, archive, "bad"+kind.suffix, func(b []byte) []byte {
 			c := make([]byte, len(b))
 			copy(c, b)
 			c[pos] ^= 1 << bit
 			return c
 		})
 
-		if _, err := compression.NewCompressor().VerifyTarZstd(context.Background(), bad); err == nil {
+		if _, err := newC(t).VerifyTarZstd(context.Background(), bad); err == nil {
 			missed++
 			t.Errorf("trial %d: flip at byte %d bit %d went undetected", i, pos, bit)
 		}
 	}
 	if missed > 0 {
-		t.Fatalf("%d/%d single-bit corruptions went undetected — the zstd drain is not running", missed, trials)
+		t.Fatalf("%d/%d single-bit corruptions went undetected — the zstd drain (or, encrypted, the age payload read) is not running", missed, trials)
 	}
 }
 
 // Every restore in ODDK goes through ExtractTarZstd. It must refuse a corrupt
 // archive rather than write a silently different tree to disk.
 func TestExtractTarZstd_RefusesCorruptArchiveWithoutWriting(t *testing.T) {
-	dir := t.TempDir()
-	archive := buildArchive(t, dir)
+	forEachKind(t, testRefusesCorruptArchiveWithoutWriting)
+}
 
-	bad := mutate(t, archive, "bad.tar.zst", func(b []byte) []byte {
+func testRefusesCorruptArchiveWithoutWriting(t *testing.T, kind archiveKind) {
+	dir := t.TempDir()
+	archive := buildArchiveOf(t, dir, kind)
+
+	bad := mutate(t, archive, "bad"+kind.suffix, func(b []byte) []byte {
 		c := make([]byte, len(b))
 		copy(c, b)
 		c[len(c)/2] ^= 0x01
@@ -134,7 +151,7 @@ func TestExtractTarZstd_RefusesCorruptArchiveWithoutWriting(t *testing.T) {
 	})
 
 	dest := filepath.Join(dir, "dest")
-	err := compression.NewCompressor().ExtractTarZstd(context.Background(), bad, dest)
+	err := newC(t).ExtractTarZstd(context.Background(), bad, dest)
 	if err == nil {
 		t.Fatal("ExtractTarZstd accepted a corrupt archive — a restore would have " +
 			"written silently wrong data and reported success")
@@ -148,8 +165,12 @@ func TestExtractTarZstd_RefusesCorruptArchiveWithoutWriting(t *testing.T) {
 }
 
 func TestVerifyTarZstd_CatchesTruncation(t *testing.T) {
+	forEachKind(t, testCatchesTruncation)
+}
+
+func testCatchesTruncation(t *testing.T, kind archiveKind) {
 	dir := t.TempDir()
-	archive := buildArchive(t, dir)
+	archive := buildArchiveOf(t, dir, kind)
 
 	cases := map[string]func([]byte) []byte{
 		"half":            func(b []byte) []byte { return b[:len(b)/2] },
@@ -161,8 +182,8 @@ func TestVerifyTarZstd_CatchesTruncation(t *testing.T) {
 
 	for name, fn := range cases {
 		t.Run(name, func(t *testing.T) {
-			bad := mutate(t, archive, "bad.tar.zst", fn)
-			if _, err := compression.NewCompressor().VerifyTarZstd(context.Background(), bad); err == nil {
+			bad := mutate(t, archive, "bad"+kind.suffix, fn)
+			if _, err := newC(t).VerifyTarZstd(context.Background(), bad); err == nil {
 				t.Errorf("%s went undetected", name)
 			}
 		})
@@ -180,7 +201,7 @@ func TestVerifyTarZstd_ZeroLengthFileYieldsNoMembers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	members, err := compression.NewCompressor().VerifyTarZstd(context.Background(), empty)
+	members, err := newC(t).VerifyTarZstd(context.Background(), empty)
 	if err == nil && len(members) != 0 {
 		t.Fatalf("expected zero members, got %d", len(members))
 	}
@@ -206,8 +227,8 @@ func TestCreateTarZstd_RejectedArchiveIsNotPublished(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	archive := filepath.Join(dir, "out.tar.zst")
-	_, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive,
+	archive := filepath.Join(dir, "out.tar.zst.age")
+	_, err := newC(t).CreateTarZstd(context.Background(), src, archive,
 		func([]compression.Member) error { return os.ErrInvalid })
 	if err == nil {
 		t.Fatal("writer ignored the verify callback's rejection")
@@ -239,7 +260,7 @@ func TestCreateTarZstd_PublishesAtomicallyAndVerifiably(t *testing.T) {
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("archive mode is %v, want 0600 — archives hold database contents and role password hashes", fi.Mode().Perm())
 	}
-	if _, err := compression.NewCompressor().VerifyTarZstd(context.Background(), archive); err != nil {
+	if _, err := newC(t).VerifyTarZstd(context.Background(), archive); err != nil {
 		t.Errorf("published archive does not verify: %v", err)
 	}
 
@@ -266,8 +287,8 @@ func TestCreateTarZstd_ReportsTheFileDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	archive := filepath.Join(dir, "a.tar.zst")
-	written, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive, nil)
+	archive := filepath.Join(dir, "a.tar.zst.age")
+	written, err := newC(t).CreateTarZstd(context.Background(), src, archive, nil)
 	if err != nil {
 		t.Fatalf("create archive: %v", err)
 	}
@@ -285,7 +306,7 @@ func TestCreateTarZstd_ReportsTheFileDigest(t *testing.T) {
 		t.Errorf("Written.Size = %d, want %d", written.Size, len(b))
 	}
 
-	v, err := compression.NewCompressor().VerifyTarZstdDigest(context.Background(), archive)
+	v, err := newC(t).VerifyTarZstdDigest(context.Background(), archive)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -297,12 +318,16 @@ func TestCreateTarZstd_ReportsTheFileDigest(t *testing.T) {
 // A corrupt archive must not come back with a digest: a caller that recorded
 // it would be recording the fingerprint of broken bytes as the reference copy.
 func TestVerifyTarZstdDigest_NoDigestForCorruptArchive(t *testing.T) {
-	archive := buildArchive(t, t.TempDir())
-	bad := mutate(t, archive, "flipped.tar.zst", func(b []byte) []byte {
+	forEachKind(t, testNoDigestForCorruptArchive)
+}
+
+func testNoDigestForCorruptArchive(t *testing.T, kind archiveKind) {
+	archive := buildArchiveOf(t, t.TempDir(), kind)
+	bad := mutate(t, archive, "flipped"+kind.suffix, func(b []byte) []byte {
 		b[len(b)/2] ^= 0x01
 		return b
 	})
-	v, err := compression.NewCompressor().VerifyTarZstdDigest(context.Background(), bad)
+	v, err := newC(t).VerifyTarZstdDigest(context.Background(), bad)
 	if err == nil {
 		t.Fatal("a flipped bit verified clean")
 	}
@@ -315,6 +340,10 @@ func TestVerifyTarZstdDigest_NoDigestForCorruptArchive(t *testing.T) {
 // corrupt archive — integrity is a property of the file, not of the members
 // a caller happens to want.
 func TestExtractTarZstdWith_Keep(t *testing.T) {
+	forEachKind(t, testExtractKeep)
+}
+
+func testExtractKeep(t *testing.T, kind archiveKind) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	for _, p := range []string{"instances/app/databases/sales", "instances/other"} {
@@ -343,8 +372,8 @@ func TestExtractTarZstdWith_Keep(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "instances/other/data.bin"), payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	archive := filepath.Join(dir, "a.tar.zst")
-	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive, nil); err != nil {
+	archive := filepath.Join(dir, "a"+kind.suffix)
+	if err := kind.write(t, src, archive); err != nil {
 		t.Fatal(err)
 	}
 
@@ -354,7 +383,7 @@ func TestExtractTarZstdWith_Keep(t *testing.T) {
 			strings.HasPrefix(name, "instances/app/")
 	}
 	dest := filepath.Join(dir, "out")
-	if err := compression.NewCompressor().ExtractTarZstdWith(context.Background(), archive, dest, compression.ExtractOptions{Keep: keep}); err != nil {
+	if err := newC(t).ExtractTarZstdWith(context.Background(), archive, dest, compression.ExtractOptions{Keep: keep}); err != nil {
 		t.Fatalf("extract: %v", err)
 	}
 	for _, want := range []string{"manifest.json", "instances/app/instance.json", "instances/app/databases/sales/toc.dat"} {
@@ -366,11 +395,11 @@ func TestExtractTarZstdWith_Keep(t *testing.T) {
 		t.Error("a filtered-out instance was extracted")
 	}
 
-	bad := mutate(t, archive, "flipped.tar.zst", func(b []byte) []byte {
+	bad := mutate(t, archive, "flipped"+kind.suffix, func(b []byte) []byte {
 		b[len(b)/2] ^= 0x01
 		return b
 	})
-	if err := compression.NewCompressor().ExtractTarZstdWith(context.Background(), bad, filepath.Join(dir, "out2"), compression.ExtractOptions{Keep: keep}); err == nil {
+	if err := newC(t).ExtractTarZstdWith(context.Background(), bad, filepath.Join(dir, "out2"), compression.ExtractOptions{Keep: keep}); err == nil {
 		t.Error("a corrupt archive was extracted because the damaged member was filtered out")
 	}
 }
@@ -389,7 +418,7 @@ func TestExtractTarZstdWith_RefusesReplacedArchive(t *testing.T) {
 	recorded := hex.EncodeToString(sum[:])
 
 	dest := filepath.Join(dir, "ok")
-	if err := compression.NewCompressor().ExtractTarZstdWith(context.Background(), archive, dest,
+	if err := newC(t).ExtractTarZstdWith(context.Background(), archive, dest,
 		compression.ExtractOptions{WantSHA256: recorded}); err != nil {
 		t.Fatalf("the catalogued archive was refused: %v", err)
 	}
@@ -402,12 +431,12 @@ func TestExtractTarZstdWith_RefusesReplacedArchive(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(otherSrc, "manifest.json"), []byte(`{"someone":"else"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	other := filepath.Join(dir, "other.tar.zst")
-	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), otherSrc, other, nil); err != nil {
+	other := filepath.Join(dir, "other.tar.zst.age")
+	if _, err := newC(t).CreateTarZstd(context.Background(), otherSrc, other, nil); err != nil {
 		t.Fatal(err)
 	}
 	dest = filepath.Join(dir, "replaced")
-	err = compression.NewCompressor().ExtractTarZstdWith(context.Background(), other, dest,
+	err = newC(t).ExtractTarZstdWith(context.Background(), other, dest,
 		compression.ExtractOptions{WantSHA256: recorded})
 	if !errors.Is(err, compression.ErrDigestMismatch) {
 		t.Fatalf("a replaced archive was not refused as a digest mismatch: %v", err)

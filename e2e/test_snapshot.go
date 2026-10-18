@@ -3,10 +3,9 @@
 package main
 
 import (
-	"archive/tar"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,7 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/andrianbdn/oddk/internal/compression"
+	"github.com/andrianbdn/oddk/internal/operations"
 )
 
 // snapshotManifest mirrors operations.SnapshotManifest for assertions.
@@ -36,63 +36,39 @@ type snapshotManifestInstance struct {
 	SkipReason  string `json:"skipReason"`
 }
 
+// harnessCompressor opens archives the harness's daemon wrote: they are
+// encrypted to the key derived from its current master.key.
+func (h *TestHarness) harnessCompressor() (*compression.Compressor, error) {
+	c, _, err := operations.ArchiveCompressorFromKeyFile(filepath.Join(h.dataDir, "master.key"))
+	return c, err
+}
+
 // tarEntryNames returns the archive member names in the order they physically
-// appear in the tar stream.
-func tarEntryNames(archivePath string) ([]string, error) {
-	f, err := os.Open(archivePath) // #nosec G304 - test-controlled path
+// appear in the tar stream (VerifyTarZstd walks it in order, and proves the
+// archive intact on the way).
+func tarEntryNames(h *TestHarness, archivePath string) ([]string, error) {
+	c, err := h.harnessCompressor()
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
-
-	zr, err := zstd.NewReader(f)
+	members, err := c.VerifyTarZstd(context.Background(), archivePath)
 	if err != nil {
 		return nil, err
 	}
-	defer zr.Close()
-
-	var names []string
-	tr := tar.NewReader(zr)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		names = append(names, hdr.Name)
+	names := make([]string, len(members))
+	for i, m := range members {
+		names[i] = m.Name
 	}
 	return names, nil
 }
 
 // readTarMember returns the contents of one archive member.
-func readTarMember(archivePath, member string) ([]byte, error) {
-	f, err := os.Open(archivePath) // #nosec G304 - test-controlled path
+func readTarMember(h *TestHarness, archivePath, member string) ([]byte, error) {
+	c, err := h.harnessCompressor()
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
-
-	zr, err := zstd.NewReader(f)
-	if err != nil {
-		return nil, err
-	}
-	defer zr.Close()
-
-	tr := tar.NewReader(zr)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			return nil, fmt.Errorf("member %s not found", member)
-		}
-		if err != nil {
-			return nil, err
-		}
-		if hdr.Name == member {
-			return io.ReadAll(tr) // #nosec G110 - test-controlled archive
-		}
-	}
+	return c.ReadMember(archivePath, member, 1<<30)
 }
 
 func testSnapshotMake(h *TestHarness) error {
@@ -142,8 +118,8 @@ func testSnapshotMake(h *TestHarness) error {
 	if err != nil {
 		return fmt.Errorf("snapshot make failed: %w (output: %s)", err, output)
 	}
-	if !strings.Contains(output, "NOT encrypted by the master key") {
-		return fmt.Errorf("snapshot output is missing the not-encrypted warning; got: %s", output)
+	if !strings.Contains(output, "encrypted with a key derived from this host's master.key") {
+		return fmt.Errorf("snapshot output is missing the master.key warning; got: %s", output)
 	}
 	// In logical mode a stopped instance cannot be captured at all.
 	if !strings.Contains(output, "configuration-only") {
@@ -181,14 +157,28 @@ func testSnapshotMake(h *TestHarness) error {
 
 	log.Println("Step 4: Locating the snapshot archive")
 	backupDir := filepath.Join(h.dataDir, "backups")
-	matches, err := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst"))
+	matches, err := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst.age"))
 	if err != nil || len(matches) != 1 {
 		return fmt.Errorf("expected exactly 1 snapshot archive in %s, found %v (err %v)", backupDir, matches, err)
 	}
 	archivePath := matches[0]
 
+	log.Println("Step 4b: Verifying the archive is encrypted at rest")
+	archiveBytes, err := os.ReadFile(archivePath) // #nosec G304 - test-controlled path
+	if err != nil {
+		return fmt.Errorf("read archive: %w", err)
+	}
+	if enc, err := compression.IsEncrypted(archivePath); err != nil || !enc {
+		return fmt.Errorf("snapshot archive is not age-encrypted (%v, %v)", enc, err)
+	}
+	for _, leak := range []string{"manifest.json", "snapdb", runningName} {
+		if strings.Contains(string(archiveBytes), leak) {
+			return fmt.Errorf("snapshot archive contains %q in the clear", leak)
+		}
+	}
+
 	log.Println("Step 5: Verifying archive layout and member order")
-	names, err := tarEntryNames(archivePath)
+	names, err := tarEntryNames(h, archivePath)
 	if err != nil {
 		return fmt.Errorf("read tar entries: %w", err)
 	}
@@ -233,7 +223,7 @@ func testSnapshotMake(h *TestHarness) error {
 	}
 
 	log.Println("Step 6: Verifying manifest contents")
-	raw, err := readTarMember(archivePath, "manifest.json")
+	raw, err := readTarMember(h, archivePath, "manifest.json")
 	if err != nil {
 		return fmt.Errorf("read manifest: %w", err)
 	}
@@ -278,7 +268,7 @@ func testSnapshotMake(h *TestHarness) error {
 	}
 
 	log.Println("Step 7: Verifying the embedded oddk.db is a usable SQLite database")
-	dbBytes, err := readTarMember(archivePath, "oddk.db")
+	dbBytes, err := readTarMember(h, archivePath, "oddk.db")
 	if err != nil {
 		return fmt.Errorf("read oddk.db: %w", err)
 	}

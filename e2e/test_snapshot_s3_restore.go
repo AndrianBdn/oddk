@@ -330,7 +330,7 @@ func testSnapshotApplyFromS3(h *TestHarness) error {
 		}
 	}
 	// The local archive is wiped too — the whole point is restoring from S3.
-	localArchives, _ := filepath.Glob(filepath.Join(h.dataDir, "backups", "snapshot-*.tar.zst"))
+	localArchives, _ := filepath.Glob(filepath.Join(h.dataDir, "backups", "snapshot-*.tar.zst.age"))
 	for _, a := range localArchives {
 		if err := os.Remove(a); err != nil {
 			return fmt.Errorf("remove local archive %s: %w", a, err)
@@ -498,7 +498,7 @@ func testSnapshotRestoreForeignFromS3(h *TestHarness) error {
 	}
 	// The source's local archive must go too: this deployment should only be
 	// able to reach the snapshot through S3.
-	localArchives, _ := filepath.Glob(filepath.Join(h.dataDir, "backups", "snapshot-*.tar.zst"))
+	localArchives, _ := filepath.Glob(filepath.Join(h.dataDir, "backups", "snapshot-*.tar.zst.age"))
 	for _, a := range localArchives {
 		if err := os.Remove(a); err != nil {
 			return fmt.Errorf("remove local archive %s: %w", a, err)
@@ -526,8 +526,8 @@ func testSnapshotRestoreForeignFromS3(h *TestHarness) error {
 	h.authToken = token
 
 	log.Println("Step 3: Foreign restore — no catalogue row, no offsite settings, wrong live key")
-	// Without the source's master key this must refuse (the daemon's own fresh
-	// key cannot decrypt the archive's stored credentials).
+	// Without the source's master key this must refuse: the daemon's own fresh
+	// key cannot decrypt the archive, so the download cannot be verified.
 	output, err = h.runCLI("snapshot", "restore-instance",
 		"--instance", instanceName,
 		"--s3-uri", remoteURI,
@@ -536,19 +536,16 @@ func testSnapshotRestoreForeignFromS3(h *TestHarness) error {
 	if err == nil {
 		return fmt.Errorf("foreign restore without --master-key should fail; output: %s", output)
 	}
-	if !strings.Contains(err.Error(), "master key") {
-		return fmt.Errorf("expected a master-key mismatch refusal, got: %v", err)
+	if !strings.Contains(err.Error(), "cannot be decrypted") || !strings.Contains(err.Error(), "that deployment's master.key") {
+		return fmt.Errorf("expected a wrong-master-key refusal pointing at the source's master.key, got: %v", err)
 	}
 
-	// The refused attempt already fetched the archive, and it must SURVIVE the
-	// failure — that is the retry story. Delete it here only so the successful
-	// attempt below demonstrably downloads rather than reuses.
+	// An archive this host cannot decrypt cannot be verified, so the refused
+	// download must NOT be kept: a reusable name would vouch for bytes nobody
+	// checked. The retry below downloads it again.
 	downloadedPath := filepath.Join(h.dataDir, "backups", "downloads", archiveName)
-	if _, statErr := os.Stat(downloadedPath); statErr != nil {
-		return fmt.Errorf("archive should survive a refused restore for retry: %v", statErr)
-	}
-	if err := os.Remove(downloadedPath); err != nil {
-		return fmt.Errorf("clear cached download: %w", err)
+	if _, statErr := os.Stat(downloadedPath); !os.IsNotExist(statErr) {
+		return fmt.Errorf("an unverifiable download was kept at %s (stat: %v)", downloadedPath, statErr)
 	}
 
 	output, err = h.runCLI("snapshot", "restore-instance",

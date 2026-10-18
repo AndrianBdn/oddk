@@ -23,7 +23,7 @@ import (
 type RestoreRDBMSParams struct {
 	// Either BackupID or FilePath must be provided (mutually exclusive)
 	BackupID int    // ID from backup_history table
-	FilePath string // Direct path to .tar.zst file
+	FilePath string // Direct path to a .tar.zst.age (or pre-0.1.94 .tar.zst) file
 
 	InstanceName string // Target instance to restore to
 	DatabaseName string // Database name inside the backup to restore
@@ -97,8 +97,10 @@ func RestoreRDBMS(ctx context.Context, deps *Dependencies, params *RestoreRDBMSP
 	}
 	defer func() { _ = os.RemoveAll(tempDir) }()
 
-	compressor := compression.NewCompressor()
-	if err := compressor.ExtractTarZstdWith(ctx, backupPath, tempDir,
+	// Backups have no --master-key: one written on another host is refused
+	// (ErrNotDecryptable, naming the key it needs). Snapshots are the
+	// cross-host path.
+	if err := deps.Archives.ExtractTarZstdWith(ctx, backupPath, tempDir,
 		compression.ExtractOptions{WantSHA256: wantSHA256}); err != nil {
 		return nil, classifyExtractError("extract backup", err)
 	}

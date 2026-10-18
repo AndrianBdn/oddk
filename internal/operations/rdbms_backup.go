@@ -79,8 +79,8 @@ func BackupRDBMS(ctx context.Context, deps *Dependencies, params *BackupRDBMSPar
 	// 2. Create tar archive with zstd compression. The archive is read back and
 	// checked before it is published; on failure nothing appears at archivePath
 	// and no catalogue row is written.
-	archivePath := backupPath + ".tar.zst"
-	written, err := compression.NewCompressor().CreateTarZstd(ctx, tempDir, archivePath, assertBackupMembers)
+	archivePath := backupPath + compression.EncryptedSuffix
+	written, err := deps.Archives.CreateTarZstd(ctx, tempDir, archivePath, assertBackupMembers)
 	if err != nil {
 		return nil, fmt.Errorf("create archive: %w", err)
 	}

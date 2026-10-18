@@ -31,12 +31,12 @@ oddk instance get-postgres-password app --conn
 - **Operationally complete.** Whole-deployment *snapshots* — scheduled, shipped
   to S3, and able to rebuild a single instance or an entire host — plus health
   monitoring with Email/Slack/Telegram/Webhook alerts, password and user
-  management, minor-version image switches, dump/restore major upgrades, and
-  per-instance backups (deprecated; removed after 2026-12-31).
+  management, minor-version image switches, and dump/restore major upgrades.
 - **Actually recoverable.** A snapshot carries every instance's data *and* ODDK's
   own configuration, so a dead host can be rebuilt from one archive plus the
   master key — not reassembled by hand from per-database dumps.
-- **Secure by default for a single host.** Secrets encrypted at rest, a
+- **Secure by default for a single host.** Secrets and every snapshot archive
+  encrypted at rest (post-quantum age, keyed from one master key), a
   loopback-only API behind a bearer token, and Postgres bound to a host-local
   bridge — not the public internet.
 - **Single binary, no runtime dependencies** beyond Docker. Pure Go, builds
@@ -77,7 +77,7 @@ script, ODDK is that, as one tool with one mental model.
 | To know when it breaks | Health checks + degraded/restored notifications |
 | To tune Postgres safely | AWS-style parameter groups with expression evaluation |
 | To move to a new major | `instance major-upgrade` via dump/restore |
-| Secrets handled properly | AES-256-GCM-encrypted passwords, tokenized API auth |
+| Secrets handled properly | Encrypted archives and passwords, tokenized API auth |
 
 ---
 
@@ -120,10 +120,11 @@ release:
 curl -fsSL https://raw.githubusercontent.com/andrianbdn/oddk/main/install.sh | sh
 ```
 
-Pin a specific version:
+Pin a specific version (any tag from
+[Releases](https://github.com/andrianbdn/oddk/releases)):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/andrianbdn/oddk/main/install.sh | sh -s -- --version v0.1.39
+curl -fsSL https://raw.githubusercontent.com/andrianbdn/oddk/main/install.sh | sh -s -- --version vX.Y.Z
 ```
 
 The installer downloads the release binary from GitHub, verifies it against the
@@ -192,11 +193,16 @@ postgresql://postgres:PASSWORD@10.88.0.1:<port>/postgres
 
 **Connecting from another Docker container** (e.g. your app's `docker-compose.yml`):
 
-```yaml
-extra_hosts:
-  - "host.docker.internal:host-gateway"
-# then: postgresql://postgres:PASSWORD@host.docker.internal:<port>/postgres
+Use the bridge gateway address directly; it is reachable from containers on
+any Docker network:
+
 ```
+postgresql://postgres:PASSWORD@10.88.0.1:<port>/postgres
+```
+
+`host.docker.internal` with `extra_hosts: host-gateway` does **not** work: it
+resolves to `docker0` (`172.17.0.1`), and the instance's port is bound to
+`10.88.0.1` only.
 
 ---
 
@@ -335,13 +341,13 @@ Restoring comes in four shapes:
 ```bash
 # 1. Rebuild ONE instance into a deployment that stays up, from a local file.
 #    Creates it if it is gone; replaces its data if it is still there.
-oddk snapshot restore-instance --instance app --file snapshot-db01-20260729140312.tar.zst
+oddk snapshot restore-instance --instance app --file snapshot-db01-20260729140312.tar.zst.age
 
 # 2. The same, straight from S3 — no manual download step.
 oddk snapshot restore-instance --instance app --id 7   # this host's catalogue; downloads
                                                        # from S3 if the local copy is gone
 oddk snapshot restore-instance --instance app \
-      --s3-uri 's3://bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst' \
+      --s3-uri 's3://bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst.age' \
       --master-key /mnt/restore/master.key             # another deployment's snapshot
 # Find URIs with `oddk snapshot list-remote` — it lists what is actually in the
 # bucket, including snapshots whose records died with another host.
@@ -360,7 +366,7 @@ oddk snapshot restore-database --instance staging --from-instance prod \
 #    Runs locally, not through the daemon, so it works when the daemon cannot start.
 systemctl stop oddk
 sudo -u oddk oddk snapshot apply \
-      --file /mnt/restore/snapshot-db01-20260729140312.tar.zst \
+      --file /mnt/restore/snapshot-db01-20260729140312.tar.zst.age \
       --master-key /mnt/restore/master.key
 systemctl start oddk
 
@@ -370,7 +376,7 @@ oddk snapshot setup-cron --resume
 # apply can also fetch the archive itself, using this shell's AWS credentials —
 # see "Disaster recovery from S3" below for the full walkthrough.
 sudo -u oddk oddk snapshot apply \
-      --s3-uri 's3://bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst' \
+      --s3-uri 's3://bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst.age' \
       --master-key /mnt/restore/master.key
 ```
 
@@ -402,21 +408,22 @@ What you need to know:
   performs — the trade you accept for their WAL-free write speed. If an
   unlogged table's contents must survive a restore, either make it a normal
   table or use `--logical`, which dumps its rows.
-- **Back up `master.key` separately.** It is deliberately *not* in the archive,
-  and a snapshot cannot be applied without it.
-- **Snapshots are not encrypted, and they carry more than your data.** The
-  archive holds database contents and role password hashes in plaintext, and it
-  embeds `oddk.db` verbatim. The master key encrypts three columns in there —
-  each instance's postgres password, the S3 secret access key, and (since
-  0.1.80) every notification config. Everything else in that database is in the
-  clear. So whoever can read a snapshot can read your databases, and that
-  includes anyone with read access to the offsite bucket you upload to; restrict
-  it accordingly.
-  **Archives written before 0.1.80 also carry your notification credentials in
-  the clear** — the SMTP password, the Slack webhook URL, the Telegram bot
-  token, and any `Authorization` header on a webhook. Encrypting the column
-  going forward does not unpublish what already shipped: if an older archive
-  has been anywhere you would not put a password, rotate those credentials.
+- **Back up `master.key` separately, off the host.** It is deliberately *not*
+  in the archive, and every archive is encrypted with a key derived from it:
+  **without `master.key` a snapshot cannot be restored, applied or even read.**
+- **Snapshots are encrypted at rest** (since 0.1.94; see
+  [Archive encryption](#archive-encryption)). Someone who can read the backup
+  directory or the offsite bucket, but does not have `master.key`, learns
+  nothing about the contents — not your data, not the role password hashes, not
+  even the instance names.
+  **Archives written before 0.1.94 are not encrypted**: they hold database
+  contents, role password hashes and `oddk.db` in the clear, and stay that way
+  until retention prunes them. Archives written before 0.1.80 also carry your
+  notification credentials in the clear — the SMTP password, the Slack webhook
+  URL, the Telegram bot token, any `Authorization` header on a webhook. If an
+  older archive has been anywhere you would not put a password, rotate those
+  credentials, and delete the old archives once a newer encrypted complete
+  snapshot exists.
 - **What gets captured is decided by the container, not by recorded state.** A
   snapshot asks Docker what each container is actually doing at capture time, so
   an instance whose recorded status has drifted is still captured correctly. A
@@ -533,7 +540,7 @@ oddk snapshot list-remote s3://my-backup-bucket/oddk-backups/
 ```bash
 systemctl stop oddk
 sudo -u oddk oddk snapshot apply \
-      --s3-uri 's3://my-backup-bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst' \
+      --s3-uri 's3://my-backup-bucket/oddk-backups/*snapshots*/2026-07-29/snapshot-db01-20260729140312.tar.zst.age' \
       --master-key /mnt/restore/master.key
 systemctl start oddk
 oddk checklist
@@ -574,11 +581,40 @@ automatically after 7 days.
 > the source had already paused stays paused.
 
 > **You still need `master.key`, and it is deliberately *not* in the bucket** —
-> an archive and its key stored together would defeat the encryption of the
-> secrets inside. And remember that **snapshots themselves are not encrypted**:
-> they hold database contents and role password hashes in plaintext, so guard
-> bucket access accordingly. (Notification credentials are encrypted since
-> 0.1.80; older archives carry them in the clear.)
+> an archive and its key stored together would defeat its encryption. Archives
+> written before 0.1.94 are not encrypted, so keep guarding bucket access until
+> retention has pruned them.
+
+### Archive encryption
+
+Since 0.1.94, every archive ODDK writes — snapshots, legacy backups, and the
+pre-upgrade backup `major-upgrade` takes — is encrypted with
+[age](https://age-encryption.org) (post-quantum hybrid, ML-KEM-768 + X25519) to a
+key derived from `master.key`. Encrypted archives end in `.tar.zst.age`; archives
+from earlier versions keep their `.tar.zst` name and stay restorable, unchanged.
+
+- **There is no second key to manage.** `snapshot apply` already requires
+  `--master-key`; restoring a snapshot from another deployment needs that
+  deployment's `master.key`, exactly as before.
+- **A wrong key is refused before anything changes**, and the error names the
+  key the archive needs: the 8-character checksum at the end of that
+  `master.key` line (`ODDK-SECRET-MASTER-KEY;V1;…;<checksum>`).
+- **Every 64 KiB of the archive is authenticated.** A flipped bit, a truncated
+  download or a tampered file is refused before anything is extracted, on top of
+  the existing read-back and SHA-256 checks.
+- **You can get at an archive without ODDK running:**
+
+```bash
+# Write the plain .tar.zst next to it (verified first; mode 0600; never overwrites)
+oddk snapshot decrypt --file snapshot-db01-20261017030000.tar.zst.age --master-key master.key
+
+# Or hand the stock age CLI the derived key — it is as sensitive as master.key itself.
+# umask 077 first: both the secret and the plaintext would otherwise be world-readable.
+(umask 077
+ oddk snapshot decrypt --master-key master.key --print-age-identity > identity.txt
+ age -d -i identity.txt -o snapshot.tar.zst snapshot-db01-20261017030000.tar.zst.age)
+shred -u identity.txt   # when done; delete snapshot.tar.zst too
+```
 
 ### Offsite storage (S3)
 
@@ -655,69 +691,6 @@ offsite settings whenever the bucket matches.
 Archives fetched by URI land in a managed `downloads/` area under the backup
 directory and are pruned after 7 days; everything there is re-fetchable from
 S3, so deleting it never loses data.
-
-### Deprecated: per-instance backups
-
-> **Per-instance backups are deprecated and will be removed in the first
-> release after 2026-12-31.** Snapshots do everything they did, including
-> restoring or cloning a single database (`oddk snapshot restore-database`).
->
-> Until then:
-> - every `oddk backup` command prints a notice on stderr naming its
->   replacement (stdout and `--json` output are unchanged);
-> - **new backup schedules are refused.** Existing schedules keep running and
->   can still be changed, paused, resumed or removed. Move them with
->   `oddk snapshot migrate-from-backups`;
-> - restore, list, download and `dangerously-drop-all` keep working, so the
->   archives you already have stay usable.
->
-> | Instead of | Use |
-> |---|---|
-> | `oddk backup make` | `oddk snapshot make` |
-> | `oddk backup restore --database` | `oddk snapshot restore-database` |
-> | `oddk backup setup-cron` | `oddk snapshot setup-cron` (or `migrate-from-backups`) |
-> | `oddk backup list` / `list-cron` | `oddk snapshot list` / `list-cron` |
-> | `oddk backup upload` / `download` / `remove-*` | the `oddk snapshot` commands of the same name |
-
-```bash
-oddk backup make app --comment "before deploy"
-oddk backup list --instance app
-oddk backup restore --instance app --id 42 --database analytics
-oddk backup restore --instance app --id 42 --database analytics --restore-as analytics_copy
-oddk backup restore --instance app --file /path/to/backup.tar.zst --database analytics
-
-# Existing schedules (new ones are refused; use `oddk snapshot setup-cron`)
-oddk backup setup-cron --instance app --cleanup-local-days 14   # keeps the existing hour
-oddk backup setup-cron --instance app --pause                  # suspend without deleting
-oddk backup setup-cron --instance app --resume
-oddk backup list-cron                                          # STATUS column: active / PAUSED
-oddk backup upload app <backup-id>
-oddk backup download app <backup-id>
-```
-
-Fields you do not pass to `setup-cron` are preserved, matching
-`oddk snapshot setup-cron` — changing a retention window cannot silently move
-the hour.
-
-Backups record roles with database-level `CREATE` access, and both restore and
-`major-upgrade` reapply those grants automatically. A role must already exist on
-the target instance to receive its grant; missing roles are reported and skipped
-without failing the operation. Older archives without this metadata retain the
-previous behavior.
-
-Done with per-instance backups? Once the snapshot schedule has proven itself,
-delete every leftover backup in one sweep — local archives, S3 copies, and the
-whole backup history, including backups of instances that no longer exist.
-Snapshots are untouched:
-
-```bash
-oddk backup dangerously-drop-all           # preview — changes nothing
-oddk backup dangerously-drop-all --apply   # delete (asks for confirmation)
-```
-
-The preview warns if any instance still has a backup schedule (migrate it
-first — the next cron run would just create new backups) and if no snapshot
-exists yet, in which case these backups are the only thing a restore could use.
 
 ### Custom images (pgvector, postgis, …)
 
@@ -810,8 +783,7 @@ events are delivered automatically with configurable thresholds.
 > Two things it does *not* do. It does not protect a snapshot archive taken
 > **before** 0.1.80 — those carry these credentials in the clear, so rotate
 > anything that has ridden in one. And it does not protect against someone who
-> has both `oddk.db` and `master.key`, which is what an archive plus its key
-> amount to. Still prefer a credential you can scope and rotate (a dedicated
+> has both an archive (or `oddk.db`) and `master.key`. Still prefer a credential you can scope and rotate (a dedicated
 > SMTP user, a per-deployment webhook) over one that grants anything else.
 
 An instance left in `error` by a failed operation — an apply whose rollback also
@@ -870,31 +842,19 @@ go looking.
 - **Encrypted secrets at rest.** Postgres passwords, S3 keys and notification
   channel configs are encrypted with AES-256-GCM (self-describing `3ncr.org/1`
   format) using a 32-byte master key at `{dataDir}/master.key` (mode `0600`).
-  Notification configs joined the list in 0.1.80; configs written earlier are
-  re-encrypted the next time the daemon starts, and a snapshot archive taken
-  before then still carries them in the clear. The key file is one
-  self-describing line so it can be identified wherever it ends up:
-  `ODDK-SECRET-MASTER-KEY;V1;<base64url>;<checksum>`. The checksum is the first
-  4 bytes of SHA-256 over the base64url text — `printf %s '<payload>' |
+  The key file is one self-describing line so it can be identified wherever it
+  ends up: `ODDK-SECRET-MASTER-KEY;V1;<base64url>;<checksum>`. The checksum is
+  the first 4 bytes of SHA-256 over the base64url text — `printf %s '<payload>' |
   sha256sum | cut -c1-8` — and exists to tell "the right key, copied badly"
-  apart from "the wrong key". Key files written by ODDK <= 0.1.59 were a bare
-  base64url string; they are still read and are rewritten in place on the next
-  daemon start (the key material never changes). Because ODDK <= 0.1.59 cannot
-  read the new format, that first start also saves the previous file as
-  `master.key.pre-v1` — if you roll the binary back, restore it with
-  `mv master.key.pre-v1 master.key`.
-- **Secrets stay out of container metadata.** Since 0.1.81 an instance's
-  postgres password is never written into its container's Docker config, which
-  Docker keeps for the container's lifetime and hands to anything that can read
-  container metadata. A fresh cluster is initialised with a throwaway and the
-  real password is set over SQL once it is ready, so `docker inspect` shows a
-  value that authenticates nothing; recreating a container (`instance
-  apply`/`switch`/`update`) passes no password at all. Containers created before
-  0.1.81 keep their old value until their next recreate — clearing it sooner
-  would mean restarting the database purely to tidy metadata. Note this is
-  hygiene rather than a boundary: anyone who can read that metadata can also
-  `docker exec ... psql -U postgres`, which the cluster answers over its local
-  socket without a password.
+  apart from "the wrong key".
+- **Secrets stay out of container metadata.** An instance's postgres password is
+  never written into its container's Docker config, which Docker keeps for the
+  container's lifetime and hands to anything that can read container metadata.
+  A fresh cluster is initialised with a throwaway and the real password is set
+  over SQL once it is ready, so `docker inspect` shows a value that
+  authenticates nothing. This is hygiene rather than a boundary: anyone who can
+  read that metadata can also `docker exec ... psql -U postgres`, which the
+  cluster answers over its local socket without a password.
 - **Tokenized API auth.** Tokens are Argon2-hashed and compared in constant
   time; the plaintext is shown only at creation.
 - **Loopback by default.** The API binds `127.0.0.1`. `--allow-remote` exists
@@ -906,6 +866,71 @@ go looking.
 
 The threat model is a **single trusted operator on a single host**. ODDK is not
 hardened for hostile multi-tenant use.
+
+---
+
+## Deprecated: per-instance backups
+
+> **Per-instance backups are deprecated and will be removed in the first
+> release after 2026-12-31.** Snapshots do everything they did, including
+> restoring or cloning a single database (`oddk snapshot restore-database`).
+>
+> Until then:
+> - every `oddk backup` command prints a notice on stderr naming its
+>   replacement (stdout and `--json` output are unchanged);
+> - **new backup schedules are refused.** Existing schedules keep running and
+>   can still be changed, paused, resumed or removed. Move them with
+>   `oddk snapshot migrate-from-backups`;
+> - restore, list, download and `dangerously-drop-all` keep working, so the
+>   archives you already have stay usable.
+>
+> | Instead of | Use |
+> |---|---|
+> | `oddk backup make` | `oddk snapshot make` |
+> | `oddk backup restore --database` | `oddk snapshot restore-database` |
+> | `oddk backup setup-cron` | `oddk snapshot setup-cron` (or `migrate-from-backups`) |
+> | `oddk backup list` / `list-cron` | `oddk snapshot list` / `list-cron` |
+> | `oddk backup upload` / `download` / `remove-*` | the `oddk snapshot` commands of the same name |
+
+```bash
+oddk backup make app --comment "before deploy"
+oddk backup list --instance app
+oddk backup restore --instance app --id 42 --database analytics
+oddk backup restore --instance app --id 42 --database analytics --restore-as analytics_copy
+oddk backup restore --instance app --file /path/to/backup.tar.zst.age --database analytics
+
+# Existing schedules (new ones are refused; use `oddk snapshot setup-cron`)
+oddk backup setup-cron --instance app --cleanup-local-days 14   # keeps the existing hour
+oddk backup setup-cron --instance app --pause                  # suspend without deleting
+oddk backup setup-cron --instance app --resume
+oddk backup list-cron                                          # STATUS column: active / PAUSED
+oddk backup upload app <backup-id>
+oddk backup download app <backup-id>
+```
+
+Fields you do not pass to `setup-cron` are preserved, matching
+`oddk snapshot setup-cron` — changing a retention window cannot silently move
+the hour.
+
+Backups record roles with database-level `CREATE` access, and both restore and
+`major-upgrade` reapply those grants automatically. A role must already exist on
+the target instance to receive its grant; missing roles are reported and skipped
+without failing the operation. Older archives without this metadata retain the
+previous behavior.
+
+Done with per-instance backups? Once the snapshot schedule has proven itself,
+delete every leftover backup in one sweep — local archives, S3 copies, and the
+whole backup history, including backups of instances that no longer exist.
+Snapshots are untouched:
+
+```bash
+oddk backup dangerously-drop-all           # preview — changes nothing
+oddk backup dangerously-drop-all --apply   # delete (asks for confirmation)
+```
+
+The preview warns if any instance still has a backup schedule (migrate it
+first — the next cron run would just create new backups) and if no snapshot
+exists yet, in which case these backups are the only thing a restore could use.
 
 ---
 
@@ -930,7 +955,7 @@ The daemon does not mint a token itself. Provision a CLI config with
 `sudo` needed; `--json` prints the config instead of eval-able shell). The CLI
 reads `.oddk-cli.json` in the current directory or `~/.config/oddk/cli.json`.
 
-**Toolchain:** Go 1.26+, Docker. Linux (primary) or macOS (development).
+**Toolchain:** Go 1.27.1+ (see `go.mod`), Docker. Linux (primary) or macOS (development).
 
 ## License
 

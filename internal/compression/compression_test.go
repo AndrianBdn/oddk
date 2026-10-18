@@ -80,7 +80,7 @@ func TestExtractTarZstd_RejectsTraversal(t *testing.T) {
 
 			writeTarZstd(t, archivePath, map[string]string{tc.entryName: "pwned"})
 
-			err := compression.NewCompressor().ExtractTarZstd(context.Background(), archivePath, extractDir)
+			err := newC(t).ExtractTarZstd(context.Background(), archivePath, extractDir)
 			if err == nil {
 				t.Fatalf("expected extraction to reject traversal entry %q, got nil error", tc.entryName)
 			}
@@ -107,7 +107,7 @@ func TestExtractTarZstd_AllowsNestedEntries(t *testing.T) {
 	}
 	writeTarZstd(t, archivePath, entries)
 
-	if err := compression.NewCompressor().ExtractTarZstd(context.Background(), archivePath, extractDir); err != nil {
+	if err := newC(t).ExtractTarZstd(context.Background(), archivePath, extractDir); err != nil {
 		t.Fatalf("ExtractTarZstd rejected a legitimate archive: %v", err)
 	}
 
@@ -127,7 +127,7 @@ func TestCompressor_CreateTarZstd(t *testing.T) {
 	// Create temp directory with test files - no cleanup needed, t.TempDir() handles it
 	tmpDir := t.TempDir()
 	sourceDir := filepath.Join(tmpDir, "source")
-	archivePath := filepath.Join(tmpDir, "test.tar.zst")
+	archivePath := filepath.Join(tmpDir, "test.tar.zst.age")
 
 	// Create source directory with multiple test files and subdirectories
 	if err := os.MkdirAll(sourceDir, 0o750); err != nil { // #nosec G301 - test directory
@@ -156,7 +156,7 @@ func TestCompressor_CreateTarZstd(t *testing.T) {
 	}
 
 	// Create compressor and archive
-	compressor := compression.NewCompressor()
+	compressor := newC(t)
 	written, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
 	if err != nil {
 		t.Fatalf("CreateTarZstd failed: %v", err)
@@ -190,20 +190,9 @@ func TestCompressor_CreateTarZstd(t *testing.T) {
 		t.Logf("Note: Small test files may not compress well, this is expected")
 	}
 
-	// Verify the file has zstd magic bytes (frame header)
-	archiveData, err := os.ReadFile(archivePath) // #nosec G304 - archivePath is controlled test path
-	if err != nil {
-		t.Fatalf("failed to read archive: %v", err)
-	}
-
-	if len(archiveData) < 4 {
-		t.Errorf("archive too small to contain zstd header")
-	} else {
-		// Zstd magic number is 0xFD2FB528 (little endian: 28 B5 2F FD)
-		zstdMagic := []byte{0x28, 0xB5, 0x2F, 0xFD}
-		if !bytes.Equal(archiveData[:4], zstdMagic) {
-			t.Errorf("archive doesn't start with zstd magic bytes, got: %x", archiveData[:4])
-		}
+	// Every archive is written encrypted.
+	if enc, err := compression.IsEncrypted(archivePath); err != nil || !enc {
+		t.Errorf("archive is not encrypted (IsEncrypted = %v, %v)", enc, err)
 	}
 
 	// Test round-trip: extract and verify content
@@ -228,24 +217,17 @@ func TestCompressor_CreateTarZstd(t *testing.T) {
 	}
 }
 
-func TestCompressor_NewCompressor(t *testing.T) {
-	compressor := compression.NewCompressor()
-	if compressor == nil {
-		t.Errorf("NewCompressor returned nil")
-	}
-}
-
 func TestCompressor_CreateTarZstd_EmptyDirectory(t *testing.T) {
 	tmpDir := t.TempDir()
 	sourceDir := filepath.Join(tmpDir, "empty")
-	archivePath := filepath.Join(tmpDir, "empty.tar.zst")
+	archivePath := filepath.Join(tmpDir, "empty.tar.zst.age")
 
 	// Create empty directory
 	if err := os.MkdirAll(sourceDir, 0o750); err != nil { // #nosec G301 - test directory
 		t.Fatalf("failed to create empty dir: %v", err)
 	}
 
-	compressor := compression.NewCompressor()
+	compressor := newC(t)
 	written, err := compressor.CreateTarZstd(context.Background(), sourceDir, archivePath, nil)
 	if err != nil {
 		t.Fatalf("CreateTarZstd failed for empty directory: %v", err)
@@ -259,10 +241,10 @@ func TestCompressor_CreateTarZstd_EmptyDirectory(t *testing.T) {
 }
 
 func TestCompressor_CreateTarZstd_InvalidPath(t *testing.T) {
-	compressor := compression.NewCompressor()
+	compressor := newC(t)
 
 	// Test with non-existent source directory
-	_, err := compressor.CreateTarZstd(context.Background(), "/non/existent/path", "/tmp/test.tar.zst", nil)
+	_, err := compressor.CreateTarZstd(context.Background(), "/non/existent/path", "/tmp/test.tar.zst.age", nil)
 	if err == nil {
 		t.Errorf("expected error for non-existent source directory")
 	}
@@ -274,7 +256,7 @@ func TestCompressor_CreateTarZstd_InvalidPath(t *testing.T) {
 		t.Fatalf("failed to create source dir: %v", err)
 	}
 
-	_, err = compressor.CreateTarZstd(context.Background(), sourceDir, "/non/existent/dir/archive.tar.zst", nil)
+	_, err = compressor.CreateTarZstd(context.Background(), sourceDir, "/non/existent/dir/archive.tar.zst.age", nil)
 	if err == nil {
 		t.Errorf("expected error for invalid archive path")
 	}

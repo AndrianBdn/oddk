@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/moby/moby/client"
+
+	"github.com/andrianbdn/oddk/internal/compression"
+	"github.com/andrianbdn/oddk/internal/crypto"
 )
 
 // testSnapshotRoundTrip is the test the whole snapshot feature exists for:
@@ -92,7 +95,7 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 		return fmt.Errorf("snapshot make: %w (output: %s)", err, output)
 	}
 	backupDir := filepath.Join(h.dataDir, "backups")
-	matches, err := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst"))
+	matches, err := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst.age"))
 	if err != nil || len(matches) != 1 {
 		return fmt.Errorf("expected 1 snapshot archive, found %v (err %v)", matches, err)
 	}
@@ -105,7 +108,7 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	}
 	defer func() { _ = os.RemoveAll(offHost) }()
 
-	archiveCopy := filepath.Join(offHost, "snapshot.tar.zst")
+	archiveCopy := filepath.Join(offHost, "snapshot.tar.zst.age")
 	keyCopy := filepath.Join(offHost, "master.key")
 	if err := copyFileForTest(matches[0], archiveCopy); err != nil {
 		return fmt.Errorf("copy archive off host: %w", err)
@@ -153,9 +156,47 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 		return fmt.Errorf("remove image to simulate a fresh host: %w", err)
 	}
 
-	log.Println("Step 4: Applying the snapshot with the daemon stopped")
+	// The archive is encrypted to the SOURCE key. The fresh install's own key
+	// must be refused before anything is touched, naming the key needed.
+	log.Println("Step 3c: Apply with the wrong master key is refused before any change")
+	sourceKey, err := crypto.ReadKeyFileAt(keyCopy)
+	if err != nil {
+		return fmt.Errorf("read parked key: %w", err)
+	}
 	output, err = h.runCLI("snapshot", "apply",
 		"--file", archiveCopy,
+		"--master-key", filepath.Join(h.dataDir, "master.key"),
+		"--data-dir", h.dataDir,
+		"--daemon-port", strconv.Itoa(testPort),
+		"--yes")
+	if err == nil {
+		return fmt.Errorf("apply with the wrong master key succeeded; output: %s", output)
+	}
+	refusal := output + err.Error()
+	if !strings.Contains(refusal, "cannot be decrypted") || !strings.Contains(refusal, crypto.KeyID(sourceKey)) ||
+		!strings.Contains(refusal, "No ODDK state on this host was modified") {
+		return fmt.Errorf("wrong-key refusal does not name the needed key %s and promise no changes: %s",
+			crypto.KeyID(sourceKey), refusal)
+	}
+	if after, _ := os.ReadFile(filepath.Join(h.dataDir, "master.key")); string(after) != string(freshKey) {
+		return fmt.Errorf("a refused apply changed master.key")
+	}
+
+	// Apply the PLAIN form of the same archive: what every ODDK <= 0.1.93
+	// wrote, and what 'snapshot decrypt' produces. Old archives in S3 must stay
+	// restorable; the physical and S3 round trips apply the encrypted form.
+	log.Println("Step 3d: Decrypting the archive to the plain pre-0.1.94 form")
+	plainCopy := filepath.Join(offHost, "snapshot.tar.zst")
+	if output, err = h.runCLI("snapshot", "decrypt", "--file", archiveCopy, "--master-key", keyCopy, "--out", plainCopy); err != nil {
+		return fmt.Errorf("snapshot decrypt: %w (output: %s)", err, output)
+	}
+	if enc, err := compression.IsEncrypted(plainCopy); err != nil || enc {
+		return fmt.Errorf("decrypted copy is still encrypted (%v, %v)", enc, err)
+	}
+
+	log.Println("Step 4: Applying the (plain) snapshot with the daemon stopped")
+	output, err = h.runCLI("snapshot", "apply",
+		"--file", plainCopy,
 		"--master-key", keyCopy,
 		"--data-dir", h.dataDir,
 		"--daemon-port", strconv.Itoa(testPort),

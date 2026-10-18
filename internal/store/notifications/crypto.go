@@ -16,8 +16,9 @@ import (
 // webhooks — an arbitrary `headers` map whose keys ODDK cannot enumerate, one
 // of which is typically `Authorization`. A per-field scheme has to be extended
 // for every new field, and the failure mode of forgetting one is SILENT: the
-// secret is written in the clear and rides into every snapshot archive, which
-// is unencrypted and uploaded to S3. Encrypting the blob cannot be defeated
+// secret is written in the clear and rides into every snapshot archive (which
+// before 0.1.94 was itself unencrypted and uploaded to S3, and is readable by
+// anyone with master.key since). Encrypting the blob cannot be defeated
 // that way, and it covers the recipient addresses as a bonus.
 //
 // The cost is that the column is opaque to `sqlite3`. Only this package reads

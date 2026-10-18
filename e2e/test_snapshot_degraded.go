@@ -104,7 +104,7 @@ func testSnapshotDegradedCapture(h *TestHarness) error {
 	}
 
 	log.Println("Step 4: The manifest must record exactly which instance is empty, and why")
-	raw, err := readTarMember(archive, "manifest.json")
+	raw, err := readTarMember(h, archive, "manifest.json")
 	if err != nil {
 		return fmt.Errorf("read manifest: %w", err)
 	}
@@ -132,7 +132,7 @@ func testSnapshotDegradedCapture(h *TestHarness) error {
 	}
 
 	log.Println("Step 5: No partial capture output may be archived for the failed instance")
-	names, err := tarEntryNames(archive)
+	names, err := tarEntryNames(h, archive)
 	if err != nil {
 		return fmt.Errorf("read tar entries: %w", err)
 	}

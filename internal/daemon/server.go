@@ -124,11 +124,17 @@ func NewServer(port int, dataDir, backupDir string, healthCheckIntervalSec int, 
 	reencryptLegacySecrets(store, masterKey)
 	encryptNotificationConfigs(store)
 
+	archiveCompressor, err := operations.ArchiveCompressor(masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("archive key: %w", err)
+	}
+
 	executor := operations.NewExecutor()
 	opDeps := &operations.Dependencies{
 		Store:     store,
 		Docker:    dockerClient,
 		MasterKey: masterKey,
+		Archives:  archiveCompressor,
 		DataDir:   dataDir,
 		BackupDir: backupDir,
 		Logger:    log.New(os.Stdout, "[ODDK] ", log.LstdFlags),

@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/moby/moby/api/types/mount"
 
-	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operr"
@@ -201,7 +200,7 @@ func (op *UpgradeRDBMSOp) takeVerifiedBackup(ctx context.Context, plan *upgradeP
 		return nil, "", nil, err
 	}
 
-	if err := compression.NewCompressor().ExtractTarZstd(ctx, backupResult.BackupPath, extractedDir); err != nil {
+	if err := op.deps.Archives.ExtractTarZstd(ctx, backupResult.BackupPath, extractedDir); err != nil {
 		return fail(fmt.Errorf("verify backup (extract): %w", err))
 	}
 	if _, err := os.Stat(filepath.Join(extractedDir, "globals.sql")); err != nil {

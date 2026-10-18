@@ -3,6 +3,7 @@ package operations
 import (
 	"log"
 
+	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/instances"
@@ -13,6 +14,9 @@ type Dependencies struct {
 	Store     *store.Store
 	Docker    *docker.Client
 	MasterKey []byte
+	// Archives writes and reads this host's archives, encrypted to the key
+	// derived from MasterKey (ArchiveCompressor). Built once, with MasterKey.
+	Archives  *compression.Compressor
 	DataDir   string // Added for backup operations
 	BackupDir string // Added for backup operations
 	Logger    *log.Logger

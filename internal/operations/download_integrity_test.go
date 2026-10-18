@@ -1,15 +1,19 @@
 package operations
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/andrianbdn/oddk/internal/compression"
 )
 
 // The catalogued-download path (`backup download`, `snapshot download <id>`)
@@ -34,9 +38,9 @@ func TestStreamToLocalFileAtomic_RefusesCorruptObject(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	dest := filepath.Join(dir, "backup-app-20260811-7.tar.zst")
+	dest := filepath.Join(dir, "backup-app-20260811-7.tar.zst.age")
 
-	if _, _, err := streamToLocalFileAtomic(context.Background(), client, "k/backup.tar.zst", dest, ""); err == nil {
+	if _, _, err := streamToLocalFileAtomic(context.Background(), testCompressor(t), client, "k/backup.tar.zst.age", dest, ""); err == nil {
 		t.Fatal("a corrupt object was accepted; the catalogue would now claim a local copy that cannot be restored")
 	}
 
@@ -63,9 +67,9 @@ func TestStreamToLocalFileAtomic_LandsAGoodArchive(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	dest := filepath.Join(dir, "snapshot-db01-20260811090000.tar.zst")
+	dest := filepath.Join(dir, "snapshot-db01-20260811090000.tar.zst.age")
 
-	written, digest, err := streamToLocalFileAtomic(context.Background(), client, "k/snap.tar.zst", dest, "")
+	written, digest, err := streamToLocalFileAtomic(context.Background(), testCompressor(t), client, "k/snap.tar.zst.age", dest, "")
 	if err != nil {
 		t.Fatalf("a good archive was refused: %v", err)
 	}
@@ -87,8 +91,9 @@ func TestStreamToLocalFileAtomic_LandsAGoodArchive(t *testing.T) {
 	}
 
 	// A downloaded archive is as sensitive as a written one: database contents
-	// plus role password hashes, unencrypted. writeVerifiedArchive already
-	// enforces 0600 on the write path; os.Create would have landed 0644 here.
+	// plus role password hashes, in the clear if it predates encryption.
+	// writeVerifiedArchive already enforces 0600 on the write path; os.Create
+	// would have landed 0644 here.
 	fi, err := os.Stat(dest)
 	if err != nil {
 		t.Fatalf("stat downloaded archive: %v", err)
@@ -160,10 +165,10 @@ func TestStreamToLocalFileAtomic_RefusesIntactArchiveWithWrongDigest(t *testing.
 	}
 
 	dir := t.TempDir()
-	dest := filepath.Join(dir, "snapshot-db01-20260929090000.tar.zst")
+	dest := filepath.Join(dir, "snapshot-db01-20260929090000.tar.zst.age")
 
-	_, _, err := streamToLocalFileAtomic(context.Background(), newFetchStubClient(t, serve(substitute)),
-		"k/snap.tar.zst", dest, sha256Hex(recorded))
+	_, _, err := streamToLocalFileAtomic(context.Background(), testCompressor(t), newFetchStubClient(t, serve(substitute)),
+		"k/snap.tar.zst.age", dest, sha256Hex(recorded))
 	if err == nil {
 		t.Fatal("an intact archive with the wrong digest was accepted as the catalogued snapshot")
 	}
@@ -176,10 +181,39 @@ func TestStreamToLocalFileAtomic_RefusesIntactArchiveWithWrongDigest(t *testing.
 	}
 
 	// The matching object is accepted.
-	if _, digest, err := streamToLocalFileAtomic(context.Background(), newFetchStubClient(t, serve(recorded)),
-		"k/snap.tar.zst", dest, sha256Hex(recorded)); err != nil {
+	if _, digest, err := streamToLocalFileAtomic(context.Background(), testCompressor(t), newFetchStubClient(t, serve(recorded)),
+		"k/snap.tar.zst.age", dest, sha256Hex(recorded)); err != nil {
 		t.Fatalf("the recorded archive was refused: %v", err)
 	} else if digest != sha256Hex(recorded) {
 		t.Errorf("digest = %s, want %s", digest, sha256Hex(recorded))
+	}
+}
+
+// An archive encrypted for another master key cannot be verified, so it is
+// refused like any other unverifiable download, naming the key it needs.
+func TestStreamToLocalFileAtomic_RefusesArchiveForAnotherKey(t *testing.T) {
+	good := tinyArchiveBytes(t, "intact")
+	client := newFetchStubClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(good)))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(good)
+		}
+	})
+	other, err := ArchiveCompressor(bytes.Repeat([]byte{8}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "snapshot-db01-20261017090000.tar.zst.age")
+	_, _, err = streamToLocalFileAtomic(context.Background(), other, client, "k/snap.tar.zst.age", dest, "")
+	if !errors.Is(err, compression.ErrNotDecryptable) {
+		t.Fatalf("got %v, want ErrNotDecryptable", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		t.Errorf("%s was left behind by a refused download", e.Name())
 	}
 }

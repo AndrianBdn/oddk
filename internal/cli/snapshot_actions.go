@@ -15,6 +15,8 @@ import (
 	"github.com/moby/term"
 	"github.com/urfave/cli/v3"
 
+	"github.com/andrianbdn/oddk/internal/compression"
+	"github.com/andrianbdn/oddk/internal/crypto"
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operations"
 	s3service "github.com/andrianbdn/oddk/internal/services/s3"
@@ -139,13 +141,12 @@ func (c *Client) snapshotMakeAction(ctx context.Context, cmd *cli.Command) error
 				"   instance. Fix the cause and take another snapshot.\n")
 	}
 
-	// Both of these are load-bearing and easy to get wrong, so they are shown
-	// on the success path rather than left to the documentation.
+	// Load-bearing and easy to get wrong, so it is shown on the success path
+	// rather than left to the documentation: the archive is encrypted to a key
+	// derived from master.key, so without that file it is unrecoverable.
 	_, _ = fmt.Fprintf(c.out,
-		"\n⚠️  This snapshot contains database contents and role password hashes in plaintext.\n"+
-			"   It is NOT encrypted by the master key. Store it accordingly.\n")
-	_, _ = fmt.Fprintf(c.out,
-		"⚠️  Restoring it requires the master.key from this host. Back that key up separately.\n")
+		"\n⚠️  The snapshot is encrypted with a key derived from this host's master.key.\n"+
+			"   Without that file it cannot be restored or read. Back master.key up separately, off this host.\n")
 
 	return snapshotCaptureError(result.CaptureFailures)
 }
@@ -920,7 +921,7 @@ func (c *Client) snapshotApplyAction(ctx context.Context, cmd *cli.Command) erro
 			Region:   cmd.String("region"),
 			Endpoint: cmd.String("endpoint"),
 			Profile:  cmd.String("aws-profile"),
-		}, backupDir, c.out)
+		}, masterKeyPath, backupDir, c.out)
 		if err != nil {
 			return err
 		}
@@ -1271,4 +1272,49 @@ func (c *Client) dockerProgressWriter() (io.Writer, func()) {
 			<-done
 		})
 	}
+}
+
+// snapshotDecryptAction is `oddk snapshot decrypt`: local, daemon-less, so an
+// operator can get at an archive's contents — or hand the stock age CLI the
+// key — on a host where ODDK itself is not running.
+func (c *Client) snapshotDecryptAction(_ context.Context, cmd *cli.Command) error {
+	key, err := crypto.ReadKeyFileAt(cmd.String("master-key"))
+	if err != nil {
+		return err
+	}
+	archiveKey, err := crypto.NewArchiveKey(key)
+	if err != nil {
+		return err
+	}
+
+	if cmd.Bool("print-age-identity") {
+		if cmd.String("file") != "" || cmd.String("out") != "" {
+			return fmt.Errorf("--print-age-identity takes only --master-key")
+		}
+		// stdout carries only the secret, so `> identity.txt` captures exactly
+		// what age -i reads; the warning goes to stderr.
+		_, _ = fmt.Fprintf(os.Stderr, "This age secret decrypts every archive written with master key %s. Treat it like master.key itself:\n"+
+			"redirect it under umask 077 (a plain '> file' is world-readable with the usual umask 022), and delete it when done.\n", archiveKey.ID())
+		_, _ = fmt.Fprintf(c.out, "# ODDK archive key for master key %s\n%s\n", archiveKey.ID(), archiveKey.AgeSecret())
+		return nil
+	}
+
+	archivePath := cmd.String("file")
+	if archivePath == "" {
+		return fmt.Errorf("--file is required (or --print-age-identity)")
+	}
+	out := cmd.String("out")
+	if out == "" {
+		trimmed, ok := strings.CutSuffix(archivePath, ".age")
+		if !ok {
+			return fmt.Errorf("%s does not end in .age; pass --out", archivePath)
+		}
+		out = trimmed
+	}
+	_, _ = fmt.Fprintf(c.out, "Verifying and decrypting %s (master key %s)...\n", archivePath, archiveKey.ID())
+	if err := compression.NewCompressor(archiveKey).DecryptTo(archivePath, out); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(c.out, "Wrote %s (mode 0600). It holds every database's contents in the clear: delete it when done.\n", out)
+	return nil
 }

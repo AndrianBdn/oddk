@@ -100,7 +100,7 @@ func testSnapshotRestoreInstance(h *TestHarness) error {
 	if output, err = h.runCLI("snapshot", "make"); err != nil {
 		return fmt.Errorf("snapshot make: %w (output: %s)", err, output)
 	}
-	matches, err := filepath.Glob(filepath.Join(h.dataDir, "backups", "snapshot-*.tar.zst"))
+	matches, err := filepath.Glob(filepath.Join(h.dataDir, "backups", "snapshot-*.tar.zst.age"))
 	if err != nil || len(matches) != 1 {
 		return fmt.Errorf("expected 1 snapshot archive, found %v (err %v)", matches, err)
 	}

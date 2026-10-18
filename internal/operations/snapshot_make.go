@@ -247,7 +247,7 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 	host = sanitizeHostForFilename(host)
 
 	snapshotName := fmt.Sprintf("%s%s-%s", SnapshotFilePrefix, host, timestampStr)
-	archivePath := filepath.Join(params.BackupDir, snapshotName+".tar.zst")
+	archivePath := filepath.Join(params.BackupDir, snapshotName+compression.EncryptedSuffix)
 	stagingDir := filepath.Join(params.BackupDir, SnapshotStagingPrefix+timestampStr)
 
 	if _, err := os.Stat(archivePath); err == nil {
@@ -310,7 +310,7 @@ func MakeSnapshot(ctx context.Context, deps *Dependencies, params *MakeSnapshotP
 	// The archive is read back before it is published, and this asserts it holds
 	// what the manifest promises. On any failure nothing is written to
 	// archivePath and nothing is catalogued — see writeVerifiedArchive.
-	written, err := compression.NewCompressor().CreateTarZstdOrdered(ctx, archiveEntries, archivePath,
+	written, err := deps.Archives.CreateTarZstdOrdered(ctx, archiveEntries, archivePath,
 		func(members []compression.Member) error {
 			return assertSnapshotMembers(members, entries)
 		})

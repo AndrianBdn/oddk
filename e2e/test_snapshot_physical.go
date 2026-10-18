@@ -77,7 +77,7 @@ func testSnapshotPhysicalMake(h *TestHarness) error {
 	}
 
 	log.Println("Step 3: Verifying the physical archive layout and manifest")
-	names, err := tarEntryNames(liveArchive)
+	names, err := tarEntryNames(h, liveArchive)
 	if err != nil {
 		return fmt.Errorf("read tar entries: %w", err)
 	}
@@ -107,7 +107,7 @@ func testSnapshotPhysicalMake(h *TestHarness) error {
 		}
 	}
 
-	raw, err := readTarMember(liveArchive, "manifest.json")
+	raw, err := readTarMember(h, liveArchive, "manifest.json")
 	if err != nil {
 		return fmt.Errorf("read manifest: %w", err)
 	}
@@ -189,7 +189,7 @@ func testSnapshotPhysicalMake(h *TestHarness) error {
 	if coldArchive == liveArchive {
 		return fmt.Errorf("cold snapshot did not produce a new archive")
 	}
-	raw, err = readTarMember(coldArchive, "manifest.json")
+	raw, err = readTarMember(h, coldArchive, "manifest.json")
 	if err != nil {
 		return fmt.Errorf("read cold manifest: %w", err)
 	}
@@ -296,7 +296,7 @@ func testSnapshotLogicalRoundTrip(h *TestHarness) error {
 		return err
 	}
 	defer func() { _ = os.RemoveAll(offHost) }()
-	archiveCopy := filepath.Join(offHost, "snapshot.tar.zst")
+	archiveCopy := filepath.Join(offHost, "snapshot.tar.zst.age")
 	keyCopy := filepath.Join(offHost, "master.key")
 	if err := copyFileForTest(archivePath, archiveCopy); err != nil {
 		return fmt.Errorf("copy archive off host: %w", err)
@@ -384,7 +384,7 @@ func testSnapshotLogicalRoundTrip(h *TestHarness) error {
 // Snapshot filenames embed a sortable UTC timestamp, so lexical order is
 // chronological.
 func newestSnapshotArchive(dir string) (string, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, "snapshot-*.tar.zst"))
+	matches, err := filepath.Glob(filepath.Join(dir, "snapshot-*.tar.zst.age"))
 	if err != nil || len(matches) == 0 {
 		return "", fmt.Errorf("no snapshot archive found in %s (err %v)", dir, err)
 	}

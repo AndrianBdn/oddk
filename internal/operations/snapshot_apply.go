@@ -1,7 +1,6 @@
 package operations
 
 import (
-	"archive/tar"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,7 +15,6 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/klauspost/compress/zstd"
 	_ "modernc.org/sqlite"
 
 	"github.com/andrianbdn/oddk/internal/compression"
@@ -83,6 +81,10 @@ type SnapshotApplyPlan struct {
 	MasterKey    []byte
 	Instances    []*InstanceMeta
 	Checks       []PreflightCheck
+
+	// archives opens the snapshot (and is the restored deployment's
+	// compressor): built from MasterKey once, in preflight.
+	archives *compression.Compressor
 
 	// LogicalInputs holds, per logically captured instance, what its dumps
 	// declare (databases.json, the roles in globals.sql). Read in preflight so
@@ -163,11 +165,26 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 		plan.Checks = append(plan.Checks, PreflightCheck{Label: label, OK: true, Detail: detail})
 	}
 
-	// 1. Version compatibility, read from the archive's first member so this
-	//    costs kilobytes rather than the whole archive.
-	manifest, err := ReadSnapshotManifestFromArchive(params.ArchivePath)
+	// 1. The master key, then version compatibility. The manifest is the
+	//    archive's first member, so this costs kilobytes rather than the whole
+	//    archive — but it is inside the encryption, so the key comes first, and
+	//    a wrong key is refused here, naming the key the archive needs.
+	const keyCheck = "Master key opens the snapshot"
+	compressor, masterKey, err := ArchiveCompressorFromKeyFile(params.MasterKeyPath)
+	if err != nil {
+		return fail(keyCheck, "", err)
+	}
+	plan.MasterKey = masterKey
+	plan.archives = compressor
+	manifest, err := ReadSnapshotManifestFromArchive(compressor, params.ArchivePath)
+	if errors.Is(err, compression.ErrNotDecryptable) {
+		return fail(keyCheck, "", err)
+	}
 	if err != nil {
 		return fail("Snapshot is readable", "", fmt.Errorf("cannot read snapshot manifest: %w", err))
+	}
+	if encrypted, _ := compression.IsEncrypted(params.ArchivePath); encrypted {
+		pass(keyCheck, "key "+crypto.KeyID(masterKey))
 	}
 	plan.Manifest = manifest
 
@@ -261,7 +278,7 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 		return fail("Snapshot extracted", "", fmt.Errorf("create staging dir: %w", err))
 	}
 	plan.ExtractedDir = extractedDir
-	if err := compression.NewCompressor().ExtractTarZstd(ctx, params.ArchivePath, extractedDir); err != nil {
+	if err := compressor.ExtractTarZstd(ctx, params.ArchivePath, extractedDir); err != nil {
 		return fail("Snapshot extracted", "", fmt.Errorf("extract snapshot: %w", err))
 	}
 	snapshotDB := filepath.Join(extractedDir, snapshotStoreFile)
@@ -272,12 +289,9 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 
 	// 6. The master key must decrypt the snapshot's stored credentials.
 	//    Without it, apply would build clusters whose postgres password cannot
-	//    be recovered (globals.sql carries only the hash).
-	masterKey, err := crypto.ReadKeyFileAt(params.MasterKeyPath)
-	if err != nil {
-		return fail("Master key decrypts instance credentials", "", err)
-	}
-	plan.MasterKey = masterKey
+	//    be recovered (globals.sql carries only the hash). Step 1 proves the key
+	//    only for an encrypted archive; a plaintext one (ODDK <= 0.1.93) is
+	//    proved here.
 	if err := verifyMasterKeyAgainstSnapshot(snapshotDB, masterKey); err != nil {
 		return fail("Master key decrypts instance credentials", "", err)
 	}
@@ -368,43 +382,22 @@ func appendNoChanges(err error) error {
 }
 
 // ReadSnapshotManifestFromArchive streams the archive only as far as its
-// manifest, which MakeSnapshot writes first precisely so this is cheap.
-func ReadSnapshotManifestFromArchive(archivePath string) (*SnapshotManifest, error) {
-	f, err := os.Open(archivePath) // #nosec G304 - operator-supplied snapshot path
+// manifest, which MakeSnapshot writes first precisely so this is cheap. The
+// manifest is inside the encryption, so c must hold the archive's key.
+func ReadSnapshotManifestFromArchive(c *compression.Compressor, archivePath string) (*SnapshotManifest, error) {
+	// Bounded: a manifest is kilobytes; anything larger is not one.
+	data, err := c.ReadMember(archivePath, snapshotManifestFile, 8<<20)
+	if errors.Is(err, compression.ErrMemberNotFound) {
+		return nil, fmt.Errorf("%s not found in archive (is this an ODDK snapshot?)", snapshotManifestFile)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
-
-	zr, err := zstd.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("open zstd stream: %w", err)
+	var manifest SnapshotManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", snapshotManifestFile, err)
 	}
-	defer zr.Close()
-
-	tr := tar.NewReader(zr)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("%s not found in archive (is this an ODDK snapshot?)", snapshotManifestFile)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read archive: %w", err)
-		}
-		if hdr.Name != snapshotManifestFile {
-			continue
-		}
-		// Bounded: a manifest is kilobytes; anything larger is not one.
-		data, err := io.ReadAll(io.LimitReader(tr, 8<<20))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", snapshotManifestFile, err)
-		}
-		var manifest SnapshotManifest
-		if err := json.Unmarshal(data, &manifest); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", snapshotManifestFile, err)
-		}
-		return &manifest, nil
-	}
+	return &manifest, nil
 }
 
 // isVersionNewer reports whether semantic version a is newer than b. The bool
@@ -664,6 +657,7 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 		Store:     st,
 		Docker:    params.Docker,
 		MasterKey: plan.MasterKey,
+		Archives:  plan.archives,
 		DataDir:   params.DataDir,
 		BackupDir: params.BackupDir,
 	}

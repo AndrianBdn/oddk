@@ -70,7 +70,7 @@ func DownloadSnapshot(ctx context.Context, deps *Dependencies, id int, backupDir
 		return nil, operr.Invalidf("snapshot %d has an unusable remote location: %v", id, err)
 	}
 
-	size, digest, err := streamToLocalFileAtomic(ctx, s3Client, s3Client.RelativeKey(key), localPath, record.SHA256Str)
+	size, digest, err := streamToLocalFileAtomic(ctx, deps.Archives, s3Client, s3Client.RelativeKey(key), localPath, record.SHA256Str)
 	if err != nil {
 		logOffsiteFailure(deps, settings, "snapshot_download", record.Filename, err)
 		return nil, fmt.Errorf("download snapshot: %w", err)

@@ -261,8 +261,14 @@ func replaceFakeS3Object(h *TestHarness, location, payload string) error {
 	if err := os.WriteFile(filepath.Join(src, "manifest.json"), []byte(payload), 0o600); err != nil {
 		return err
 	}
-	archive := filepath.Join(dir, "substitute.tar.zst")
-	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, archive, nil); err != nil {
+	// Encrypted to the harness's own key, so it is a VALID archive this host
+	// can open — only the digest can tell it apart.
+	c, err := h.harnessCompressor()
+	if err != nil {
+		return err
+	}
+	archive := filepath.Join(dir, "substitute"+compression.EncryptedSuffix)
+	if _, err := c.CreateTarZstd(context.Background(), src, archive, nil); err != nil {
 		return fmt.Errorf("build substitute archive: %w", err)
 	}
 	b, err := os.ReadFile(archive) // #nosec G304 - test-controlled path

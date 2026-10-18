@@ -157,7 +157,12 @@ func RestoreDatabaseFromSnapshot(ctx context.Context, deps *Dependencies, params
 	}
 
 	// 3. Manifest: compatibility, and whether this instance's data is in here.
-	manifest, entry, err := readRestoreManifest(params.ArchivePath, source)
+	//    The keys come first: the manifest is inside the encryption.
+	compressor, sourceKey, err := restoreArchiveKeys(deps, params.MasterKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	manifest, entry, err := readRestoreManifest(compressor, params.ArchivePath, source)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +193,7 @@ func RestoreDatabaseFromSnapshot(ctx context.Context, deps *Dependencies, params
 	}
 	defer func() { _ = os.RemoveAll(extractedDir) }()
 
-	if err := compression.NewCompressor().ExtractTarZstdWith(ctx, params.ArchivePath, extractedDir, compression.ExtractOptions{
+	if err := compressor.ExtractTarZstdWith(ctx, params.ArchivePath, extractedDir, compression.ExtractOptions{
 		Keep:       restoreDatabaseMembers(source, physical),
 		WantSHA256: params.ExpectedSHA256,
 	}); err != nil {
@@ -216,14 +221,7 @@ func RestoreDatabaseFromSnapshot(ctx context.Context, deps *Dependencies, params
 	//    database. A logical entry IS one.
 	dumpTree := instanceDir
 	if physical {
-		masterKey := deps.MasterKey
-		if params.MasterKeyPath != "" {
-			masterKey, err = crypto.ReadKeyFileAt(params.MasterKeyPath)
-			if err != nil {
-				return nil, operr.Invalidf("read source master key: %v", err)
-			}
-		}
-		sourcePassword, err := snapshotInstancePassword(filepath.Join(extractedDir, snapshotStoreFile), source, masterKey)
+		sourcePassword, err := snapshotInstancePassword(filepath.Join(extractedDir, snapshotStoreFile), source, sourceKey)
 		if err != nil {
 			return nil, err
 		}
@@ -351,8 +349,8 @@ func refuseNewerSourceMajor(sourceVersion, targetVersion string) error {
 // manifest is the archive's first member, so all of this costs kilobytes.
 //
 // Whether a configuration-only entry is acceptable is the caller's call.
-func readRestoreManifest(archivePath, instanceName string) (*SnapshotManifest, SnapshotInstanceEntry, error) {
-	manifest, err := ReadSnapshotManifestFromArchive(archivePath)
+func readRestoreManifest(c *compression.Compressor, archivePath, instanceName string) (*SnapshotManifest, SnapshotInstanceEntry, error) {
+	manifest, err := ReadSnapshotManifestFromArchive(c, archivePath)
 	if err != nil {
 		return nil, SnapshotInstanceEntry{}, operr.Invalidf("cannot read snapshot manifest: %v", err)
 	}

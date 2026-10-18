@@ -11,6 +11,47 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.94 — 2026-10-17
+
+### Added
+
+- **Archives are encrypted at rest.** Every snapshot, legacy backup and
+  pre-upgrade backup is now written as `.tar.zst.age`: [age](https://age-encryption.org)
+  with a post-quantum hybrid key (ML-KEM-768 + X25519) derived from `master.key`.
+  Someone who can read the backup directory or the offsite bucket but does not
+  have `master.key` learns nothing about the contents, not even instance names.
+  There is no new secret: restore and apply use the `--master-key` they already
+  take. There is no setting to turn it off.
+- **A wrong master key is refused before anything changes,** and the error names
+  the key the archive needs: the checksum that ends its `master.key` line.
+  `snapshot apply` now checks the key first, before any other preflight step.
+- **`oddk snapshot decrypt`** writes the plain `.tar.zst` out of an encrypted
+  archive (verified first, mode 0600). With `--print-age-identity` it prints the
+  derived age secret instead, so the stock `age` CLI can decrypt with no ODDK
+  installed. It runs locally; no daemon needed.
+
+### Changed
+
+- Archives written before this release keep their `.tar.zst` name and stay
+  restorable through every path, unchanged.
+- An `--s3-uri` download that this host cannot decrypt is now discarded, because
+  it cannot be verified, rather than kept for a retry. Supply the source's
+  `--master-key` and the retry downloads it again.
+- A legacy `backup restore` of a backup written on **another** host is refused:
+  backups have no `--master-key`. Snapshots are the cross-host path.
+
+**Action:** without `master.key`, archives from this release on cannot be
+restored or read. Confirm now that `master.key` is backed up somewhere other
+than this host and its bucket.
+
+**Action:** ODDK versions before 0.1.94 cannot read the new archives. Install
+this release or later on any host you would restore or apply to.
+
+**Action (optional):** archives already in your bucket stay **unencrypted**
+until retention prunes them. To be rid of them sooner, delete them once a newer
+encrypted *complete* snapshot exists (`oddk snapshot list`,
+`oddk snapshot remove-remote <id>`).
+
 ## v0.1.93 — 2026-09-30
 
 ### Fixed
@@ -490,6 +531,8 @@ commit whose subject describes the change.
 
 - **v0.1.60** (2026-07-31) — `master.key` became a self-describing single line
   (`ODDK-SECRET-MASTER-KEY;V1;…`), upgraded in place on first start. The old
-  bare-base64 format is still read. Also added
+  bare-base64 format is still read. ODDK <= 0.1.59 cannot read the new format,
+  so that first start saves the previous file as `master.key.pre-v1`: to roll
+  the binary back, restore it with `mv master.key.pre-v1 master.key`. Also added
   `oddk snapshot migrate-from-backups` for moving a deployment off per-instance
   backup schedules.

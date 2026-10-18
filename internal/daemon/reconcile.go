@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/docker"
 	"github.com/andrianbdn/oddk/internal/operations"
 	"github.com/andrianbdn/oddk/internal/store"
@@ -225,7 +226,7 @@ func sweepBackupDir(st *store.Store, backupDir string) {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".tar.zst") || referenced[name] {
+		if entry.IsDir() || !compression.HasArchiveSuffix(name) || referenced[name] {
 			continue
 		}
 		if strings.HasPrefix(name, operations.SnapshotFilePrefix) {

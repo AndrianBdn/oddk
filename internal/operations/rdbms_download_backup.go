@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -62,7 +63,7 @@ func DownloadBackup(ctx context.Context, deps *Dependencies, params DownloadBack
 	// REPORTS unreferenced archives — it never deletes them, precisely because
 	// one might be a file an operator parked there for 'backup restore --file'.
 	// The stored key includes the configured bucket path; the client re-adds it.
-	written, digest, err := streamToLocalFileAtomic(ctx, s3Client, s3Client.RelativeKey(s3Key), localPath, backup.SHA256Str)
+	written, digest, err := streamToLocalFileAtomic(ctx, deps.Archives, s3Client, s3Client.RelativeKey(s3Key), localPath, backup.SHA256Str)
 	if err != nil {
 		return nil, err
 	}
@@ -178,8 +179,16 @@ func streamToLocalFile(ctx context.Context, s3Client *s3service.Client, key, loc
 // key that now holds a different deployment's upload under the same name — and
 // restoring it would report success with somebody else's data. Empty means the
 // row predates migration 022, so there is nothing to compare against.
-func verifyDownloadedArchive(ctx context.Context, path, wantSHA256 string) (string, error) {
-	verified, err := compression.NewCompressor().VerifyTarZstdDigest(ctx, path)
+//
+// c must hold the archive's key: verification decrypts. An archive no key in c
+// opens is refused like any other unverifiable download.
+func verifyDownloadedArchive(ctx context.Context, c *compression.Compressor, path, wantSHA256 string) (string, error) {
+	verified, err := c.VerifyTarZstdDigest(ctx, path)
+	if errors.Is(err, compression.ErrNotDecryptable) {
+		// Not damage: the copy may be fine, it is our key that cannot open it.
+		// Kept bytes nobody could verify would be reused unverified later.
+		return "", fmt.Errorf("the downloaded archive was discarded because it could not be verified: %w", err)
+	}
 	if err != nil {
 		return "", fmt.Errorf("the downloaded archive failed verification and was discarded (%w); "+
 			"re-run the download, and if it fails again the copy in the bucket is damaged", err)

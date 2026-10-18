@@ -179,7 +179,7 @@ func newSnapshotFetchClient(ctx context.Context, deps *Dependencies, spec *Remot
 // wantSHA256 is the catalogue row's recorded digest ("" when unknown); the
 // download is refused if the verified copy does not match it. Returns the
 // byte count and the copy's digest.
-func streamToLocalFileAtomic(ctx context.Context, s3Client *s3service.Client, key, localPath, wantSHA256 string) (int64, string, error) {
+func streamToLocalFileAtomic(ctx context.Context, c *compression.Compressor, s3Client *s3service.Client, key, localPath, wantSHA256 string) (int64, string, error) {
 	tmpPath := filepath.Join(filepath.Dir(localPath), ".tmp-s3-download-"+filepath.Base(localPath))
 	written, err := streamToLocalFile(ctx, s3Client, key, tmpPath)
 	if err != nil {
@@ -188,7 +188,7 @@ func streamToLocalFileAtomic(ctx context.Context, s3Client *s3service.Client, ke
 	// Verified BEFORE the rename, so a corrupt download never reaches a name
 	// that reads as a real archive — the same ordering writeVerifiedArchive uses
 	// on the way out.
-	digest, err := verifyDownloadedArchive(ctx, tmpPath, wantSHA256)
+	digest, err := verifyDownloadedArchive(ctx, c, tmpPath, wantSHA256)
 	if err != nil {
 		_ = os.Remove(tmpPath)
 		return 0, "", err
@@ -241,11 +241,12 @@ type FetchResult struct {
 //
 // uri is the operator's original s3:// form, used verbatim in messages (key
 // may have had a configured bucket path stripped for the client to re-add).
-func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key, destDir string, progress io.Writer) (*FetchResult, error) {
+// c verifies the download, so it must hold the archive's key.
+func FetchRemoteSnapshot(ctx context.Context, c *compression.Compressor, client *s3service.Client, uri, key, destDir string, progress io.Writer) (*FetchResult, error) {
 	bucket, _, _ := s3service.ParseS3URI(uri)
 	name := path.Base(key)
-	if !strings.HasSuffix(name, ".tar.zst") || name == ".tar.zst" {
-		return nil, operr.Invalidf("%s does not name a .tar.zst archive; find one with 'oddk snapshot list-remote s3://%s'", uri, bucket)
+	if !compression.HasArchiveSuffix(name) || name == compression.PlainSuffix || name == compression.EncryptedSuffix {
+		return nil, operr.Invalidf("%s does not name a snapshot archive (.tar.zst.age, or .tar.zst before 0.1.94); find one with 'oddk snapshot list-remote s3://%s'", uri, bucket)
 	}
 
 	info, err := client.StatFile(ctx, key)
@@ -277,8 +278,8 @@ func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key
 	emitLine(progress, "Downloading %s (%s)...", uri, humanBytes(size))
 	tmpPath := filepath.Join(destDir, ".tmp-"+name)
 	// 0600 for the same reason writeVerifiedArchive chmods its temp file: the
-	// archive holds every database's contents and the role password hashes, and
-	// is not encrypted by the master key. os.Create's 0666&^umask would publish
+	// archive holds every database's contents and the role password hashes —
+	// in the clear, if it predates 0.1.94. os.Create's 0666&^umask would publish
 	// it world-readable into a downloads area that survives for seven days.
 	tmpFile, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 - path is constructed from safe components
 	if err != nil {
@@ -303,8 +304,11 @@ func FetchRemoteSnapshot(ctx context.Context, client *s3service.Client, uri, key
 	emitLine(progress, "Verifying %s...", name)
 	// No expected digest: an --s3-uri fetch is by definition not tied to a
 	// catalogue row (a URI that IS one is routed through DownloadSnapshot).
-	if _, err := verifyDownloadedArchive(ctx, tmpPath, ""); err != nil {
+	if _, err := verifyDownloadedArchive(ctx, c, tmpPath, ""); err != nil {
 		_ = os.Remove(tmpPath)
+		if errors.Is(err, compression.ErrNotDecryptable) {
+			return nil, fmt.Errorf("%w. If it came from another deployment, supply that deployment's master.key", err)
+		}
 		return nil, err
 	}
 	// Invalidate any stale sidecar before the archive lands: a crash between
@@ -440,6 +444,11 @@ type RestoreArchiveSource struct {
 	ArchivePath string              // a path on this host's filesystem
 	SnapshotID  int                 // a row in this host's snapshot catalogue
 	Remote      *RemoteSnapshotSpec // an s3:// object, possibly foreign
+
+	// MasterKeyPath is a foreign archive's master key (--master-key), on the
+	// daemon's filesystem. A Remote fetch is verified as it lands, which for
+	// an encrypted archive needs its key.
+	MasterKeyPath string
 }
 
 // Archive origin kinds, reported to the operator.
@@ -519,11 +528,15 @@ func ResolveRestoreInstanceArchive(ctx context.Context, deps *Dependencies, src 
 			return resolveCatalogueArchive(ctx, deps, record.ID, backupDir, progress)
 		}
 
+		compressor, _, err := restoreArchiveKeys(deps, src.MasterKeyPath)
+		if err != nil {
+			return "", false, nil, err
+		}
 		client, key, source, err := newSnapshotFetchClient(ctx, deps, src.Remote)
 		if err != nil {
 			return "", false, nil, err
 		}
-		fetch, err := FetchRemoteSnapshot(ctx, client, src.Remote.URI, key, SnapshotDownloadsDir(backupDir), progress)
+		fetch, err := FetchRemoteSnapshot(ctx, compressor, client, src.Remote.URI, key, SnapshotDownloadsDir(backupDir), progress)
 		if err != nil {
 			return "", false, nil, err
 		}
@@ -630,10 +643,17 @@ func ListRemoteSnapshots(ctx context.Context, client *s3service.Client, bucket, 
 // Every failure ends with the no-changes reassurance, matching preflight
 // refusals — the download is additive and nothing of ODDK's state has been
 // touched.
-func FetchSnapshotForApply(ctx context.Context, spec *RemoteSnapshotSpec, backupDir string, progress io.Writer) (*FetchResult, error) {
+//
+// masterKeyPath is apply's --master-key: the download is verified as it lands,
+// which for an encrypted archive needs its key.
+func FetchSnapshotForApply(ctx context.Context, spec *RemoteSnapshotSpec, masterKeyPath, backupDir string, progress io.Writer) (*FetchResult, error) {
 	bucket, key, err := s3service.ParseS3URI(spec.URI)
 	if err != nil {
 		return nil, appendNoChanges(fmt.Errorf("invalid s3 URI: %w", err))
+	}
+	compressor, _, err := ArchiveCompressorFromKeyFile(masterKeyPath)
+	if err != nil {
+		return nil, appendNoChanges(err)
 	}
 
 	client, err := s3service.NewClientAmbient(ctx, s3service.Target{
@@ -650,7 +670,7 @@ func FetchSnapshotForApply(ctx context.Context, spec *RemoteSnapshotSpec, backup
 		))
 	}
 
-	fetch, err := FetchRemoteSnapshot(ctx, client, spec.URI, key, SnapshotDownloadsDir(backupDir), progress)
+	fetch, err := FetchRemoteSnapshot(ctx, compressor, client, spec.URI, key, SnapshotDownloadsDir(backupDir), progress)
 	if err != nil {
 		return nil, appendNoChanges(err)
 	}

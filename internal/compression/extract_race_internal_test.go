@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+func testCompressor(t *testing.T) *Compressor {
+	t.Helper()
+	return NewCompressor(KeyForTest(t, 1))
+}
+
 // buildTestArchive writes a one-member archive whose manifest.json says body.
 func buildTestArchive(t *testing.T, dir, name, body string) (path, digest string) {
 	t.Helper()
@@ -22,8 +27,8 @@ func buildTestArchive(t *testing.T, dir, name, body string) (path, digest string
 	if err := os.WriteFile(filepath.Join(src, "manifest.json"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	path = filepath.Join(dir, name+".tar.zst")
-	if _, err := NewCompressor().CreateTarZstd(context.Background(), src, path, nil); err != nil {
+	path = filepath.Join(dir, name+EncryptedSuffix)
+	if _, err := testCompressor(t).CreateTarZstd(context.Background(), src, path, nil); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -54,7 +59,7 @@ func TestExtract_RenameOverPathAfterVerifyExtractsTheVerifiedArchive(t *testing.
 		}
 	})
 	dest := filepath.Join(dir, "out")
-	if err := NewCompressor().ExtractTarZstdWith(context.Background(), archive, dest, ExtractOptions{WantSHA256: digest}); err != nil {
+	if err := testCompressor(t).ExtractTarZstdWith(context.Background(), archive, dest, ExtractOptions{WantSHA256: digest}); err != nil {
 		t.Fatalf("extract: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(dest, "manifest.json"))
@@ -83,7 +88,7 @@ func TestExtract_InPlaceRewriteAfterVerifyIsRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	err = NewCompressor().ExtractTarZstdWith(context.Background(), archive, filepath.Join(dir, "out"),
+	err = testCompressor(t).ExtractTarZstdWith(context.Background(), archive, filepath.Join(dir, "out"),
 		ExtractOptions{WantSHA256: digest})
 	if !errors.Is(err, ErrArchiveChanged) {
 		t.Fatalf("an archive rewritten in place after verification was not refused: %v", err)
@@ -105,7 +110,7 @@ func TestExtract_InPlaceRewriteRefusedWithoutDigest(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	err = NewCompressor().ExtractTarZstd(context.Background(), archive, filepath.Join(dir, "out"))
+	err = testCompressor(t).ExtractTarZstd(context.Background(), archive, filepath.Join(dir, "out"))
 	if !errors.Is(err, ErrArchiveChanged) {
 		t.Fatalf("in-place rewrite not refused without a digest: %v", err)
 	}
@@ -131,8 +136,8 @@ func buildRandomArchive(t *testing.T, dir, name string, seed int64) string {
 	if err := os.Chtimes(filepath.Join(src, "data.bin"), fixed, fixed); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, name+".tar.zst")
-	if _, err := NewCompressor().CreateTarZstd(context.Background(), src, path, nil); err != nil {
+	path := filepath.Join(dir, name+EncryptedSuffix)
+	if _, err := testCompressor(t).CreateTarZstd(context.Background(), src, path, nil); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -170,7 +175,7 @@ func TestExtract_SameLengthRewriteWithRestoredMtimeIsRefused(t *testing.T) {
 			t.Fatalf("fixture: size/mtime not preserved (%v, %v)", after, err)
 		}
 	})
-	err = NewCompressor().ExtractTarZstd(context.Background(), archive, filepath.Join(dir, "out"))
+	err = testCompressor(t).ExtractTarZstd(context.Background(), archive, filepath.Join(dir, "out"))
 	if !errors.Is(err, ErrArchiveChanged) {
 		t.Fatalf("a same-length rewrite with its mtime restored was not refused: %v", err)
 	}

@@ -113,8 +113,14 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 
 	// 1. Manifest first — it is the archive's first member, so compatibility and
 	//    "is this instance even in here" cost kilobytes rather than the whole
-	//    archive. Same reasoning as PreflightSnapshotApply.
-	manifest, entry, err := readRestoreManifest(params.ArchivePath, params.InstanceName)
+	//    archive. Same reasoning as PreflightSnapshotApply. The keys come
+	//    before it, because the manifest is inside the encryption: the live
+	//    host's key for its own snapshot, --master-key for one from elsewhere.
+	compressor, sourceKey, err := restoreArchiveKeys(deps, params.MasterKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	manifest, entry, err := readRestoreManifest(compressor, params.ArchivePath, params.InstanceName)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +170,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 	}
 	defer func() { _ = os.RemoveAll(extractedDir) }()
 
-	if err := compression.NewCompressor().ExtractTarZstdWith(ctx, params.ArchivePath, extractedDir,
+	if err := compressor.ExtractTarZstdWith(ctx, params.ArchivePath, extractedDir,
 		compression.ExtractOptions{WantSHA256: params.ExpectedSHA256}); err != nil {
 		return nil, classifyExtractError("extract snapshot", err)
 	}
@@ -191,19 +197,11 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		)
 	}
 
-	// 5. Resolve the key that decrypts the SNAPSHOT's stored credential. The
-	//    live host's key is the right default (restoring this host's own
-	//    snapshot); a snapshot from elsewhere needs its own key supplied.
-	masterKey := deps.MasterKey
-	if params.MasterKeyPath != "" {
-		masterKey, err = crypto.ReadKeyFileAt(params.MasterKeyPath)
-		if err != nil {
-			return nil, operr.Invalidf("read source master key: %v", err)
-		}
-	}
-
+	// 5. Decrypt the SNAPSHOT's stored credential with the source key resolved
+	//    in step 1: the live host's for its own snapshot, the supplied one for
+	//    a snapshot from elsewhere.
 	snapshotDB := filepath.Join(extractedDir, snapshotStoreFile)
-	password, err := snapshotInstancePassword(snapshotDB, params.InstanceName, masterKey)
+	password, err := snapshotInstancePassword(snapshotDB, params.InstanceName, sourceKey)
 	if err != nil {
 		return nil, err
 	}

@@ -83,7 +83,7 @@ func TestFetchRemoteSnapshot(t *testing.T) {
 	// provenance sidecar exists to catch. The ETag varies with path+content,
 	// like a real object store's would.
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/b/snap/x.tar.zst" && r.URL.Path != "/b/other/x.tar.zst" {
+		if r.URL.Path != "/b/snap/x.tar.zst.age" && r.URL.Path != "/b/other/x.tar.zst.age" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -105,7 +105,7 @@ func TestFetchRemoteSnapshot(t *testing.T) {
 	ctx := context.Background()
 
 	// Fresh download: final file present with the right bytes, no temp left.
-	res, err := FetchRemoteSnapshot(ctx, client, "s3://b/snap/x.tar.zst", "snap/x.tar.zst", destDir, nil)
+	res, err := FetchRemoteSnapshot(ctx, testCompressor(t), client, "s3://b/snap/x.tar.zst.age", "snap/x.tar.zst.age", destDir, nil)
 	if err != nil {
 		t.Fatalf("FetchRemoteSnapshot: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestFetchRemoteSnapshot(t *testing.T) {
 	if err := os.Chtimes(res.Path, old, old); err != nil {
 		t.Fatal(err)
 	}
-	res2, err := FetchRemoteSnapshot(ctx, client, "s3://b/snap/x.tar.zst", "snap/x.tar.zst", destDir, nil)
+	res2, err := FetchRemoteSnapshot(ctx, testCompressor(t), client, "s3://b/snap/x.tar.zst.age", "snap/x.tar.zst.age", destDir, nil)
 	if err != nil {
 		t.Fatalf("cached fetch: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestFetchRemoteSnapshot(t *testing.T) {
 	// A DIFFERENT URI whose object shares the basename and the size must NOT
 	// be served from the cache — the sidecar's URI/ETag mismatch forces a real
 	// download. Reusing here would silently restore the wrong deployment.
-	resOther, err := FetchRemoteSnapshot(ctx, client, "s3://b/other/x.tar.zst", "other/x.tar.zst", destDir, nil)
+	resOther, err := FetchRemoteSnapshot(ctx, testCompressor(t), client, "s3://b/other/x.tar.zst.age", "other/x.tar.zst.age", destDir, nil)
 	if err != nil {
 		t.Fatalf("impostor fetch: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestFetchRemoteSnapshot(t *testing.T) {
 	// Different size: replaced atomically, no refusal — everything in the
 	// downloads area is re-fetchable by construction.
 	content = tinyArchiveBytes(t, strings.Repeat("v2-payload", 512))
-	res3, err := FetchRemoteSnapshot(ctx, client, "s3://b/snap/x.tar.zst", "snap/x.tar.zst", destDir, nil)
+	res3, err := FetchRemoteSnapshot(ctx, testCompressor(t), client, "s3://b/snap/x.tar.zst.age", "snap/x.tar.zst.age", destDir, nil)
 	if err != nil {
 		t.Fatalf("replacing fetch: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestFetchRemoteSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	failGet = true
-	if _, err := FetchRemoteSnapshot(ctx, client, "s3://b/snap/x.tar.zst", "snap/x.tar.zst", destDir, nil); err == nil {
+	if _, err := FetchRemoteSnapshot(ctx, testCompressor(t), client, "s3://b/snap/x.tar.zst.age", "snap/x.tar.zst.age", destDir, nil); err == nil {
 		t.Fatal("expected the failed stream to error")
 	}
 	if _, err := os.Stat(res3.Path); !os.IsNotExist(err) {
@@ -193,19 +193,20 @@ func TestFetchRemoteSnapshotRefusals(t *testing.T) {
 	destDir := t.TempDir()
 
 	// A key that is not an archive refuses before any network round-trip.
-	_, err := FetchRemoteSnapshot(context.Background(), client, "s3://b/snap/readme.txt", "snap/readme.txt", destDir, nil)
+	_, err := FetchRemoteSnapshot(context.Background(), testCompressor(t), client, "s3://b/snap/readme.txt", "snap/readme.txt", destDir, nil)
 	if err == nil || !strings.Contains(err.Error(), ".tar.zst") {
 		t.Errorf("non-archive key: got %v, want a .tar.zst refusal", err)
 	}
 
 	// A missing object names the listing command that finds real ones.
-	_, err = FetchRemoteSnapshot(context.Background(), client, "s3://b/snap/missing.tar.zst", "snap/missing.tar.zst", destDir, nil)
+	_, err = FetchRemoteSnapshot(context.Background(), testCompressor(t), client, "s3://b/snap/missing.tar.zst", "snap/missing.tar.zst", destDir, nil)
 	if err == nil || !strings.Contains(err.Error(), "list-remote") {
 		t.Errorf("missing object: got %v, want a list-remote hint", err)
 	}
 }
 
-// tinyArchiveBytes builds a real, verifiable .tar.zst holding one member.
+// tinyArchiveBytes builds a real, verifiable archive holding one member,
+// encrypted to testMasterKey as production writes it.
 func tinyArchiveBytes(t *testing.T, payload string) []byte {
 	t.Helper()
 	dir := t.TempDir()
@@ -216,8 +217,8 @@ func tinyArchiveBytes(t *testing.T, payload string) []byte {
 	if err := os.WriteFile(filepath.Join(src, "manifest.json"), []byte(payload), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out := filepath.Join(dir, "a.tar.zst")
-	if _, err := compression.NewCompressor().CreateTarZstd(context.Background(), src, out, nil); err != nil {
+	out := filepath.Join(dir, "a"+compression.EncryptedSuffix)
+	if _, err := testCompressor(t).CreateTarZstd(context.Background(), src, out, nil); err != nil {
 		t.Fatalf("build fixture archive: %v", err)
 	}
 	b, err := os.ReadFile(out) // #nosec G304 - test-controlled path
@@ -237,7 +238,7 @@ func TestFetchRemoteSnapshot_RefusesCorruptDownload(t *testing.T) {
 	corrupt[len(corrupt)/2] ^= 0x01
 
 	client := newFetchStubClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/b/snap/x.tar.zst" {
+		if r.URL.Path != "/b/snap/x.tar.zst.age" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -252,7 +253,7 @@ func TestFetchRemoteSnapshot_RefusesCorruptDownload(t *testing.T) {
 	})
 	destDir := filepath.Join(t.TempDir(), "downloads")
 
-	res, err := FetchRemoteSnapshot(context.Background(), client, "s3://b/snap/x.tar.zst", "snap/x.tar.zst", destDir, nil)
+	res, err := FetchRemoteSnapshot(context.Background(), testCompressor(t), client, "s3://b/snap/x.tar.zst.age", "snap/x.tar.zst.age", destDir, nil)
 	if err == nil {
 		t.Fatalf("a corrupt download was accepted and landed at %s", res.Path)
 	}

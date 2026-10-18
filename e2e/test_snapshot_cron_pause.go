@@ -96,7 +96,7 @@ func testSnapshotCronPause(h *TestHarness) error {
 	// nothing has run in this slot, so the pause is the ONLY thing that can be
 	// holding it back.
 	time.Sleep(20 * time.Second)
-	archives, _ := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst"))
+	archives, _ := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst.age"))
 	if len(archives) != 0 {
 		return fmt.Errorf("a PAUSED schedule fired anyway (%d archive(s)) — force-run must not defeat the pause", len(archives))
 	}
@@ -125,12 +125,12 @@ func testSnapshotCronPause(h *TestHarness) error {
 func waitForSnapshotArchives(backupDir string, want int, within time.Duration) error {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
-		archives, _ := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst"))
+		archives, _ := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst.age"))
 		if len(archives) >= want {
 			return nil
 		}
 		time.Sleep(1 * time.Second)
 	}
-	archives, _ := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst"))
+	archives, _ := filepath.Glob(filepath.Join(backupDir, "snapshot-*.tar.zst.age"))
 	return fmt.Errorf("expected at least %d snapshot archive(s) within %s, have %d", want, within, len(archives))
 }
