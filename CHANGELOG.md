@@ -11,6 +11,34 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.96 — 2026-11-05
+
+### Fixed
+
+- **`oddk snapshot apply` no longer refuses an instance recorded with more CPU
+  or RAM than the target host has.** An instance keeps its size when its host
+  is resized down, so a host could not restore its own snapshot onto an
+  identical machine ("requested RAM (8192 MB) exceeds available memory"). Apply
+  now restores such an instance at what the host provides, builds its container
+  (memory limit, `shm_size`, memory-derived parameters) from that size, and
+  records it in `oddk.db`. Preflight reports it:
+  `✓ Host can run the recorded instance sizes (qasphere: 8192 → 7762 MB to fit this host)`.
+  `snapshot restore-instance` does the same and reports it on a `Resized:`
+  line (and as `resized` in `--json`). Snapshots written by earlier
+  versions apply as they are.
+- A parameter group that sets memory explicitly (for example `shared_buffers`)
+  and does not fit the instance's RAM is now refused in preflight, before
+  `oddk.db` and `master.key` are replaced, when the archive carries the group's
+  definition (every snapshot does unless the group was unreadable at capture).
+  It used to fail once the destructive phase had begun.
+
+### Added
+
+- **`oddk checklist` flags an instance sized above its host**, which is how the
+  apply refusal above used to arise. Lower it with
+  `oddk instance apply <name> --cpu <cores> --ram <MB>M`; both values are
+  checked against the host.
+
 ## v0.1.95 — 2026-11-05
 
 ### Added

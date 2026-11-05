@@ -70,6 +70,11 @@ type RestoreInstanceResult struct {
 	RAMMB      int       `json:"ramMb"`
 	Image      string    `json:"image"`
 
+	// Resized describes how the recorded size was fitted to this host (for
+	// example "8192 → 7762 MB"); empty when it fit as recorded. CPUCores and
+	// RAMMB are the fitted values.
+	Resized string `json:"resized,omitempty"`
+
 	// PasswordChanged reports that the instance's stored postgres password was
 	// replaced by the snapshot's. This is not optional and not a side effect to
 	// hide: globals.sql sets the postgres role to the SOURCE's hash, so the only
@@ -209,8 +214,11 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 
 	// 6. Remaining read-only guards, cheapest last because each needs the
 	//    extracted tree. All of them refuse before anything is destroyed.
+	//    A recorded size larger than this host is fitted down, not refused;
+	//    the row written below takes the fitted size from meta.
 	metas := []*InstanceMeta{meta}
-	if err := checkHostResources(metas); err != nil {
+	resized, err := fitToHost(metas)
+	if err != nil {
 		return nil, err
 	}
 	if err := checkRestorePortFree(deps, meta, existing); err != nil {
@@ -249,16 +257,24 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 				meta.ParameterGroup, groupErr)
 		}
 		parameterGroup = group
-	} else if exists, existsErr := deps.Store.Parameters.GroupExists(meta.ParameterGroup); existsErr == nil && !exists {
-		// The container is built from the INLINED definition, but the instance
-		// row stores only the group's NAME. If this host has no group by that
-		// name the row points at nothing: 'oddk parameters get' cannot show it
-		// and a later 'instance apply'/reconfigure fails. Materialise the
-		// snapshot's definition under that name so the row and reality agree.
-		if err := deps.Store.Parameters.CreateGroup(meta.ParameterGroup, parameterGroup.Parameters); err != nil {
-			return nil, fmt.Errorf("materialise parameter group %q from the snapshot: %w", meta.ParameterGroup, err)
+	}
+	// Against the RAM fitted above, before the group is materialised here.
+	if err := checkParameterGroupFits(meta, parameterGroup); err != nil {
+		return nil, err
+	}
+	if meta.ParameterGroupDefinition != nil {
+		if exists, existsErr := deps.Store.Parameters.GroupExists(meta.ParameterGroup); existsErr == nil && !exists {
+			// The container is built from the INLINED definition, but the
+			// instance row stores only the group's NAME. If this host has no
+			// group by that name the row points at nothing: 'oddk parameters
+			// get' cannot show it and a later 'instance apply'/reconfigure
+			// fails. Materialise the snapshot's definition under that name so
+			// the row and reality agree.
+			if err := deps.Store.Parameters.CreateGroup(meta.ParameterGroup, parameterGroup.Parameters); err != nil {
+				return nil, fmt.Errorf("materialise parameter group %q from the snapshot: %w", meta.ParameterGroup, err)
+			}
+			emitLine(params.Progress, "  ✓ Parameter group %q restored from the snapshot", meta.ParameterGroup)
 		}
-		emitLine(params.Progress, "  ✓ Parameter group %q restored from the snapshot", meta.ParameterGroup)
 	}
 
 	// 8. Re-encrypt under THIS host's key before writing anything. The
@@ -283,6 +299,7 @@ func RestoreInstanceFromSnapshot(ctx context.Context, deps *Dependencies, params
 		CPUCores:        meta.CPUCores,
 		RAMMB:           meta.RAMMB,
 		Image:           meta.Image,
+		Resized:         resizedChange(resized),
 		PasswordChanged: true,
 		Format:          entryFormat(entry),
 		FinalStatus:     "running",
@@ -555,4 +572,13 @@ func entrySkipReason(entry SnapshotInstanceEntry) string {
 		return "no reason recorded"
 	}
 	return entry.SkipReason
+}
+
+// resizedChange is the one instance's fit in resized, or "" when it was not
+// resized.
+func resizedChange(resized []ResizedInstance) string {
+	if len(resized) == 0 {
+		return ""
+	}
+	return resized[0].Change()
 }

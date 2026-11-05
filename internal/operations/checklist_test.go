@@ -153,3 +153,21 @@ func TestCollectSnapshotsSkipsCopylessNewest(t *testing.T) {
 		t.Errorf("copies = %+v, want 1 local-only (surviving) and 1 with no copies", out.Copies)
 	}
 }
+
+func TestExceedsHost(t *testing.T) {
+	tests := []struct {
+		cpu, ram int
+		want     string
+	}{
+		{2, 7762, ""},
+		{1, 512, ""},
+		{2, 8192, "8192 MB RAM (this host has 7762 MB)"},
+		{4, 2048, "4 CPU (this host has 2)"},
+		{4, 8192, "8192 MB RAM (this host has 7762 MB) and 4 CPU (this host has 2)"},
+	}
+	for _, tc := range tests {
+		if got := exceedsHost(tc.cpu, tc.ram, 2, 7762); got != tc.want {
+			t.Errorf("exceedsHost(%d, %d) = %q, want %q", tc.cpu, tc.ram, got, tc.want)
+		}
+	}
+}

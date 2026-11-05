@@ -27,7 +27,7 @@ func hermeticAWSEnv(t *testing.T) {
 }
 
 const restoreInstanceResponse = `{"instance":"app","created":false,"replaced":true,` +
-	`"databases":1,"port":5432,"cpuCores":1,"ramMb":1024,"image":"postgres:17",` +
+	`"databases":1,"port":5432,"cpuCores":1,"ramMb":7762,"image":"postgres:17","resized":"8192 → 7762 MB",` +
 	`"passwordChanged":true,"format":"physical","finalStatus":"running"}`
 
 // captureRestoreInstanceBody returns a fake daemon that records the decoded
@@ -59,6 +59,11 @@ func TestRestoreInstanceByIDSendsCatalogueID(t *testing.T) {
 	out, err := runCLI(t, env, "snapshot", "restore-instance", "--instance", "app", "--id", "7", "--yes")
 	if err != nil {
 		t.Fatalf("restore-instance --id: %v\n%s", err, out)
+	}
+	// The daemon's progress never reaches the CLI, so the fit must be in the
+	// result to be seen at all.
+	if !strings.Contains(out, "Resized:   8192 → 7762 MB to fit this host") {
+		t.Errorf("output does not report the fit to this host:\n%s", out)
 	}
 	if body["snapshotId"] != float64(7) {
 		t.Errorf("snapshotId = %v, want 7", body["snapshotId"])

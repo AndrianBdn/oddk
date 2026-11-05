@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/instances"
 	notificationstore "github.com/andrianbdn/oddk/internal/store/notifications"
+	"github.com/andrianbdn/oddk/internal/store/parameters"
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
 	"github.com/andrianbdn/oddk/internal/util"
 	"github.com/andrianbdn/oddk/internal/version"
@@ -100,6 +102,11 @@ type SnapshotApplyPlan struct {
 	// PulledImages lists images preflight fetched onto this host. Recorded so
 	// the summary can be honest that preflight was not purely read-only.
 	PulledImages []string
+
+	// Resized lists the instances whose recorded size preflight fitted to this
+	// host. Instances already carries the fitted sizes; the destructive phase
+	// writes them into the restored oddk.db.
+	Resized []ResizedInstance
 
 	params *SnapshotApplyParams
 }
@@ -327,14 +334,36 @@ func PreflightSnapshotApply(ctx context.Context, params *SnapshotApplyParams) (*
 	}
 	plan.Instances = instances
 
-	// 8. This host must be able to run the recorded sizes. The values are not
-	//    just cgroup limits: RAMMB drives shared_buffers and shm_size, so a
-	//    smaller DR host would build a container PostgreSQL cannot start in —
-	//    and would discover it only after the destructive phase.
-	if err := checkHostResources(instances); err != nil {
-		return fail("Host can run the recorded instance sizes", "", err)
+	// 8. This host must be able to run the instances. The sizes are not just
+	//    cgroup limits: RAMMB drives shared_buffers and shm_size. A recorded
+	//    size larger than this host is fitted down rather than refused (an
+	//    instance keeps its size when its host shrinks), and the restored
+	//    oddk.db records the fitted size. What cannot be fitted is a parameter
+	//    group that sets memory explicitly, so each one is checked against the
+	//    fitted RAM here rather than at container create, after the
+	//    destructive phase. A group the archive did not inline (it was
+	//    unreadable at capture) is only known at rebuild time, where
+	//    CreateContainer checks it.
+	const sizeCheck = "Host can run the recorded instance sizes"
+	resized, err := fitToHost(instances)
+	if err != nil {
+		return fail(sizeCheck, "", err)
 	}
-	pass("Host can run the recorded instance sizes", resourceSummary(instances))
+	plan.Resized = resized
+	for _, meta := range instances {
+		entry, _ := snapshotEntry(manifest, meta.Name)
+		if !entry.HasData || meta.ParameterGroupDefinition == nil {
+			continue
+		}
+		if err := checkParameterGroupFits(meta, meta.ParameterGroupDefinition); err != nil {
+			return fail(sizeCheck, "", err)
+		}
+	}
+	if len(resized) > 0 {
+		pass(sizeCheck, resizedSummary(resized))
+	} else {
+		pass(sizeCheck, resourceSummary(instances))
+	}
 
 	// 9. Every LOGICALLY captured database must use a locale provider this
 	//    restore can reproduce — buildCreateDatabaseSQL only reproduces libc
@@ -720,6 +749,20 @@ func ExecuteSnapshotApply(ctx context.Context, plan *SnapshotApplyPlan, progress
 			DescribeScheduleSet(snapshotPaused, backupsPaused))
 	}
 
+	// 3e. Record the sizes preflight fitted to this host, for configuration-only
+	//     entries too: 'oddk list', the checklist, a later 'instance apply' and
+	//     the next snapshot must all describe what actually runs here.
+	for _, meta := range plan.Instances {
+		i := slices.IndexFunc(plan.Resized, func(r ResizedInstance) bool { return r.Name == meta.Name })
+		if i < 0 {
+			continue
+		}
+		if err := st.Instances.UpdateResources(meta.Name, meta.Port, meta.CPUCores, meta.RAMMB); err != nil {
+			return nil, fmt.Errorf("record the fitted size of %s: %w", meta.Name, err)
+		}
+		emitLine(progress, "  ✓ %s", plan.Resized[i])
+	}
+
 	// 4. Rebuild each instance.
 	byName := make(map[string]SnapshotInstanceEntry, len(plan.Manifest.Instances))
 	for _, entry := range plan.Manifest.Instances {
@@ -1065,19 +1108,96 @@ func imageSummary(manifest *SnapshotManifest, pulled []string) string {
 	return summary
 }
 
-// checkHostResources refuses sizes this host cannot honour, mirroring the
-// validation 'oddk create' applies (handlers_rdbms.go -> ValidateSystemResources).
-// Without it a snapshot from a larger machine builds a container with
-// shared_buffers and shm_size derived from the source's RAM, and PostgreSQL
-// fails to start — after the destructive phase.
-func checkHostResources(instances []*InstanceMeta) error {
+// ResizedInstance is an instance whose recorded size this host cannot
+// provide, and the size it was fitted to.
+type ResizedInstance struct {
+	Name         string
+	FromCPUCores int
+	CPUCores     int
+	FromRAMMB    int
+	RAMMB        int
+}
+
+func (r ResizedInstance) String() string {
+	return fmt.Sprintf("%s: %s to fit this host", r.Name, r.Change())
+}
+
+// Change describes the fit without the instance name, e.g. "8192 → 7762 MB".
+func (r ResizedInstance) Change() string {
+	var parts []string
+	if r.RAMMB != r.FromRAMMB {
+		parts = append(parts, fmt.Sprintf("%d → %d MB", r.FromRAMMB, r.RAMMB))
+	}
+	if r.CPUCores != r.FromCPUCores {
+		parts = append(parts, fmt.Sprintf("%d → %d CPU", r.FromCPUCores, r.CPUCores))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// fitToHost fits each instance's recorded size to this host; see
+// fitInstanceSizes.
+func fitToHost(instances []*InstanceMeta) ([]ResizedInstance, error) {
+	hostCores, hostRAMMB, err := util.GetSystemResourceLimits()
+	if err != nil {
+		return nil, fmt.Errorf("read this host's resources: %w", err)
+	}
+	return fitInstanceSizes(instances, hostCores, hostRAMMB)
+}
+
+// fitInstanceSizes lowers each instance's recorded CPU and RAM to at most what
+// this host has (the most 'oddk create' accepts), in place, and returns the
+// instances it changed. Every caller builds the container from meta, so the
+// fitted RAM is also what shared_buffers and shm_size resolve against.
+//
+// A recorded size larger than the host is routine, not an error: an instance
+// keeps its size when its host is resized down, so refusing would stop a host
+// from restoring its own snapshot onto an identical machine. Only a size that
+// is unusable after fitting is refused.
+func fitInstanceSizes(instances []*InstanceMeta, hostCores, hostRAMMB int) ([]ResizedInstance, error) {
+	var resized []ResizedInstance
 	for _, meta := range instances {
-		if err := util.ValidateSystemResources(meta.CPUCores, meta.RAMMB); err != nil {
-			return operr.Invalidf("instance %q was sized %d CPU / %d MB RAM on the source host, which this host cannot provide: %v. Recreate it with smaller resources after restoring, or apply on a larger host",
-				meta.Name, meta.CPUCores, meta.RAMMB, err)
+		r := ResizedInstance{
+			Name:         meta.Name,
+			FromCPUCores: meta.CPUCores,
+			CPUCores:     min(meta.CPUCores, hostCores),
+			FromRAMMB:    meta.RAMMB,
+			RAMMB:        min(meta.RAMMB, hostRAMMB),
+		}
+		if r.CPUCores <= 0 || r.RAMMB <= 0 {
+			return nil, operr.Invalidf("instance %q was recorded with %d CPU / %d MB RAM, which cannot be restored (this host has %d CPU / %d MB)",
+				meta.Name, meta.CPUCores, meta.RAMMB, hostCores, hostRAMMB)
+		}
+		if r.CPUCores != r.FromCPUCores || r.RAMMB != r.FromRAMMB {
+			meta.CPUCores, meta.RAMMB = r.CPUCores, r.RAMMB
+			resized = append(resized, r)
 		}
 	}
+	return resized, nil
+}
+
+// checkParameterGroupFits refuses a parameter group whose shared memory cannot
+// fit in the instance's (possibly fitted) RAM. CreateContainer makes the same
+// check, but only after the destructive phase has begun; this is the copy that
+// runs while a refusal is still free.
+func checkParameterGroupFits(meta *InstanceMeta, group *parameters.ParameterGroup) error {
+	resolved, err := parameters.ResolveParameters(group.Parameters, meta.CPUCores, meta.RAMMB)
+	if err != nil {
+		return operr.Invalidf("instance %q: resolve parameter group %q for %d CPU / %d MB RAM: %w",
+			meta.Name, meta.ParameterGroup, meta.CPUCores, meta.RAMMB, err)
+	}
+	if err := parameters.ValidateForContainer(resolved, meta.RAMMB); err != nil {
+		return operr.Invalidf("instance %q, parameter group %q: %w. Restore on a host with more RAM, or lower the group's memory settings in the snapshot's source deployment",
+			meta.Name, meta.ParameterGroup, err)
+	}
 	return nil
+}
+
+func resizedSummary(resized []ResizedInstance) string {
+	parts := make([]string, 0, len(resized))
+	for _, r := range resized {
+		parts = append(parts, r.String())
+	}
+	return strings.Join(parts, "; ")
 }
 
 func resourceSummary(instances []*InstanceMeta) string {

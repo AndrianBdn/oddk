@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 // testSnapshotRestoreInstance covers restoring ONE instance out of a snapshot
@@ -96,6 +98,17 @@ func testSnapshotRestoreInstance(h *TestHarness) error {
 	}
 	bystanderPassword = strings.TrimSpace(bystanderPassword)
 
+	// The target is recorded larger than this host, so the restore must fit
+	// it rather than refuse (see testSnapshotRoundTrip for apply).
+	hostCores, hostRAMMB, err := util.GetSystemResourceLimits()
+	if err != nil {
+		return err
+	}
+	recordedCores, recordedRAMMB := hostCores+2, hostRAMMB+1024
+	if err := setRecordedSize(h, targetName, recordedCores, recordedRAMMB); err != nil {
+		return err
+	}
+
 	log.Println("Step 2: Snapshot, then write MORE data that must not survive the restore")
 	if output, err = h.runCLI("snapshot", "make"); err != nil {
 		return fmt.Errorf("snapshot make: %w (output: %s)", err, output)
@@ -121,8 +134,17 @@ func testSnapshotRestoreInstance(h *TestHarness) error {
 		return fmt.Errorf("restore-instance did not report a restore; output: %s", output)
 	}
 
+	fitted := fmt.Sprintf("Resized:   %d → %d MB, %d → %d CPU to fit this host",
+		recordedRAMMB, hostRAMMB, recordedCores, hostCores)
+	if !strings.Contains(output, fitted) {
+		return fmt.Errorf("restore-instance did not report fitting the instance to this host (%q); output: %s", fitted, output)
+	}
+
 	if err := h.waitForPostgreSQL(portA); err != nil {
 		return fmt.Errorf("target not ready after restore: %w", err)
+	}
+	if err := checkFittedToHost(h, targetName, hostCores, hostRAMMB); err != nil {
+		return err
 	}
 
 	adminConn, err := pgConnect(portA, "postgres", targetPassword, dbName)

@@ -34,6 +34,7 @@ type checklistResponse struct {
 			State    string            `json:"state"`
 			Snapshot *checklistArchive `json:"snapshot"`
 		} `json:"snapshotCoverage"`
+		ExceedsHost string `json:"exceedsHost"`
 	} `json:"instances"`
 	Snapshots struct {
 		Scheduled     bool              `json:"scheduled"`
@@ -171,6 +172,14 @@ func (c *Client) checklistAction(ctx context.Context, cmd *cli.Command) error {
 				detail(glyphTodo, "snapshot coverage", "not yet captured (newer than the newest snapshot)")
 			default: // "no-snapshots", or an unknown state from a newer daemon
 				detail(glyphTodo, "snapshot coverage", "no completed snapshots")
+			}
+
+			// Sized above this host: a host resized down under the instance.
+			if inst.ExceedsHost != "" {
+				detail(glyphTodo, "size", fmt.Sprintf(
+					"sized %s — lower it: oddk instance apply %s --cpu <cores> --ram <MB>M (both must fit)",
+					inst.ExceedsHost, inst.Name,
+				))
 			}
 
 			// The one backup-shaped line left: a still-scheduled per-instance

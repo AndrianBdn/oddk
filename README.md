@@ -418,6 +418,15 @@ What you need to know:
   performs — the trade you accept for their WAL-free write speed. If an
   unlogged table's contents must survive a restore, either make it a normal
   table or use `--logical`, which dumps its rows.
+- **A restore fits each instance to the host it lands on.** An instance
+  recorded with more CPU or RAM than this host has (typically because its host
+  was resized down under it) is restored at what this host provides, and
+  `oddk.db` records the smaller size; preflight says so (`qasphere: 8192 → 7762
+  MB to fit this host`). Memory-dependent parameters resolve against the fitted
+  RAM. A parameter group that sets memory explicitly and does not fit the
+  fitted RAM is refused before anything changes (when the archive carries the
+  group's definition, as it does unless the group was unreadable at capture).
+  `oddk checklist` flags an instance sized above its host.
 - **Back up `master.key` separately, off the host.** It is deliberately *not*
   in the archive, and every archive is encrypted with a key derived from it:
   **without `master.key` a snapshot cannot be restored, applied or even read.**

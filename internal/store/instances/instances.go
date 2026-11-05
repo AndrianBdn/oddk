@@ -144,8 +144,9 @@ func (s *InstanceStore) UpdateParameterGroup(name, parameterGroup string) error 
 
 // UpdateResources rewrites the shape an instance runs at.
 //
-// Needed by snapshot restore-instance, which rebuilds a container from the
-// SNAPSHOT's recorded port/CPU/RAM. Without it the container would be created at
+// Used by instance apply, and by snapshot restore-instance and apply, which
+// build a container from the SNAPSHOT's recorded port/CPU/RAM (fitted to this
+// host). Without it the container would be created at
 // the snapshot's values while the row kept the old ones, so the catalogue would
 // report a port nothing listens on — and IsPortInUse would guard the wrong one.
 func (s *InstanceStore) UpdateResources(name string, port, cpuCores, ramMB int) error {

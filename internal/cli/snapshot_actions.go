@@ -532,6 +532,7 @@ type snapshotRestoreInstanceResult struct {
 	CPUCores        int                    `json:"cpuCores"`
 	RAMMB           int                    `json:"ramMb"`
 	Image           string                 `json:"image"`
+	Resized         string                 `json:"resized"`
 	PasswordChanged bool                   `json:"passwordChanged"`
 	Format          string                 `json:"format"`
 	FinalStatus     string                 `json:"finalStatus"`
@@ -565,7 +566,7 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 		_, _ = fmt.Fprintln(c.out, "  - If the instance exists here, its container and DATA VOLUME are destroyed and")
 		_, _ = fmt.Fprintln(c.out, "    rebuilt from the snapshot. Data written since the snapshot is lost.")
 		_, _ = fmt.Fprintln(c.out, "  - Its port, resources, image and parameter group are set to the SNAPSHOT's,")
-		_, _ = fmt.Fprintln(c.out, "    not whatever they are now.")
+		_, _ = fmt.Fprintln(c.out, "    not whatever they are now (CPU and RAM fitted to this host if larger).")
 		_, _ = fmt.Fprintln(c.out, "  - Its postgres password becomes the snapshot's. The archive carries only a")
 		_, _ = fmt.Fprintln(c.out, "    hash, so the source's password is the only one that can still authenticate.")
 		_, _ = fmt.Fprintln(c.out, "  - Other instances are untouched.")
@@ -615,6 +616,9 @@ func (c *Client) snapshotRestoreInstanceAction(ctx context.Context, cmd *cli.Com
 	_, _ = fmt.Fprintf(c.out, "  Databases: %d\n", result.Databases)
 	_, _ = fmt.Fprintf(c.out, "  Config:    port %d, %d CPU, %d MB, image %s\n",
 		result.Port, result.CPUCores, result.RAMMB, result.Image)
+	if result.Resized != "" {
+		_, _ = fmt.Fprintf(c.out, "  Resized:   %s to fit this host\n", result.Resized)
+	}
 	if result.Format != "" {
 		_, _ = fmt.Fprintf(c.out, "  Format:    %s\n", describeSnapshotFormat(result.Format))
 	}

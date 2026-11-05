@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	snapshotstore "github.com/andrianbdn/oddk/internal/store/snapshot"
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 // checklistNotificationLogWindow bounds how far back the checklist looks for
@@ -96,6 +98,11 @@ type ChecklistInstance struct {
 	ParameterGroup   string               `json:"parameterGroup"`
 	LegacyBackupCron *ChecklistBackupCron `json:"legacyBackupCron,omitempty"`
 	SnapshotCoverage ChecklistCoverage    `json:"snapshotCoverage"`
+
+	// ExceedsHost is set when the instance is sized larger than this host,
+	// which happens when a host is resized down under it. Docker cannot honour
+	// the limit, and a restore fits it to the host instead.
+	ExceedsHost string `json:"exceedsHost,omitempty"`
 }
 
 // ChecklistCoverage reports whether this instance's DATA is in the newest
@@ -219,6 +226,12 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 		return fmt.Errorf("list instances: %w", err)
 	}
 
+	// Unknown host limits only cost the size warning.
+	hostCores, hostRAMMB, hostErr := util.GetSystemResourceLimits()
+	if hostErr != nil {
+		log.Printf("Checklist: read host resources: %v", hostErr)
+	}
+
 	for i := range instanceList {
 		// Reconcile stored status with Docker, same as ListRDBMS.
 		checkOp := NewConsistencyCheckOp(op.deps, &instanceList[i])
@@ -250,6 +263,9 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 			SnapshotCoverage: snapshotCoverage(newestSnapshot, result.Snapshots.LastSnapshot,
 				inst.Name, inst.CreatedAt.Time),
 		}
+		if hostErr == nil {
+			row.ExceedsHost = exceedsHost(inst.CPUCores, inst.RAMMB, hostCores, hostRAMMB)
+		}
 
 		result.Instances = append(result.Instances, row)
 	}
@@ -260,6 +276,19 @@ func (op *ChecklistOp) Execute(ctx context.Context) error {
 
 	op.result = result
 	return nil
+}
+
+// exceedsHost describes an instance size larger than this host, or returns ""
+// when it fits.
+func exceedsHost(cpuCores, ramMB, hostCores, hostRAMMB int) string {
+	var over []string
+	if ramMB > hostRAMMB {
+		over = append(over, fmt.Sprintf("%d MB RAM (this host has %d MB)", ramMB, hostRAMMB))
+	}
+	if cpuCores > hostCores {
+		over = append(over, fmt.Sprintf("%d CPU (this host has %d)", cpuCores, hostCores))
+	}
+	return strings.Join(over, " and ")
 }
 
 // collectSnapshots fills the deployment-wide snapshot summary and returns the

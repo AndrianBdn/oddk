@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -12,10 +13,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/moby/moby/client"
+	_ "modernc.org/sqlite"
 
 	"github.com/andrianbdn/oddk/internal/compression"
 	"github.com/andrianbdn/oddk/internal/crypto"
+	"github.com/andrianbdn/oddk/internal/docker"
+	"github.com/andrianbdn/oddk/internal/util"
 )
 
 // testSnapshotRoundTrip is the test the whole snapshot feature exists for:
@@ -78,6 +83,26 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 		return fmt.Errorf("read postgres password: %w", err)
 	}
 	postgresPassword = strings.TrimSpace(postgresPassword)
+
+	// Record a size larger than this host, as when an instance keeps its size
+	// after its host is resized down (the 2026-11-05 ap1 cut). Apply must fit
+	// it to the host rather than refuse its own snapshot.
+	log.Println("Step 1b: Recording an instance size larger than this host")
+	hostCores, hostRAMMB, err := util.GetSystemResourceLimits()
+	if err != nil {
+		return err
+	}
+	recordedCores, recordedRAMMB := hostCores+2, hostRAMMB+1024
+	if err := setRecordedSize(h, instanceName, recordedCores, recordedRAMMB); err != nil {
+		return err
+	}
+	output, err = h.runCLI("checklist")
+	if err != nil {
+		return fmt.Errorf("checklist: %w (output: %s)", err, output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("%d MB RAM (this host has %d MB)", recordedRAMMB, hostRAMMB)) {
+		return fmt.Errorf("checklist does not warn about an instance sized above the host: %s", output)
+	}
 
 	// Schedule snapshots AND a legacy per-instance backup before capturing, so
 	// the archive's oddk.db carries both — the state that makes an unpaused
@@ -210,6 +235,11 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	if !strings.Contains(output, "previous key saved as") {
 		return fmt.Errorf("apply did not report replacing the generated master.key; output: %s", output)
 	}
+	fitted := fmt.Sprintf("%s: %d → %d MB, %d → %d CPU to fit this host",
+		instanceName, recordedRAMMB, hostRAMMB, recordedCores, hostCores)
+	if !strings.Contains(output, fitted) {
+		return fmt.Errorf("apply did not report fitting the instance to this host (%q); output: %s", fitted, output)
+	}
 	// Apply must have pulled the image it needs during preflight, BEFORE
 	// replacing oddk.db and master.key.
 	if !strings.Contains(output, "Instance images are available") {
@@ -266,6 +296,10 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	}
 	if !strings.Contains(statusOut, "running") {
 		return fmt.Errorf("instance is not running after apply; status: %s", statusOut)
+	}
+
+	if err := checkFittedToHost(h, instanceName, hostCores, hostRAMMB); err != nil {
+		return err
 	}
 
 	// The postgres password must still be the one ODDK has stored - proving
@@ -331,6 +365,56 @@ func testSnapshotRoundTrip(h *TestHarness) error {
 	}
 
 	log.Println("=== Snapshot Round Trip Test PASSED ===")
+	return nil
+}
+
+// setRecordedSize overwrites an instance's stored size with the daemon
+// stopped, leaving its container as it is: no command can size an instance
+// above its host, but a host can shrink under one.
+func setRecordedSize(h *TestHarness, name string, cpuCores, ramMB int) error {
+	if err := h.stopDaemon(); err != nil {
+		return err
+	}
+	db, err := sqlx.Open("sqlite", filepath.Join(h.dataDir, "oddk.db"))
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`UPDATE rdbms_instances SET cpu_cores = ?, ram_mb = ? WHERE name = ?`, cpuCores, ramMB, name)
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("set recorded size: %w", err)
+	}
+	return h.startDaemon()
+}
+
+// checkFittedToHost proves a restored instance runs at the size fitted to
+// this host, and that oddk.db records that size rather than the archive's.
+func checkFittedToHost(h *TestHarness, name string, hostCores, hostRAMMB int) error {
+	inspect, err := h.inspectContainer(context.Background(), docker.ContainerName(name))
+	if err != nil {
+		return fmt.Errorf("inspect restored container: %w", err)
+	}
+	if inspect.HostConfig.Memory != int64(hostRAMMB)<<20 || inspect.HostConfig.CPUShares != int64(hostCores)*1024 {
+		return fmt.Errorf("restored container has memory %d / cpu shares %d, want %d MB / %d cores",
+			inspect.HostConfig.Memory, inspect.HostConfig.CPUShares, hostRAMMB, hostCores)
+	}
+	code, body, err := h.request("GET", "/api/rdbms/"+name, nil)
+	if err != nil || code != 200 {
+		return fmt.Errorf("get restored instance: %d %v %s", code, err, body)
+	}
+	var restored struct {
+		CPUCores int `json:"cpuCores"`
+		RAMMB    int `json:"ramMb"`
+	}
+	if err := json.Unmarshal(body, &restored); err != nil {
+		return fmt.Errorf("parse restored instance: %w", err)
+	}
+	if restored.CPUCores != hostCores || restored.RAMMB != hostRAMMB {
+		return fmt.Errorf("oddk.db records %d CPU / %d MB, want the fitted %d / %d",
+			restored.CPUCores, restored.RAMMB, hostCores, hostRAMMB)
+	}
 	return nil
 }
 

@@ -10,7 +10,8 @@ import (
 // completed snapshot, my-app and billing are in it with data, warehouse was
 // captured configuration-only (it was stopped during a logical capture), and
 // fresh was created after the capture. billing still has a legacy per-instance
-// backup cron — an un-migrated schedule the audit must surface.
+// backup cron — an un-migrated schedule the audit must surface — and my-app
+// is sized above its host, which was resized down under it.
 const checklistFixture = `{
 	"generatedAt": "2026-07-08T12:00:00Z",
 	"health": {
@@ -29,7 +30,8 @@ const checklistFixture = `{
 			"snapshotCoverage": {
 				"state": "covered",
 				"snapshot": {"id": 7, "timestamp": "2026-07-08T02:30:00Z", "sizeBytes": 2147483648, "location": "local+s3"}
-			}
+			},
+			"exceedsHost": "8192 MB RAM (this host has 7762 MB)"
 		},
 		{
 			"name": "billing",
@@ -121,6 +123,7 @@ func TestChecklistAction_BlockOutput(t *testing.T) {
 		// billing's surviving per-instance schedule is an un-migrated to-do.
 		"legacy backups",
 		"daily backup cron at 03:00 UTC still scheduled — migrate: oddk snapshot migrate-from-backups",
+		"sized 8192 MB RAM (this host has 7762 MB) — lower it: oddk instance apply my-app --cpu <cores> --ram <MB>M (both must fit)",
 		"scheduled: daily at 03:00 UTC, physical",
 		"last snapshot: 2026-07-08T02:30:00Z (local+s3)",
 		"stored: 3 · 2 local+s3, 1 local",
@@ -142,6 +145,9 @@ func TestChecklistAction_BlockOutput(t *testing.T) {
 	// Only billing still has a legacy schedule.
 	if got := strings.Count(out, "legacy backups"); got != 1 {
 		t.Errorf("expected exactly 1 legacy backup cron warning, got %d:\n%s", got, out)
+	}
+	if got := strings.Count(out, "this host has"); got != 1 {
+		t.Errorf("expected exactly 1 size warning, got %d:\n%s", got, out)
 	}
 	// Backups are legacy and excluded from the audit — none of the retired
 	// lines may resurface.
