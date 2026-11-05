@@ -277,6 +277,18 @@ func (c *Compressor) VerifyTarZstdDigest(_ context.Context, archivePath string) 
 	return &Verified{Members: members, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
+// VerifyTarZstdDigestFrom is VerifyTarZstdDigest over a stream, so a remote
+// copy can be checked without staging it on disk. It reads r to EOF on success;
+// on failure it may stop early, and the caller must unblock its producer.
+func (c *Compressor) VerifyTarZstdDigestFrom(r io.Reader) (*Verified, error) {
+	h := sha256.New()
+	members, err := c.verifyTarZstdFrom(r, h)
+	if err != nil {
+		return nil, err
+	}
+	return &Verified{Members: members, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
+}
+
 // verifyTarZstd is the body of both verifiers. When h is non-nil, every byte
 // read from the file is also written to it, in order.
 //

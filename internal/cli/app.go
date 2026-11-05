@@ -332,6 +332,10 @@ func instanceCommands(client *Client) *cli.Command {
 				Usage:     "Add database user",
 				ArgsUsage: "<instance-name>",
 				Description: "Adds a user to an existing database.\n\n" +
+					"--readonly grants SELECT on the tables and sequences in schema public,\n" +
+					"including ones postgres or the database owner creates later. Objects other\n" +
+					"users create later, and schemas created later, are not covered: a complete\n" +
+					"pg_dump of such a database needs the postgres user.\n\n" +
 					"Tip: when provisioning a new service, create the database and its owner\n" +
 					"user in one step instead:\n" +
 					"   oddk instance create-db <instance> --database <db> --username <user>",
@@ -639,6 +643,23 @@ func snapshotCommands(client *Client) *cli.Command {
 					&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
 				},
 				Action: client.snapshotDownloadAction,
+			},
+			{
+				Name:      "verify",
+				Usage:     "Check a snapshot's stored copies for damage or replacement",
+				ArgsUsage: "<snapshot-id> | --all",
+				Description: "Reads the local copy in full (decrypt, decompress, structure check) and\n" +
+					"compares its SHA-256 with the one catalogued when the archive was written.\n" +
+					"The S3 copy is checked for existence and size; --deep downloads it and\n" +
+					"verifies it the same way, without writing it to disk.\n\n" +
+					"Exits non-zero when any copy is missing, damaged, replaced, or could not\n" +
+					"be checked. Run it from cron to find bit rot before a restore needs the copy.",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "all", Usage: "Verify every catalogued snapshot"},
+					&cli.BoolFlag{Name: "deep", Usage: "Also download and verify the S3 copy (costs a full download)"},
+					&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
+				},
+				Action: client.snapshotVerifyAction,
 			},
 			{
 				Name:      "remove-local",

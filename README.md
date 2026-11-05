@@ -263,6 +263,12 @@ oddk instance delete-db-user app --username appuser
 changes in one transaction. A failed grant or ownership transfer rolls all of them
 back. Ownership transfer includes public-schema functions and stored procedures.
 
+A `--readonly` user can `SELECT` every table and sequence in schema `public`,
+including ones `postgres` or the database owner creates later, so it can take a
+`pg_dump` of that schema. Not covered: objects another user creates later, and
+schemas created later (PostgreSQL has no default privilege for them). A complete
+dump of such a database needs the `postgres` user.
+
 `delete-db-user` first reassigns everything the user owns to `postgres`, then
 revokes its grants and drops the role. If that reassignment fails the command
 aborts and leaves the user in place — it will not proceed to a step that would
@@ -297,6 +303,10 @@ one instance's data and none of the configuration needed to rebuild it.
 oddk snapshot make --comment "before major upgrade"
 oddk snapshot make --logical            # portable pg_dump-based format
 oddk snapshot list
+
+# Check stored copies for bit rot or replacement (exits non-zero on a problem)
+oddk snapshot verify <id>               # read the local copy in full; HEAD the S3 copy
+oddk snapshot verify --all --deep       # every snapshot, downloading the S3 copies too
 
 # Suspend a schedule without losing it (and put it back)
 oddk snapshot setup-cron --pause
@@ -444,6 +454,10 @@ What you need to know:
   `backup download` and `restore-instance --id` refuse a copy whose digest
   differs, even when the archive is otherwise intact. That catches an object
   replaced in the bucket, which would otherwise restore somebody else's data.
+  `snapshot verify` runs the same checks on demand, so a damaged copy is found
+  while another copy still exists, not at restore time. It reads the local copy in
+  full and checks the S3 copy's size; `--deep` also downloads and verifies the S3
+  copy, without writing it to disk.
 - Restoring an instance sets its postgres password to the snapshot's, because the
   archive carries only the hash. Re-read it with `instance get-postgres-password`.
 - Retention keeps the newest snapshots regardless of age, so a run of failed

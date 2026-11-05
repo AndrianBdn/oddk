@@ -123,6 +123,7 @@ func main() {
 			},
 		},
 		{Name: "SnapshotUpload", Fn: testSnapshotUpload, RunFakeS3: true},
+		{Name: "SnapshotVerify", Fn: testSnapshotVerify, RunFakeS3: true},
 		{Name: "SnapshotRestoreInstanceFromS3", Fn: testSnapshotRestoreInstanceFromS3, RunFakeS3: true},
 		{Name: "SnapshotApplyFromS3", Fn: testSnapshotApplyFromS3, RunFakeS3: true},
 		{Name: "SnapshotRestoreForeignFromS3", Fn: testSnapshotRestoreForeignFromS3, RunFakeS3: true},

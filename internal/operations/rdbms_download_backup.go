@@ -2,7 +2,6 @@ package operations
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -184,20 +183,18 @@ func streamToLocalFile(ctx context.Context, s3Client *s3service.Client, key, loc
 // opens is refused like any other unverifiable download.
 func verifyDownloadedArchive(ctx context.Context, c *compression.Compressor, path, wantSHA256 string) (string, error) {
 	verified, err := c.VerifyTarZstdDigest(ctx, path)
-	if errors.Is(err, compression.ErrNotDecryptable) {
+	switch classifyVerification(verified, err, wantSHA256) {
+	case CopyUnchecked:
 		// Not damage: the copy may be fine, it is our key that cannot open it.
 		// Kept bytes nobody could verify would be reused unverified later.
 		return "", fmt.Errorf("the downloaded archive was discarded because it could not be verified: %w", err)
-	}
-	if err != nil {
+	case CopyDamaged:
 		return "", fmt.Errorf("the downloaded archive failed verification and was discarded (%w); "+
 			"re-run the download, and if it fails again the copy in the bucket is damaged", err)
-	}
-	if wantSHA256 != "" && verified.SHA256 != wantSHA256 {
-		return "", fmt.Errorf("the downloaded archive is intact but is NOT the archive this host wrote, and was discarded: "+
-			"its SHA-256 is %s, the catalogue recorded %s when the archive was created. "+
+	case CopyMismatch:
+		return "", fmt.Errorf("the downloaded archive is intact but is NOT the archive this host wrote, and was discarded: %s. "+
 			"The object in the bucket has been replaced since it was uploaded; do not restore from it without finding out why",
-			verified.SHA256, wantSHA256)
+			digestMismatchDetail(verified.SHA256, wantSHA256))
 	}
 	return verified.SHA256, nil
 }

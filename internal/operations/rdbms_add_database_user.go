@@ -141,7 +141,8 @@ type sqlStep struct {
 
 // grantStatements returns the ordered grant statements for a new database
 // user: CONNECT for everyone, then either read-only grants (USAGE + SELECT on
-// existing objects + SELECT default privileges for future tables) or
+// existing tables and sequences + SELECT default privileges for future ones)
+// or
 // read-write grants (CREATE on the database, ALL on the public schema and
 // existing objects, plus ALL default privileges for future tables, sequences
 // and functions).
@@ -152,6 +153,12 @@ type sqlStep struct {
 // after create-db --username, where the owner runs the app's migrations),
 // each default-privileges statement is issued a second time FOR ROLE <owner>
 // so this user also covers tables the owner creates in the future.
+//
+// Read-only SELECT on sequences is what pg_dump needs: it reads each
+// sequence's state, so without it a dump as this user fails on the first
+// serial/identity table created after the grant. Everything here covers
+// schema public only; schemas created later cannot be covered by default
+// privileges, which the add-db-user help documents.
 func grantStatements(databaseName, username string, readOnly bool, dbOwner string) []sqlStep {
 	db := pgx.Identifier{databaseName}.Sanitize()
 	user := pgx.Identifier{username}.Sanitize()
@@ -173,7 +180,8 @@ func grantStatements(databaseName, username string, readOnly bool, dbOwner strin
 		)
 		for _, forRole := range forRoles {
 			steps = append(steps,
-				sqlStep{"set default privileges", fmt.Sprintf("ALTER DEFAULT PRIVILEGES%s IN SCHEMA public GRANT SELECT ON TABLES TO %s", forRole, user)},
+				sqlStep{"set default privileges on tables", fmt.Sprintf("ALTER DEFAULT PRIVILEGES%s IN SCHEMA public GRANT SELECT ON TABLES TO %s", forRole, user)},
+				sqlStep{"set default privileges on sequences", fmt.Sprintf("ALTER DEFAULT PRIVILEGES%s IN SCHEMA public GRANT SELECT ON SEQUENCES TO %s", forRole, user)},
 			)
 		}
 		return steps

@@ -11,6 +11,35 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.95 — 2026-11-05
+
+### Added
+
+- **`oddk snapshot verify <id>` (or `--all`)** checks stored copies before a
+  restore depends on them. The local copy is read in full (decrypted and
+  decompressed) and its SHA-256 compared with the one recorded when it was
+  written; a snapshot from before v0.1.86, which has no recorded SHA-256, gets
+  its structure checked instead. The S3 copy is checked for existence and size, and
+  `--deep` downloads and verifies it the same way without writing it to disk.
+  Any copy that is missing, damaged, replaced or could not be checked makes the
+  command exit non-zero, so it can run from cron. It does not wait for a running
+  snapshot.
+
+### Fixed
+
+- **A `--readonly` user can now read sequences created after it was added**
+  (by `postgres` or the database owner, as for tables), so `pg_dump` as that
+  user no longer fails with "permission denied for sequence" once a table with a
+  `serial` or identity column appears. Sequences that existed when the user was
+  added were already covered.
+- **Action:** read-only users created before this release keep the old grants.
+  Recreate them (`delete-db-user`, then `add-db-user --readonly`), or run this in
+  each database, as `postgres`, once for every role that creates tables there
+  (`postgres` and the database owner):
+  `ALTER DEFAULT PRIVILEGES FOR ROLE <creator> IN SCHEMA public GRANT SELECT ON SEQUENCES TO <reader>;`
+  plus `GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO <reader>;` for the
+  sequences created in the meantime.
+
 ## v0.1.94 — 2026-10-17
 
 ### Added

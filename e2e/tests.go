@@ -561,6 +561,18 @@ func testDatabaseManagement(h *TestHarness) error {
 	if err := h.execSQLAsUser(port, "svcdb", "svcreader", readerPassword, "SELECT * FROM post_grant_table"); err != nil {
 		return fmt.Errorf("read-only user should see tables the owner creates later: %w", err)
 	}
+	// pg_dump reads every sequence's state, so a reader must also be able to
+	// SELECT sequences the owner creates later (serial/identity columns), yet
+	// not advance them.
+	if err := h.execSQLAsUser(port, "svcdb", "svcowner", ownerPassword, "CREATE TABLE post_grant_serial (id serial PRIMARY KEY)"); err != nil {
+		return fmt.Errorf("owner should be able to create a serial table: %w", err)
+	}
+	if err := h.execSQLAsUser(port, "svcdb", "svcreader", readerPassword, "SELECT last_value, is_called FROM post_grant_serial_id_seq"); err != nil {
+		return fmt.Errorf("read-only user should read sequences the owner creates later: %w", err)
+	}
+	if err := h.execSQLAsUser(port, "svcdb", "svcreader", readerPassword, "SELECT nextval('post_grant_serial_id_seq')"); err == nil {
+		return fmt.Errorf("read-only user should not be able to advance sequences")
+	}
 	if err := h.execSQLAsUser(port, "svcdb", "svcreader", readerPassword, "CREATE TABLE denied_check (id int)"); err == nil {
 		return fmt.Errorf("read-only user should not be able to create tables")
 	}

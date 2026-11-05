@@ -18,8 +18,8 @@ func TestGrantStatementsDefaultPrivilegeRoles(t *testing.T) {
 		wantForRole  int // FOR ROLE statements expected
 		wantDefaults int // total ALTER DEFAULT PRIVILEGES statements expected
 	}{
-		{"readonly postgres-owned", true, "postgres", 0, 1},
-		{"readonly service-owned", true, "svc", 1, 2},
+		{"readonly postgres-owned", true, "postgres", 0, 2},
+		{"readonly service-owned", true, "svc", 2, 4},
 		{"readwrite postgres-owned", false, "postgres", 0, 3},
 		{"readwrite service-owned", false, "svc", 3, 6},
 		{"owner is the new user", false, "reader", 0, 3},

@@ -61,6 +61,7 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /api/snapshots/remote", s.withAuth(s.handleSnapshotListRemote))
 	mux.HandleFunc("POST /api/snapshot/{id}/upload", s.withAuth(s.handleSnapshotUpload))
 	mux.HandleFunc("POST /api/snapshot/{id}/download", s.withAuth(s.handleSnapshotDownload))
+	mux.HandleFunc("POST /api/snapshot/{id}/verify", s.withAuth(s.handleSnapshotVerify))
 	mux.HandleFunc("DELETE /api/snapshot/{id}/local", s.withAuth(s.handleSnapshotRemoveLocal))
 	mux.HandleFunc("DELETE /api/snapshot/{id}/remote", s.withAuth(s.handleSnapshotRemoveRemote))
 

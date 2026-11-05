@@ -655,6 +655,40 @@ func (s *Server) handleSnapshotDownload(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, http.StatusOK, result)
 }
 
+// handleSnapshotVerify handles POST /api/snapshot/{id}/verify[?deep=true]
+//
+// A read: it writes nothing, so it does not queue behind a running snapshot.
+// It reads a whole archive (and with deep, downloads one), so the write
+// deadline is cleared all the same. A client that goes away cancels only the
+// S3 half; the local read runs to the end.
+func (s *Server) handleSnapshotVerify(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.snapshotIDParam(w, r)
+	if !ok {
+		return
+	}
+	deep := r.URL.Query().Get("deep") == "true"
+	s.clearWriteDeadline(w, fmt.Sprintf("snapshot verify %d", id))
+
+	var result *operations.VerifySnapshotResult
+	op := &snapshotFuncOp{
+		name: "VerifySnapshot",
+		read: true,
+		run: func(ctx context.Context) error {
+			res, err := operations.VerifySnapshot(ctx, s.opDeps, id, deep)
+			if err != nil {
+				return err
+			}
+			result = res
+			return nil
+		},
+	}
+	if err := s.executor.ExecuteRead(r.Context(), op); err != nil {
+		s.writeOpError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, result)
+}
+
 // handleSnapshotRemoveLocal handles DELETE /api/snapshot/{id}/local
 func (s *Server) handleSnapshotRemoveLocal(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.snapshotIDParam(w, r)
@@ -704,14 +738,22 @@ func (s *Server) snapshotIDParam(w http.ResponseWriter, r *http.Request) (int, b
 }
 
 // snapshotFuncOp adapts a plain function to the Operation interface, for the
-// short snapshot operations that do not need their own type.
+// short snapshot operations that do not need their own type. It is a write
+// unless read is set (OpTypeRead is OpType's zero value, so a type field
+// would default the wrong way).
 type snapshotFuncOp struct {
 	name string
+	read bool
 	run  func(ctx context.Context) error
 }
 
-func (op *snapshotFuncOp) Name() string                      { return op.name }
-func (op *snapshotFuncOp) Type() operations.OpType           { return operations.OpTypeWrite }
+func (op *snapshotFuncOp) Name() string { return op.name }
+func (op *snapshotFuncOp) Type() operations.OpType {
+	if op.read {
+		return operations.OpTypeRead
+	}
+	return operations.OpTypeWrite
+}
 func (op *snapshotFuncOp) Execute(ctx context.Context) error { return op.run(ctx) }
 
 type snapshotUploadOp struct {
