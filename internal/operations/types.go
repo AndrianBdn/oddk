@@ -9,6 +9,12 @@ import (
 	"github.com/andrianbdn/oddk/internal/store/instances"
 )
 
+// DefaultPostgresVersion is the major `create` uses when given neither a
+// version nor an image (resolveCreateVersion). It trails the newest major on purpose:
+// a new major becomes the default once it has had its first minor releases,
+// not on release day.
+const DefaultPostgresVersion = "18"
+
 // Dependencies holds all the dependencies needed by operations
 type Dependencies struct {
 	Store     *store.Store

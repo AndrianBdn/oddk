@@ -11,6 +11,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/andrianbdn/oddk/internal/operations"
 	"github.com/andrianbdn/oddk/internal/store/parameters"
 	"github.com/andrianbdn/oddk/internal/version"
 )
@@ -135,7 +136,7 @@ func pullCommand(client *Client) *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "version",
-				Usage: "PostgreSQL version to pull (e.g. 17)",
+				Usage: "PostgreSQL version to pull (e.g. " + operations.DefaultPostgresVersion + ")",
 			},
 			&cli.StringFlag{
 				Name:  "image",
@@ -167,9 +168,8 @@ func createCommand(client *Client) *cli.Command {
 				Required: true,
 			},
 			&cli.StringFlag{
-				Name:        "version",
-				Usage:       "PostgreSQL version",
-				DefaultText: "17",
+				Name:  "version",
+				Usage: "PostgreSQL major version (default: read from --image; " + operations.DefaultPostgresVersion + " when no --image is given)",
 			},
 			&cli.IntFlag{
 				Name:        "port",

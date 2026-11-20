@@ -25,22 +25,25 @@ import (
 // gone), a COLD capture of a stopped instance (which logical mode reduces to
 // configuration-only), and the cold restore's contract of coming back
 // verified-but-stopped.
-func testSnapshotPhysicalMake(h *TestHarness) error {
-	log.Println("=== Testing Physical Snapshot (make + restore-instance + cold capture, PG18) ===")
+func testSnapshotPhysicalMake(h *TestHarness) error { return snapshotPhysicalMake(h, "18", 15501) }
 
-	if _, err := h.pullImageCLI("18"); err != nil {
+// testSnapshotPhysicalMake19 runs the same on the newest major, which keeps
+// 18's data-directory layout.
+func testSnapshotPhysicalMake19(h *TestHarness) error { return snapshotPhysicalMake(h, "19", 15505) }
+
+func snapshotPhysicalMake(h *TestHarness, version string, port int) error {
+	log.Printf("=== Testing Physical Snapshot (make + restore-instance + cold capture, PG%s) ===", version)
+
+	if _, err := h.pullImageCLI(version); err != nil {
 		return fmt.Errorf("pull image failed: %w", err)
 	}
 
-	const (
-		port   = 15501
-		dbName = "physdb"
-	)
-	instanceName := fmt.Sprintf("oddk-danger-funct-phys-%d", time.Now().Unix())
+	const dbName = "physdb"
+	instanceName := fmt.Sprintf("oddk-danger-funct-phys%s-%d", version, time.Now().Unix())
 
-	log.Println("Step 1: Creating a PG18 instance with data")
+	log.Printf("Step 1: Creating a PG%s instance with data", version)
 	output, err := h.runCLI("create",
-		"--name", instanceName, "--version", "18",
+		"--name", instanceName, "--version", version,
 		"--port", strconv.Itoa(port), "--cpu", "1", "--ram", "512M")
 	if err != nil {
 		return fmt.Errorf("create instance: %w (output: %s)", err, output)

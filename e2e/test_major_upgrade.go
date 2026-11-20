@@ -24,25 +24,35 @@ func pgConnect(port int, user, password, database string) (*pgx.Conn, error) {
 	return pgx.Connect(ctx, connStr)
 }
 
-func testMajorUpgrade(h *TestHarness) error {
-	log.Println("=== Testing Major Version Upgrade (17 -> 18) ===")
+func testMajorUpgrade(h *TestHarness) error { return majorUpgradeBetween(h, 17, 18, 15451) }
 
-	instanceName := testPrefix + "-pgupgrade"
-	port := 15451
+// testMajorUpgrade18to19 also covers the newest major: the PG 18 data-dir
+// layout on both sides, and a PG 19 server receiving a PG 18 dump.
+func testMajorUpgrade18to19(h *TestHarness) error { return majorUpgradeBetween(h, 18, 19, 15456) }
+
+// unavailableMajor is a PostgreSQL major with no image in any registry, for the
+// "target image cannot be had" path. It used to be 19, until 19 was released.
+const unavailableMajor = 99
+
+func majorUpgradeBetween(h *TestHarness, fromMajor, toMajor, port int) error {
+	from, to := strconv.Itoa(fromMajor), strconv.Itoa(toMajor)
+	log.Printf("=== Testing Major Version Upgrade (%s -> %s) ===", from, to)
+
+	instanceName := fmt.Sprintf("%s-pgupgrade%sto%s", testPrefix, from, to)
 	ownerPass := "ownerpass123"
 
-	log.Println("Step 1: Pulling PostgreSQL 17 and 18 images")
-	if _, err := h.pullImageCLI("17"); err != nil {
-		return fmt.Errorf("pull 17 failed: %w", err)
+	log.Printf("Step 1: Pulling PostgreSQL %s and %s images", from, to)
+	if _, err := h.pullImageCLI(from); err != nil {
+		return fmt.Errorf("pull %s failed: %w", from, err)
 	}
-	if _, err := h.pullImageCLI("18"); err != nil {
-		return fmt.Errorf("pull 18 failed: %w", err)
+	if _, err := h.pullImageCLI(to); err != nil {
+		return fmt.Errorf("pull %s failed: %w", to, err)
 	}
 
-	log.Println("Step 2: Creating PG17 instance")
+	log.Printf("Step 2: Creating PG%s instance", from)
 	output, err := h.runCLI("create",
 		"--name", instanceName,
-		"--version", "17",
+		"--version", from,
 		"--port", strconv.Itoa(port),
 		"--cpu", "1",
 		"--ram", "512M")
@@ -111,8 +121,8 @@ func testMajorUpgrade(h *TestHarness) error {
 		return err
 	}
 
-	log.Println("Step 5: Upgrading to PostgreSQL 18")
-	output, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", "18", "--yes")
+	log.Printf("Step 5: Upgrading to PostgreSQL %s", to)
+	output, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", to, "--yes")
 	if err != nil {
 		return fmt.Errorf("major-upgrade failed: %w (output: %s)", err, output)
 	}
@@ -136,11 +146,11 @@ func testMajorUpgrade(h *TestHarness) error {
 	if err := json.Unmarshal(body, &inst); err != nil {
 		return fmt.Errorf("unmarshal instance: %w", err)
 	}
-	if inst.Version != "18" {
-		return fmt.Errorf("expected version 18, got %q", inst.Version)
+	if inst.Version != to {
+		return fmt.Errorf("expected version %s, got %q", to, inst.Version)
 	}
-	if inst.Image != "postgres:18" {
-		return fmt.Errorf("expected image postgres:18, got %q", inst.Image)
+	if inst.Image != "postgres:"+to {
+		return fmt.Errorf("expected image postgres:%s, got %q", to, inst.Image)
 	}
 	if inst.Status != "running" {
 		return fmt.Errorf("expected status running, got %q", inst.Status)
@@ -155,7 +165,7 @@ func testMajorUpgrade(h *TestHarness) error {
 		return fmt.Errorf("appdb missing after upgrade: %s", dbList)
 	}
 
-	log.Println("Step 8: Verifying data + ownership on the new PG18 cluster")
+	log.Printf("Step 8: Verifying data + ownership on the new PG%s cluster", to)
 	if err := func() error {
 		conn, err := pgConnect(port, "postgres", password, "appdb")
 		if err != nil {
@@ -167,8 +177,8 @@ func testMajorUpgrade(h *TestHarness) error {
 		if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&verNum); err != nil {
 			return fmt.Errorf("query server version: %w", err)
 		}
-		if verNum/10000 != 18 {
-			return fmt.Errorf("expected server major version 18, got server_version_num=%d", verNum)
+		if verNum/10000 != toMajor {
+			return fmt.Errorf("expected server major version %d, got server_version_num=%d", toMajor, verNum)
 		}
 
 		var rowCount int
@@ -226,7 +236,7 @@ func testMajorUpgrade(h *TestHarness) error {
 	}
 
 	log.Println("Step 10: Verifying downgrade is rejected")
-	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", "16", "--yes")
+	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", from, "--yes")
 	if err == nil {
 		return fmt.Errorf("expected downgrade to be rejected")
 	}
@@ -235,7 +245,7 @@ func testMajorUpgrade(h *TestHarness) error {
 	}
 
 	log.Println("Step 11: Verifying same-version is rejected")
-	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", "18", "--yes")
+	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", to, "--yes")
 	if err == nil {
 		return fmt.Errorf("expected same-version upgrade to be rejected")
 	}
@@ -244,11 +254,11 @@ func testMajorUpgrade(h *TestHarness) error {
 	}
 
 	log.Println("Step 12: Verifying version/image mismatch is rejected")
-	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", "19", "--image", "postgres:17", "--yes")
+	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", strconv.Itoa(toMajor+1), "--image", "postgres:"+from, "--yes")
 	if err == nil {
 		return fmt.Errorf("expected version/image mismatch to be rejected")
 	}
-	if !strings.Contains(err.Error(), "suggests PostgreSQL 17") {
+	if !strings.Contains(err.Error(), "suggests PostgreSQL "+from) {
 		return fmt.Errorf("expected mismatch rejection message, got: %v", err)
 	}
 
@@ -258,11 +268,12 @@ func testMajorUpgrade(h *TestHarness) error {
 	// naming the image that could not be resolved — instead of failing at the
 	// daemon with advice to run a pull that would fail exactly the same way.
 	// Asserted on the image name rather than on Docker's phrasing.
-	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", "19", "--yes")
+	unavailable := strconv.Itoa(unavailableMajor)
+	_, err = h.runCLI("instance", "major-upgrade", instanceName, "--target-version", unavailable, "--yes")
 	if err == nil {
 		return fmt.Errorf("expected an unavailable target image to be rejected")
 	}
-	if !strings.Contains(err.Error(), "postgres:19") {
+	if !strings.Contains(err.Error(), "postgres:"+unavailable) {
 		return fmt.Errorf("expected the failure to name the unavailable image, got: %v", err)
 	}
 
@@ -270,7 +281,7 @@ func testMajorUpgrade(h *TestHarness) error {
 	// anything destructive happens — that is what protects a direct API client,
 	// and the CLI pre-fetch no longer reaches it, so assert it directly.
 	upgradeStatus, upgradeBody, err := h.request("POST", "/api/rdbms/"+instanceName+"/major-upgrade",
-		map[string]string{"targetVersion": "19"})
+		map[string]string{"targetVersion": unavailable})
 	if err != nil {
 		return fmt.Errorf("major-upgrade request failed: %w", err)
 	}
@@ -287,8 +298,8 @@ func testMajorUpgrade(h *TestHarness) error {
 	if err := json.Unmarshal(body, &inst); err != nil {
 		return fmt.Errorf("unmarshal instance: %w", err)
 	}
-	if inst.Version != "18" || inst.Status != "running" {
-		return fmt.Errorf("instance should be running at version 18, got version=%q status=%q", inst.Version, inst.Status)
+	if inst.Version != to || inst.Status != "running" {
+		return fmt.Errorf("instance should be running at version %s, got version=%q status=%q", to, inst.Version, inst.Status)
 	}
 
 	log.Println("Step 15: Cleaning up")

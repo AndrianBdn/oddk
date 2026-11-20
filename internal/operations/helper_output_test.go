@@ -67,3 +67,12 @@ func TestNoHelperOutputHint_PointsAtFreeSpace(t *testing.T) {
 		}
 	}
 }
+
+// helperExitError replaced a fmt.Errorf; every caller that wraps it with %w and
+// every log reader depends on the text staying the same.
+func TestHelperExitErrorKeepsTheMessage(t *testing.T) {
+	e := &helperExitError{Tool: "pg_dump", Status: 1, Logs: "stdout: \nstderr: boom", Hint: " (hint)"}
+	if got, want := e.Error(), "pg_dump failed with status 1: stdout: \nstderr: boom (hint)"; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+}

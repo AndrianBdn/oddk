@@ -25,6 +25,7 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/andrianbdn/oddk/internal/daemon"
+	"github.com/andrianbdn/oddk/internal/operations"
 	"github.com/andrianbdn/oddk/internal/store"
 	"github.com/andrianbdn/oddk/internal/store/auth"
 	"github.com/andrianbdn/oddk/internal/store/parameters"
@@ -147,6 +148,13 @@ func (c *Client) createAction(ctx context.Context, cmd *cli.Command) error {
 	// Use default parameter group if not specified
 	if parameterGroup == "" {
 		parameterGroup = parameters.DefaultParameterGroup
+	}
+
+	// Neither flag: name the default here. /api/pull refuses an empty
+	// version-and-image, so leaving it to the daemon's create default made the
+	// auto-pull below fail before create ran.
+	if version == "" && image == "" {
+		version = operations.DefaultPostgresVersion
 	}
 
 	// Auto-provision the image (pull only if missing, with live progress) so

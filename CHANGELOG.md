@@ -11,6 +11,62 @@ the commit that made it.
 Versions are `0.1.x`: during development every release bumps the patch number,
 whether it carries a feature, a fix or a refactor.
 
+## v0.1.97 — 2026-11-20
+
+PostgreSQL 19 compatibility.
+
+### Added
+
+- **PostgreSQL 19 support.** `oddk create --version 19`, and
+  `oddk instance major-upgrade <name> --target-version 19` from an earlier
+  major. Physical snapshots, `restore-instance` and `restore-database` work on
+  19 as they do on 18 (the image keeps 18's data-directory layout).
+
+### Changed
+
+- **`oddk create` defaults to PostgreSQL 18** (was 17) when given neither
+  `--version` nor `--image`. Existing instances are not affected.
+- **With `--image` and no `--version`, the major now comes from the image**: the
+  `PG_MAJOR` it declares (every image built on the official one does), else a
+  major in its tag. An image that names its major neither way is refused with a
+  request for `--version`; it used to get the default, and a default that did
+  not match the image put the data where the next container recreate would not
+  find it. A `--version` that contradicts the image's `PG_MAJOR` is refused for
+  the same reason, and so is an image whose tag names a different major than
+  its `PG_MAJOR` (retag it with its major).
+  **Action:** a script that creates without `--version` from an image that names
+  its major neither way must now pass `--version`; an image whose tag names the
+  wrong major must be retagged.
+
+### Fixed
+
+- **`major-upgrade` checks the parameter group against the target major before
+  it changes anything.** The new cluster is started with the instance's group
+  only after the old volume has been removed, so a setting the new major does
+  not accept left the instance in `error`, with the pre-upgrade backup as the
+  only way back. The target image's server now validates each setting's name
+  and value first, and the group's fit in the instance's RAM is checked; a
+  refusal names the setting and changes nothing, not even a backup is taken.
+  Not covered: a `shared_preload_libraries` library missing from a custom
+  target image, and rules that combine several settings; those still surface
+  at the new cluster's first start.
+- `oddk create` without `--version` or `--image` failed at the automatic image
+  pull ("version or image is required"). It now uses the default.
+
+### Notes for PostgreSQL 19
+
+- **Action:** if an 18 instance's parameter group sets `io_workers`, remove it
+  before upgrading that instance to 19 (19 replaced it with
+  `io_min_workers`/`io_max_workers`). The upgrade refuses until you do. The
+  group ODDK ships does not set it.
+- 19 counts lock-table capacity differently: a group that sets
+  `max_locks_per_transaction` gets about half the capacity it had on 18. Double
+  it if you set it for a workload that needs many locks.
+- JIT is off by default in 19; turn it back on in the group (`jit=on`) if
+  large analytical queries relied on it.
+- Logging in with an MD5 password now produces a warning. Roles ODDK creates use
+  SCRAM unless a parameter group sets `password_encryption=md5`.
+
 ## v0.1.96 — 2026-11-05
 
 ### Fixed

@@ -22,17 +22,33 @@ import (
 // helperContainerSpec describes one ephemeral helper container run. Every
 // helper shares the same lifecycle contract: labeled oddk.helper=true (so the
 // daemon-startup sweep can reap orphans after a crash), run as the daemon's
-// uid/gid (so files it stages are readable and deletable without a chown pass),
-// given the postgres password via a short-lived read-only .pgpass mount (never
-// an env var, so it is not exposed via docker inspect), attached to oddk-bridge
-// unless it joins an instance's network namespace, and force-removed with a
+// uid/gid (so files it stages are readable and deletable without a chown pass)
+// unless User overrides it, given the postgres password via a short-lived
+// read-only .pgpass mount (never an env var, so it is not exposed via docker
+// inspect) unless NoCredentials, attached to oddk-bridge unless it joins an
+// instance's network namespace or sets NoNetwork, and force-removed with a
 // detached context so a cancelled op ctx doesn't leave it running.
 type helperContainerSpec struct {
 	ContainerName string
 	Image         string
 	Cmd           []string
+	// Entrypoint, when set, replaces the image's entrypoint. The official
+	// images' docker-entrypoint.sh treats a "postgres" command as "set up and
+	// start a server", so a helper that runs the server binary for a one-shot
+	// answer must bypass it.
+	Entrypoint []string
 	// Password is written to the .pgpass mount; PGPASSFILE points at it.
 	Password string
+	// NoCredentials skips the .pgpass mount for a helper that never connects
+	// to a server. Password must then be empty.
+	NoCredentials bool
+	// User, when set, replaces the daemon's uid:gid. Only for helpers that
+	// write nothing the daemon must later read or delete: the postgres server
+	// binary refuses to run as root, which the daemon may be.
+	User string
+	// NoNetwork runs the helper with NetworkMode none instead of attaching it
+	// to oddk-bridge. Mutually exclusive with JoinNetNSContainer.
+	NoNetwork bool
 	// Mounts are added in addition to the .pgpass mount.
 	Mounts []mount.Mount
 	// Env is added to the helper's environment (after PGPASSFILE). Never put
@@ -65,25 +81,45 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 	if tool == "" {
 		tool = "helper"
 	}
-
-	pgPassMount, pgPassEnv, cleanup, err := newPgPassMount(deps.BackupDir, spec.Password)
-	if err != nil {
-		return err
+	if spec.NoCredentials && spec.Password != "" {
+		return fmt.Errorf("%s helper: NoCredentials with a password set", tool)
 	}
-	defer cleanup()
+	if spec.NoNetwork && spec.JoinNetNSContainer != "" {
+		return fmt.Errorf("%s helper: NoNetwork with JoinNetNSContainer set", tool)
+	}
 
+	mounts := append([]mount.Mount{}, spec.Mounts...)
+	var env []string
+	if !spec.NoCredentials {
+		pgPassMount, pgPassEnv, cleanup, err := newPgPassMount(deps.BackupDir, spec.Password)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		mounts = append(mounts, pgPassMount)
+		env = append(env, pgPassEnv)
+	}
+
+	user := spec.User
+	if user == "" {
+		user = fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	}
 	config := &container.Config{
-		Image:  spec.Image,
-		User:   fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
-		Cmd:    spec.Cmd,
-		Env:    append([]string{pgPassEnv}, spec.Env...),
-		Labels: map[string]string{"oddk.helper": "true"},
+		Image:      spec.Image,
+		User:       user,
+		Entrypoint: spec.Entrypoint,
+		Cmd:        spec.Cmd,
+		Env:        append(env, spec.Env...),
+		Labels:     map[string]string{"oddk.helper": "true"},
 	}
-	hostConfig := &container.HostConfig{Mounts: append(append([]mount.Mount{}, spec.Mounts...), pgPassMount)}
+	hostConfig := &container.HostConfig{Mounts: mounts}
 	var networkConfig *network.NetworkingConfig
-	if spec.JoinNetNSContainer != "" {
+	switch {
+	case spec.JoinNetNSContainer != "":
 		hostConfig.NetworkMode = container.NetworkMode("container:" + spec.JoinNetNSContainer)
-	} else {
+	case spec.NoNetwork:
+		hostConfig.NetworkMode = container.NetworkMode("none")
+	default:
 		networkConfig = &network.NetworkingConfig{
 			EndpointsConfig: map[string]*network.EndpointSettings{
 				util.OddkNetworkName: {},
@@ -138,7 +174,7 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 			if spec.FailureHint != nil {
 				hint = spec.FailureHint(logs)
 			}
-			return fmt.Errorf("%s failed with status %d: %s%s", tool, status.StatusCode, logs, hint)
+			return &helperExitError{Tool: tool, Status: status.StatusCode, Output: out, Logs: logs, Hint: hint}
 		}
 	}
 
@@ -167,6 +203,24 @@ func runHelperContainer(ctx context.Context, deps *Dependencies, spec helperCont
 		}
 	}
 	return nil
+}
+
+// helperExitError is a helper container that ran and exited non-zero, as
+// opposed to one Docker could not create, start or wait on. Callers that must
+// tell "the tool refused" from "the tool could not run" use errors.AsType.
+type helperExitError struct {
+	Tool   string
+	Status int64
+	// Output is the helper's streams; empty when the logs were unavailable.
+	Output helperOutput
+	// Logs is Output rendered for the operator, or a placeholder when there
+	// was none (noHelperOutputHint) or it could not be read.
+	Logs string
+	Hint string
+}
+
+func (e *helperExitError) Error() string {
+	return fmt.Sprintf("%s failed with status %d: %s%s", e.Tool, e.Status, e.Logs, e.Hint)
 }
 
 // noHelperOutputHint replaces the empty "stdout: \nstderr: " pair a silent

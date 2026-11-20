@@ -8,25 +8,29 @@ import (
 	"strings"
 )
 
-func testPG18Lifecycle(h *TestHarness) error {
-	log.Println("=== Testing PG18 Lifecycle ===")
+func testPG18Lifecycle(h *TestHarness) error { return pgLifecycle(h, "18", 15450) }
+func testPG19Lifecycle(h *TestHarness) error { return pgLifecycle(h, "19", 15455) }
 
-	instanceName := testPrefix + "-pg18"
-	port := 15450
+// pgLifecycle is the smoke test every supported major from 18 on gets: pull,
+// create (PG 18+ data-dir layout), list and create databases, destroy.
+func pgLifecycle(h *TestHarness, version string, port int) error {
+	log.Printf("=== Testing PG%s Lifecycle ===", version)
 
-	log.Println("Step 1: Pulling PostgreSQL 18 image")
-	output, err := h.pullImageCLI("18")
+	instanceName := testPrefix + "-pg" + version
+
+	log.Printf("Step 1: Pulling PostgreSQL %s image", version)
+	output, err := h.pullImageCLI(version)
 	if err != nil {
 		return fmt.Errorf("pull image failed: %w", err)
 	}
-	if !strings.Contains(output, "postgres:18") {
-		return fmt.Errorf("pull output should mention postgres:18, got: %s", output)
+	if !strings.Contains(output, "postgres:"+version) {
+		return fmt.Errorf("pull output should mention postgres:%s, got: %s", version, output)
 	}
 
-	log.Println("Step 2: Creating PG 18 instance")
+	log.Printf("Step 2: Creating PG %s instance", version)
 	output, err = h.runCLI("create",
 		"--name", instanceName,
-		"--version", "18",
+		"--version", version,
 		"--port", fmt.Sprintf("%d", port),
 		"--cpu", "1",
 		"--ram", "512M")
@@ -62,6 +66,6 @@ func testPG18Lifecycle(h *TestHarness) error {
 		return fmt.Errorf("destroy instance failed: %w", err)
 	}
 
-	log.Println("=== PG18 Lifecycle Test PASSED ===")
+	log.Printf("=== PG%s Lifecycle Test PASSED ===", version)
 	return nil
 }

@@ -49,10 +49,13 @@ func (op *PullImageOp) SetProgressWriter(w io.Writer) {
 // can return a clean 4xx before committing to a streaming response. Execute
 // calls it implicitly if it hasn't run yet.
 func (op *PullImageOp) Resolve() error {
+	if err := validateVersionShape(op.params.Version); err != nil {
+		return err
+	}
 	imageName := op.params.Image
 	if imageName == "" {
 		if op.params.Version == "" {
-			op.params.Version = "17"
+			return operr.Invalidf("version or image is required")
 		}
 		imageName = fmt.Sprintf("postgres:%s", op.params.Version)
 	}
@@ -60,7 +63,9 @@ func (op *PullImageOp) Resolve() error {
 	// Validate version/image consistency when both are provided.
 	if op.params.Version != "" && op.params.Image != "" {
 		if detectedVersion, ok := docker.DetectPGVersionFromImage(imageName); ok {
-			if detectedVersion != op.params.Version {
+			// Majors, not strings: --version 17.2 with postgres:17 agrees.
+			detectedMajor, _ := parseMajorVersion(detectedVersion)
+			if wantMajor, _ := parseMajorVersion(op.params.Version); detectedMajor != wantMajor {
 				return operr.Invalidf("image tag suggests PostgreSQL %s but --version %s was specified", detectedVersion, op.params.Version)
 			}
 		}

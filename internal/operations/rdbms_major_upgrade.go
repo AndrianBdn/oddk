@@ -154,6 +154,12 @@ func (op *UpgradeRDBMSOp) validateAndPlan(ctx context.Context) (*upgradePlan, er
 	if err != nil {
 		return nil, fmt.Errorf("get parameter group %s: %w", instance.ParameterGroup, err)
 	}
+	// The target cluster is started with this group only after the old volume
+	// is gone, so prove now that the new major accepts it.
+	if err := checkTargetAcceptsParameterGroup(ctx, op.deps, name, targetImage, targetMajor,
+		instance.ParameterGroup, parameterGroup.Parameters, instance.CPUCores, instance.RAMMB); err != nil {
+		return nil, err
+	}
 
 	// Capture role names from the live instance (status still "running" so
 	// ConnectToRunningInstance works) so we can verify globals fully apply

@@ -207,9 +207,10 @@ func PGDataMountTarget(version string) string {
 // ImagePGMajor reports the PostgreSQL major version a local image serves, read
 // from the PG_MAJOR environment variable the official images (and everything
 // derived from them: pgvector, postgis, ...) carry. Best-effort: ok is false
-// when the image cannot be inspected or does not declare PG_MAJOR, and callers
-// must skip their check rather than refuse — a non-standard image is not proof
-// of a mismatch.
+// when the image cannot be inspected or does not declare PG_MAJOR, and that
+// alone is not proof of a mismatch: callers skip their check, or (create,
+// which must record some major) fall back to the tag and then ask for
+// --version.
 func (c *Client) ImagePGMajor(imageName string) (int, bool) {
 	inspect, err := c.cli.ImageInspect(c.ctx, imageName)
 	if err != nil || inspect.Config == nil {
@@ -259,6 +260,20 @@ func (c *Client) ContainerPGData(containerID, version string) (string, error) {
 	return target, nil
 }
 
+// PostgresConfigArgs is the "-c name=value" list an instance container passes
+// to postgres for a resolved parameter group. The major-upgrade preflight
+// feeds the same list to the target image's server binary, so the two must
+// come from this one function.
+func PostgresConfigArgs(resolvedParams []parameters.ResolvedParameter) []string {
+	var args []string
+	for _, param := range resolvedParams {
+		if param.Type == parameters.ParameterTypePostgresCLIArg {
+			args = append(args, "-c", fmt.Sprintf("%s=%s", param.Name, param.Value))
+		}
+	}
+	return args
+}
+
 // pgPort is the port PostgreSQL listens on inside every instance container.
 var pgPort = network.MustParsePort("5432/tcp")
 
@@ -281,12 +296,7 @@ func buildInstanceContainer(name, version, imageName string, port, cpuCores, ram
 	// Set shared memory size as a percentage of RAM (typically 25% of RAM for PostgreSQL)
 	shmSize := memLimit / 4
 
-	cmd := []string{"postgres"}
-	for _, param := range resolvedParams {
-		if param.Type == "postgres_cli_arg" {
-			cmd = append(cmd, "-c", fmt.Sprintf("%s=%s", param.Name, param.Value))
-		}
-	}
+	cmd := append([]string{"postgres"}, PostgresConfigArgs(resolvedParams)...)
 
 	config := &container.Config{
 		Image:        imageName,

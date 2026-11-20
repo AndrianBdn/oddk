@@ -14,7 +14,7 @@ upgrade major versions — except it all runs locally against Docker, on hardwar
 you control. Think "a small, self-hosted RDS for Postgres."
 
 ```bash
-oddk create --name app --version 17 --port 5432 --cpu 4 --ram 8   # pulls the image if needed
+oddk create --name app --version 18 --port 5432 --cpu 4 --ram 8   # pulls the image if needed
 oddk instance get-postgres-password app --conn
 # postgresql://postgres:••••••••@10.88.0.1:5432/postgres
 ```
@@ -32,6 +32,8 @@ oddk instance get-postgres-password app --conn
   to S3, and able to rebuild a single instance or an entire host — plus health
   monitoring with Email/Slack/Telegram/Webhook alerts, password and user
   management, minor-version image switches, and dump/restore major upgrades.
+  Tested with PostgreSQL 15 through 19 (`--version` defaults to 18), and with
+  images built on the official one (pgvector, postgis, …).
 - **Actually recoverable.** A snapshot carries every instance's data *and* ODDK's
   own configuration, so a dead host can be rebuilt from one archive plus the
   master key — not reassembled by hand from per-database dumps.
@@ -172,7 +174,7 @@ After installation the daemon is running and your CLI is configured. From here:
 ```bash
 # 1. Create an instance — 4 CPUs, 8 GB RAM, listening on port 5432.
 #    The PostgreSQL image is pulled automatically if it isn't already local.
-oddk create --name app --version 17 --port 5432 --cpu 4 --ram 8
+oddk create --name app --version 18 --port 5432 --cpu 4 --ram 8
 
 # 2. See what you have
 oddk list
@@ -214,8 +216,8 @@ resolves to `docker0` (`172.17.0.1`), and the instance's port is bound to
 ### Instances
 
 ```bash
-oddk create --name app --version 17 --port 5432 --cpu 4 --ram 8
-oddk create --name dev --version 17 --port 5433 --cpu 1 --ram 1024M   # RAM accepts M/MB/MiB
+oddk create --name app --version 18 --port 5432 --cpu 4 --ram 8
+oddk create --name dev --version 18 --port 5433 --cpu 1 --ram 1024M   # RAM accepts M/MB/MiB
 oddk instance status app
 oddk instance start app
 oddk instance stop app
@@ -718,7 +720,7 @@ S3, so deleting it never loses data.
 ### Custom images (pgvector, postgis, …)
 
 ```bash
-oddk create --name vec --version 17 --image pgvector/pgvector:pg17-trixie --port 5436 --cpu 2 --ram 4
+oddk create --name vec --image pgvector/pgvector:pg18-trixie --port 5436 --cpu 2 --ram 4   # major read from the image
 ```
 
 ### Updating, switching & major upgrades
@@ -728,16 +730,23 @@ oddk create --name vec --version 17 --image pgvector/pgvector:pg17-trixie --port
 oddk instance update app
 
 # Switch to a different image, same major version — fast, reuses the volume
-oddk instance switch app --image pgvector/pgvector:pg17-trixie
+oddk instance switch app --image pgvector/pgvector:pg18-trixie
 
 # New major version — dump/restore migration (causes downtime; backs up first)
-oddk instance major-upgrade app --target-version 18 --yes
+oddk instance major-upgrade app --target-version 19 --yes
 ```
 
 > `create`, `switch`, `update` and `major-upgrade` pull the image automatically
 > when needed — `oddk pull` is optional, for pre-warming or CI. Quiesce writes
 > before a major upgrade; changes made after it starts are not migrated.
 > Cross-major `switch` is rejected up front — use `major-upgrade`.
+>
+> Before it backs anything up, `major-upgrade` has the target image check each
+> setting in the instance's parameter group, and refuses (changing nothing) if
+> the new major rejects one — for example `io_workers`, which PostgreSQL 19
+> removed. Fix the group, or move the instance to another one with
+> `instance apply --parameter-group`, then retry. A `shared_preload_libraries`
+> library is not checked: make sure a custom target image has it.
 
 ### Parameter groups (AWS-style tuning)
 
@@ -745,7 +754,7 @@ oddk instance major-upgrade app --target-version 18 --yes
 oddk parameters get                                   # list groups
 oddk parameters get --name default:2025-08-27         # inspect one
 oddk parameters put custom --file params.json         # create/update
-oddk create --name app --version 17 --port 5432 --cpu 4 --ram 8 --parameter-group custom
+oddk create --name app --version 18 --port 5432 --cpu 4 --ram 8 --parameter-group custom
 oddk instance apply app --parameter-group custom      # reconfigure in place
 oddk instance apply app --cpu 8 --ram 16              # resize in place (data kept)
 oddk instance apply app --port 5433                   # move the port

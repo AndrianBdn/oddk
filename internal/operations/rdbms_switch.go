@@ -37,6 +37,10 @@ func (op *SwitchRDBMSOp) Execute(ctx context.Context) error {
 		return fmt.Errorf("get instance: %w", err)
 	}
 
+	if err := validateVersionShape(op.params.Version); err != nil {
+		return err
+	}
+
 	// Resolve new version: use provided, auto-detect from image tag, or keep current
 	newVersion := op.params.Version
 	if newVersion == "" {
@@ -50,7 +54,9 @@ func (op *SwitchRDBMSOp) Execute(ctx context.Context) error {
 	newImage := op.params.Image
 
 	if detectedVersion, ok := docker.DetectPGVersionFromImage(newImage); ok {
-		if detectedVersion != newVersion {
+		// Majors, not strings, as create and pull compare them.
+		detectedMajor, _ := parseMajorVersion(detectedVersion)
+		if wantMajor, _ := parseMajorVersion(newVersion); detectedMajor != wantMajor {
 			return operr.Invalidf("image tag suggests PostgreSQL %s but --version %s was specified", detectedVersion, newVersion)
 		}
 	}
