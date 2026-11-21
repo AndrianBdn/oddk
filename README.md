@@ -19,6 +19,8 @@ oddk instance get-postgres-password app --conn
 # postgresql://postgres:••••••••@10.88.0.1:5432/postgres
 ```
 
+<img src="https://oddk.dev/images/oddk-terminal.png" width="720" alt="Terminal: oddk create starts a PostgreSQL 19 instance, oddk list shows it running, and oddk snapshot make writes an encrypted physical snapshot of the whole deployment" />
+
 ---
 
 ## What it is
